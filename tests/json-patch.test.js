@@ -70,6 +70,11 @@ describe("applyJsonPatches", () => {
     expect(() => applyJsonPatches({ turns: [] }, [{ op: "replace", path: ["turns", "-"], value: {} }])).toThrow(
       "Array '-' patch key is only valid for add",
     );
+    for (const key of ["", " 0 ", "01", "1e0"]) {
+      expect(() => applyJsonPatches({ turns: [{}] }, [{ op: "replace", path: ["turns", key], value: {} }])).toThrow(
+        "Array patch key is not a valid index",
+      );
+    }
   });
 
   test("rejects missing final object keys for replace and remove", () => {

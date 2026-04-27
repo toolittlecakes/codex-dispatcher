@@ -118,10 +118,7 @@ function setPatchValue(target, key, value, op) {
     return;
   }
 
-  const index = Number(key);
-  if (!Number.isInteger(index)) {
-    throw new Error("Array patch key is not an integer");
-  }
+  const index = parseArrayIndex(key);
 
   if (op === "add") {
     if (index < 0 || index > target.length) {
@@ -139,10 +136,7 @@ function setPatchValue(target, key, value, op) {
 
 function removePatchValue(target, key) {
   if (Array.isArray(target)) {
-    const index = Number(key);
-    if (!Number.isInteger(index)) {
-      throw new Error("Array patch key is not an integer");
-    }
+    const index = parseArrayIndex(key);
     if (index < 0 || index >= target.length) {
       throw new Error("Array remove patch index is out of bounds");
     }
@@ -159,4 +153,19 @@ function removePatchValue(target, key) {
 
 function hasOwn(value, key) {
   return Object.prototype.hasOwnProperty.call(value, key);
+}
+
+function parseArrayIndex(key) {
+  if (typeof key === "number") {
+    if (Number.isInteger(key) && key >= 0) {
+      return key;
+    }
+    throw new Error("Array patch key is not a valid index");
+  }
+
+  if (/^(0|[1-9]\d*)$/.test(key)) {
+    return Number(key);
+  }
+
+  throw new Error("Array patch key is not a valid index");
 }
