@@ -24,7 +24,7 @@ Goal: make the dispatcher behave like the VS Code Codex extension for shared ses
 - Broadcast dispatcher-owned stream snapshots/patches so VS Code/Desktop can follow it.
 - Validation: a session started in dispatcher can be continued from VS Code/Desktop.
 
-## 4. Extension-like chat rendering
+## 4. Extension-like chat rendering - done
 
 - Render assistant markdown, reasoning, plans, tools, command output, diffs, file changes, images, and errors with compact mobile layouts.
 - Preserve scroll behavior and streaming updates without layout jumps.

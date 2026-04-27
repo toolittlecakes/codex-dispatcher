@@ -771,6 +771,7 @@ function renderThreadHeader() {
 }
 
 function renderMessages() {
+  const stickToEnd = isNearMessageBottom();
   const items = collectItems();
   if (items.length === 0) {
     const empty = document.createElement("div");
@@ -781,14 +782,32 @@ function renderMessages() {
   }
 
   dom.messages.replaceChildren(...items.map(renderItem));
+  if (stickToEnd) {
+    scrollMessagesToEnd();
+  }
 }
 
 function collectItems() {
   const turns = currentThreadState()?.turns || [];
   const items = [];
-  for (const turn of turns) {
-    for (const item of turn.items || []) {
+  for (const [turnIndex, turn] of turns.entries()) {
+    const turnItems = turn.items || [];
+    if (!turnItems.some((item) => item?.type === "userMessage") && Array.isArray(turn.params?.input)) {
+      items.push({
+        type: "userMessage",
+        id: `turn-${turn.turnId || turnIndex}-input`,
+        content: turn.params.input,
+      });
+    }
+    for (const item of turnItems) {
       items.push(item);
+    }
+    if (hasDisplayValue(turn.diff)) {
+      items.push({
+        type: "turnDiff",
+        id: `turn-${turn.turnId || turnIndex}-diff`,
+        diff: turn.diff,
+      });
     }
   }
   for (const liveItem of state.liveItems.values()) {
@@ -806,26 +825,207 @@ function renderItem(item) {
   label.textContent = messageLabel(item);
   element.append(label);
 
-  if (item.type === "commandExecution") {
-    element.append(renderToolSummary(item.command, item.status, item.cwd));
-    element.append(renderDetails("Command", item.command));
-    if (item.aggregatedOutput) {
-      element.append(renderDetails("Output", item.aggregatedOutput));
-    }
-    return element;
+  element.append(renderItemBody(item));
+  return element;
+}
+
+function renderItemBody(item) {
+  if (item.type === "agentMessage") {
+    return renderMarkdown(item.text || "");
   }
 
-  if (item.type === "mcpToolCall" || item.type === "dynamicToolCall") {
-    element.append(renderToolSummary(`${item.server || item.namespace || "tool"} / ${item.tool}`, item.status, null));
-    element.append(renderDetails("Details", JSON.stringify(item.result || item.contentItems || item.error || item.arguments, null, 2)));
-    return element;
+  if (item.type === "userMessage") {
+    return renderMarkdown(itemText(item));
+  }
+
+  if (item.type === "reasoning") {
+    return renderReasoning(item);
+  }
+
+  if (item.type === "plan" || item.type === "todo-list" || item.type === "planImplementation") {
+    return renderPlanItem(item);
+  }
+
+  if (item.type === "commandExecution") {
+    return renderCommandExecution(item);
+  }
+
+  if (item.type === "mcpToolCall" || item.type === "dynamicToolCall" || item.type === "collabAgentToolCall") {
+    return renderToolCall(item);
+  }
+
+  if (item.type === "fileChange") {
+    return renderFileChange(item);
+  }
+
+  if (item.type === "turnDiff") {
+    return renderDiff("Diff", item.diff);
+  }
+
+  if (item.type === "imageView" || item.type === "imageGeneration") {
+    return renderImageItem(item);
+  }
+
+  if (item.type === "error") {
+    return renderErrorItem(item);
+  }
+
+  if (item.type === "webSearch") {
+    return renderKeyValueBody([["Query", item.query], ["Status", item.action || item.status]]);
   }
 
   const body = document.createElement("div");
   body.className = "message-body";
   body.textContent = itemText(item);
-  element.append(body);
-  return element;
+  return body;
+}
+
+function renderReasoning(item) {
+  const body = document.createElement("div");
+  body.className = "message-body reasoning-body";
+
+  const summary = flattenTextParts(item.summary);
+  const content = flattenTextParts(item.content);
+  if (summary) {
+    body.append(renderMarkdown(summary));
+  }
+  if (content) {
+    body.append(renderDetails("Raw reasoning", content));
+  }
+  if (!summary && !content) {
+    body.textContent = item.status || "Reasoning";
+  }
+  return body;
+}
+
+function renderPlanItem(item) {
+  if (item.type === "todo-list" && Array.isArray(item.plan)) {
+    const body = document.createElement("div");
+    body.className = "message-body";
+    if (item.explanation) {
+      body.append(renderMarkdown(item.explanation));
+    }
+    const list = document.createElement("ol");
+    list.className = "plan-list";
+    for (const entry of item.plan) {
+      const row = document.createElement("li");
+      row.className = `plan-step ${String(entry.status || "").toLowerCase()}`;
+      row.textContent = [entry.status, entry.step || entry.text].filter(Boolean).join(" - ");
+      list.append(row);
+    }
+    body.append(list);
+    return body;
+  }
+
+  if (item.type === "planImplementation") {
+    return renderKeyValueBody([
+      ["Plan", item.planContent],
+      ["Status", item.isCompleted ? "completed" : "in progress"],
+    ]);
+  }
+
+  return renderMarkdown(item.text || item.content || "");
+}
+
+function renderCommandExecution(item) {
+  const body = document.createElement("div");
+  body.className = "message-body tool-body";
+  body.append(renderToolSummary(item.command || "Command", item.status, item.cwd));
+  body.append(renderDetails("Command", item.command || ""));
+  if (item.exitCode != null) {
+    body.append(renderKeyValueBody([["Exit code", String(item.exitCode)]]));
+  }
+  if (item.aggregatedOutput) {
+    body.append(renderDetails("Output", item.aggregatedOutput, true));
+  }
+  return body;
+}
+
+function renderToolCall(item) {
+  const title = item.type === "collabAgentToolCall"
+    ? `${item.tool || item.action || "agent"}`
+    : `${item.server || item.namespace || "tool"} / ${item.tool || item.functionName || item.name || "call"}`;
+  const body = document.createElement("div");
+  body.className = "message-body tool-body";
+  body.append(renderToolSummary(title, item.status || (item.completed ? "completed" : "pending"), null));
+
+  const args = item.arguments || item.invocation?.arguments || item.prompt || null;
+  const result = item.result || item.contentItems || item.error || item.agentsStates || null;
+  if (args) {
+    body.append(renderDetails("Arguments", stringifyPretty(args)));
+  }
+  if (result) {
+    body.append(renderDetails("Result", stringifyPretty(result)));
+  }
+  return body;
+}
+
+function renderFileChange(item) {
+  const body = document.createElement("div");
+  body.className = "message-body file-change-body";
+  const changes = Array.isArray(item.changes) ? item.changes : [];
+  if (changes.length === 0) {
+    body.textContent = "No file changes";
+    return body;
+  }
+
+  const list = document.createElement("div");
+  list.className = "file-change-list";
+  for (const change of changes) {
+    const row = document.createElement("div");
+    row.className = "change-row";
+    const kind = document.createElement("span");
+    kind.className = "change-kind";
+    kind.textContent = fileChangeKind(change);
+    const path = document.createElement("span");
+    path.className = "change-path";
+    path.textContent = change.path || change.move_path || "unknown";
+    row.append(kind, path);
+    list.append(row);
+
+    const diff = change.unified_diff || change.diff || change.content;
+    if (diff) {
+      list.append(renderDetails("Patch", diff, true));
+    }
+  }
+  body.append(list);
+  return body;
+}
+
+function renderDiff(label, diff) {
+  const body = document.createElement("div");
+  body.className = "message-body";
+  body.append(renderDetails(label, formatDiffValue(diff), true, true));
+  return body;
+}
+
+function renderImageItem(item) {
+  const body = document.createElement("div");
+  body.className = "message-body image-body";
+  const src = item.src || item.url || item.savedPath || item.path || item.result;
+  if (isDisplayableImageUrl(src)) {
+    const image = document.createElement("img");
+    image.className = "image-preview";
+    image.src = src;
+    image.alt = item.prompt || item.path || "Generated image";
+    body.append(image);
+  }
+  body.append(renderKeyValueBody([
+    ["Status", item.status],
+    ["Path", item.path || item.savedPath],
+    ["Prompt", item.prompt],
+  ]));
+  return body;
+}
+
+function renderErrorItem(item) {
+  const body = document.createElement("div");
+  body.className = "message-body error-body";
+  body.append(renderMarkdown(item.message || item.content || "Error"));
+  if (item.additionalDetails || item.errorInfo) {
+    body.append(renderDetails("Details", stringifyPretty(item.additionalDetails || item.errorInfo)));
+  }
+  return body;
 }
 
 function renderToolSummary(titleText, statusText, subText) {
@@ -844,15 +1044,19 @@ function renderToolSummary(titleText, statusText, subText) {
   return summary;
 }
 
-function renderDetails(labelText, bodyText) {
+function renderDetails(labelText, bodyText, startOpen = false, diff = false) {
   const details = document.createElement("details");
   details.className = "tool-details";
+  details.open = Boolean(startOpen);
 
   const summary = document.createElement("summary");
   summary.textContent = labelText;
   details.append(summary);
 
   const pre = document.createElement("pre");
+  if (diff) {
+    pre.className = "diff-pre";
+  }
   pre.textContent = bodyText || "";
   details.append(pre);
   return details;
@@ -862,6 +1066,10 @@ function messageClass(item) {
   if (item.type === "userMessage") return "user";
   if (item.type === "agentMessage") return "agent";
   if (item.type === "reasoning" || item.type === "plan") return item.type;
+  if (item.type === "todo-list" || item.type === "planImplementation") return "plan";
+  if (item.type === "fileChange" || item.type === "turnDiff") return "diff";
+  if (item.type === "imageView" || item.type === "imageGeneration") return "image";
+  if (item.type === "error") return "error";
   return "tool";
 }
 
@@ -879,10 +1087,18 @@ function messageLabel(item) {
       return `Command - ${item.status || ""}`;
     case "fileChange":
       return `File change - ${item.status || ""}`;
+    case "turnDiff":
+      return "Diff";
     case "mcpToolCall":
       return "MCP tool";
     case "dynamicToolCall":
       return "Tool";
+    case "todo-list":
+      return "Plan";
+    case "planImplementation":
+      return "Plan";
+    case "error":
+      return "Error";
     default:
       return item.type || "Item";
   }
@@ -895,7 +1111,7 @@ function itemText(item) {
     case "agentMessage":
       return item.text || "";
     case "reasoning":
-      return [...(item.summary || []), ...(item.content || [])].join("\n");
+      return [flattenTextParts(item.summary), flattenTextParts(item.content)].filter(Boolean).join("\n");
     case "plan":
       return item.text || "";
     case "fileChange":
@@ -911,6 +1127,240 @@ function itemText(item) {
     default:
       return JSON.stringify(item, null, 2);
   }
+}
+
+function renderMarkdown(text) {
+  const body = document.createElement("div");
+  body.className = "message-body rich-text";
+  const blocks = splitMarkdownCodeBlocks(String(text || ""));
+  for (const block of blocks) {
+    if (block.type === "code") {
+      const pre = document.createElement("pre");
+      const code = document.createElement("code");
+      code.textContent = block.content;
+      if (block.language) {
+        pre.dataset.language = block.language;
+      }
+      pre.append(code);
+      body.append(pre);
+      continue;
+    }
+    appendMarkdownText(body, block.content);
+  }
+  return body;
+}
+
+function splitMarkdownCodeBlocks(text) {
+  const blocks = [];
+  const fence = /```([^\n`]*)\n?([\s\S]*?)```/g;
+  let cursor = 0;
+  for (const match of text.matchAll(fence)) {
+    if (match.index > cursor) {
+      blocks.push({ type: "text", content: text.slice(cursor, match.index) });
+    }
+    blocks.push({
+      type: "code",
+      language: (match[1] || "").trim(),
+      content: (match[2] || "").replace(/\n$/, ""),
+    });
+    cursor = match.index + match[0].length;
+  }
+  if (cursor < text.length) {
+    blocks.push({ type: "text", content: text.slice(cursor) });
+  }
+  return blocks.length > 0 ? blocks : [{ type: "text", content: "" }];
+}
+
+function appendMarkdownText(parent, text) {
+  const lines = String(text || "").split(/\r?\n/);
+  let paragraph = [];
+  let list = null;
+  let listKind = null;
+
+  const flushParagraph = () => {
+    if (paragraph.length === 0) return;
+    const p = document.createElement("p");
+    appendInlineMarkdown(p, paragraph.join("\n").trim());
+    parent.append(p);
+    paragraph = [];
+  };
+
+  const flushList = () => {
+    if (!list) return;
+    parent.append(list);
+    list = null;
+    listKind = null;
+  };
+
+  for (const line of lines) {
+    const trimmed = line.trim();
+    if (!trimmed) {
+      flushParagraph();
+      flushList();
+      continue;
+    }
+
+    const heading = trimmed.match(/^(#{1,4})\s+(.+)$/);
+    if (heading) {
+      flushParagraph();
+      flushList();
+      const level = Math.min(4, heading[1].length + 2);
+      const h = document.createElement(`h${level}`);
+      appendInlineMarkdown(h, heading[2]);
+      parent.append(h);
+      continue;
+    }
+
+    const bullet = trimmed.match(/^[-*]\s+(.+)$/);
+    const numbered = trimmed.match(/^\d+[.)]\s+(.+)$/);
+    if (bullet || numbered) {
+      flushParagraph();
+      const nextKind = bullet ? "ul" : "ol";
+      if (!list || listKind !== nextKind) {
+        flushList();
+        list = document.createElement(nextKind);
+        listKind = nextKind;
+      }
+      const li = document.createElement("li");
+      appendInlineMarkdown(li, bullet ? bullet[1] : numbered[1]);
+      list.append(li);
+      continue;
+    }
+
+    if (trimmed.startsWith(">")) {
+      flushParagraph();
+      flushList();
+      const quote = document.createElement("blockquote");
+      appendInlineMarkdown(quote, trimmed.replace(/^>\s?/, ""));
+      parent.append(quote);
+      continue;
+    }
+
+    paragraph.push(line);
+  }
+
+  flushParagraph();
+  flushList();
+}
+
+function appendInlineMarkdown(parent, text) {
+  const pattern = /(`[^`]+`|\*\*[^*]+\*\*|\[[^\]\n]+\]\(([^)\n]+)\))/g;
+  let cursor = 0;
+  for (const match of text.matchAll(pattern)) {
+    if (match.index > cursor) {
+      parent.append(document.createTextNode(text.slice(cursor, match.index)));
+    }
+    const token = match[0];
+    if (token.startsWith("`")) {
+      const code = document.createElement("code");
+      code.textContent = token.slice(1, -1);
+      parent.append(code);
+    } else if (token.startsWith("**")) {
+      const strong = document.createElement("strong");
+      strong.textContent = token.slice(2, -2);
+      parent.append(strong);
+    } else {
+      const parts = token.match(/^\[([^\]\n]+)\]\(([^)\n]+)\)$/);
+      const url = parts?.[2] || "";
+      if (isSafeUrl(url)) {
+        const link = document.createElement("a");
+        link.href = url;
+        link.target = "_blank";
+        link.rel = "noreferrer";
+        link.textContent = parts[1];
+        parent.append(link);
+      } else {
+        parent.append(document.createTextNode(parts?.[1] || token));
+      }
+    }
+    cursor = match.index + token.length;
+  }
+  if (cursor < text.length) {
+    parent.append(document.createTextNode(text.slice(cursor)));
+  }
+}
+
+function renderKeyValueBody(entries) {
+  const body = document.createElement("div");
+  body.className = "message-body key-value-body";
+  for (const [label, value] of entries) {
+    if (value == null || value === "") continue;
+    const row = document.createElement("div");
+    row.className = "key-value-row";
+    const key = document.createElement("span");
+    key.textContent = label;
+    const val = document.createElement("span");
+    val.textContent = typeof value === "string" ? value : stringifyPretty(value);
+    row.append(key, val);
+    body.append(row);
+  }
+  return body;
+}
+
+function flattenTextParts(parts) {
+  if (!Array.isArray(parts)) {
+    return typeof parts === "string" ? parts : "";
+  }
+  return parts
+    .map((part) => {
+      if (typeof part === "string") return part;
+      if (typeof part?.text === "string") return part.text;
+      if (typeof part?.content === "string") return part.content;
+      return "";
+    })
+    .filter(Boolean)
+    .join("\n");
+}
+
+function stringifyPretty(value) {
+  if (typeof value === "string") return value;
+  try {
+    return JSON.stringify(value, null, 2);
+  } catch {
+    return String(value);
+  }
+}
+
+function hasDisplayValue(value) {
+  if (value == null || value === "") return false;
+  if (Array.isArray(value)) return value.length > 0;
+  if (typeof value === "object") return Object.keys(value).length > 0;
+  return true;
+}
+
+function formatDiffValue(value) {
+  if (Array.isArray(value)) {
+    return value.map(formatDiffEntry).filter(Boolean).join("\n");
+  }
+  return formatDiffEntry(value);
+}
+
+function formatDiffEntry(value) {
+  if (typeof value === "string") return value;
+  if (!value || typeof value !== "object") return String(value || "");
+  return value.unified_diff || value.diff || value.content || stringifyPretty(value);
+}
+
+function fileChangeKind(change) {
+  const kind = change.kind;
+  if (typeof kind === "string") return kind;
+  if (typeof kind?.type === "string") return kind.type;
+  if (change.move_path) return "move";
+  return "change";
+}
+
+function isSafeUrl(value) {
+  if (typeof value !== "string") return false;
+  try {
+    const url = new URL(value, location.href);
+    return url.protocol === "http:" || url.protocol === "https:";
+  } catch {
+    return false;
+  }
+}
+
+function isDisplayableImageUrl(value) {
+  return typeof value === "string" && (value.startsWith("data:image/") || /^https?:\/\//.test(value));
 }
 
 function inputText(input) {
