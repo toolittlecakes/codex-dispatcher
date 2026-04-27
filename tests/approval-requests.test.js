@@ -1,5 +1,9 @@
 import { describe, expect, test } from "bun:test";
-import { buildApprovalResponseRequest, collectApprovalRequests } from "../public/approval-requests.js";
+import {
+  buildApprovalResponseRequest,
+  collectApprovalRequests,
+  prunePendingApprovalResponses,
+} from "../public/approval-requests.js";
 
 describe("approval request helpers", () => {
   test("collects app-server requests and owner mirrored requests", () => {
@@ -13,11 +17,7 @@ describe("approval request helpers", () => {
               method: "item/commandExecution/requestApproval",
               params: { command: "date" },
             },
-            {
-              id: "unsupported",
-              method: "item/tool/call",
-              params: {},
-            },
+            { id: "unsupported", method: "item/tool/call", params: {} },
           ],
         },
       ],
@@ -52,11 +52,20 @@ describe("approval request helpers", () => {
       streamOwners: new Map([["owned-thread", "owner-1"]]),
     });
 
-    expect(requests.map((request) => request.key)).toEqual(["app:7", "app:8", "ipc:owned-thread:ipc-command"]);
+    expect(requests.map((request) => request.key)).toEqual([
+      "app:7",
+      "app:8",
+      "ipc:owned-thread:ipc-command",
+      "ipc:owned-thread:unsupported",
+    ]);
     expect(requests[2]).toMatchObject({
       conversationId: "owned-thread",
       ownerClientId: "owner-1",
       requestId: "ipc-command",
+      source: "ipc",
+    });
+    expect(requests[3]).toMatchObject({
+      method: "item/tool/call",
       source: "ipc",
     });
   });
@@ -165,5 +174,46 @@ describe("approval request helpers", () => {
         },
       });
     }
+  });
+
+  test("tracks pending IPC responses without mutating mirrored requests", () => {
+    const mirroredRequest = {
+      id: "ipc-command",
+      method: "item/commandExecution/requestApproval",
+      params: { command: "date" },
+    };
+    const mirroredConversation = {
+      requests: [mirroredRequest],
+    };
+    const mirroredThreads = new Map([["owned-thread", mirroredConversation]]);
+    const pendingApprovalResponseKeys = new Set(["ipc:owned-thread:ipc-command"]);
+
+    const activeRequests = collectApprovalRequests({
+      appServerRequests: [],
+      mirroredThreads,
+      pendingApprovalResponseKeys,
+      streamOwners: new Map([["owned-thread", "owner-1"]]),
+    });
+
+    expect(activeRequests[0]).toMatchObject({
+      key: "ipc:owned-thread:ipc-command",
+      responsePending: true,
+    });
+    expect(mirroredConversation.requests).toEqual([mirroredRequest]);
+
+    prunePendingApprovalResponses(pendingApprovalResponseKeys, activeRequests);
+    expect(pendingApprovalResponseKeys.has("ipc:owned-thread:ipc-command")).toBe(true);
+
+    mirroredConversation.requests = [];
+    prunePendingApprovalResponses(
+      pendingApprovalResponseKeys,
+      collectApprovalRequests({
+        appServerRequests: [],
+        mirroredThreads,
+        pendingApprovalResponseKeys,
+        streamOwners: new Map([["owned-thread", "owner-1"]]),
+      }),
+    );
+    expect(pendingApprovalResponseKeys.has("ipc:owned-thread:ipc-command")).toBe(false);
   });
 });

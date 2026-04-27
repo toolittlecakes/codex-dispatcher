@@ -1,4 +1,8 @@
-import { buildApprovalResponseRequest, collectApprovalRequests } from "./approval-requests.js";
+import {
+  buildApprovalResponseRequest,
+  collectApprovalRequests,
+  prunePendingApprovalResponses,
+} from "./approval-requests.js";
 import { applyJsonPatches, cloneJson, isPlainObject } from "./json-patch.js";
 
 const state = {
@@ -7,6 +11,7 @@ const state = {
   requestSeq: 1,
   pending: new Map(),
   approvals: new Map(),
+  pendingApprovalResponses: new Set(),
   threads: [],
   currentThread: null,
   selectedThreadId: null,
@@ -921,8 +926,10 @@ function renderApprovals() {
   const requests = collectApprovalRequests({
     appServerRequests: Array.from(state.approvals.values()),
     mirroredThreads: state.mirroredThreads,
+    pendingApprovalResponseKeys: state.pendingApprovalResponses,
     streamOwners: state.streamOwners,
   });
+  prunePendingApprovalResponses(state.pendingApprovalResponses, requests);
   dom.approvalTray.classList.toggle("hidden", requests.length === 0);
   dom.approvalCount.textContent = requests.length > 0 ? String(requests.length) : "";
   dom.approvalCount.className = requests.length > 0 ? "approval-count-badge" : "";
@@ -939,6 +946,12 @@ function renderApproval(requestValue) {
   const description = document.createElement("p");
   description.textContent = approvalDescription(requestValue);
   card.append(description);
+
+  if (requestValue.responsePending) {
+    const pending = document.createElement("p");
+    pending.textContent = requestValue.source === "ipc" ? "Sent to owner. Waiting for owner state." : "Response sent.";
+    card.append(pending);
+  }
 
   const pre = document.createElement("pre");
   pre.textContent = approvalBody(requestValue);
@@ -960,6 +973,7 @@ function renderApproval(requestValue) {
     const button = document.createElement("button");
     button.type = "button";
     button.className = action.className;
+    button.disabled = Boolean(requestValue.responsePending);
     button.textContent = action.label;
     button.addEventListener("click", () => {
       void respondToApproval(requestValue, action.result);
@@ -984,6 +998,7 @@ function renderUserInputForm(requestValue) {
     if (question.options?.length) {
       const select = document.createElement("select");
       select.name = question.id;
+      select.disabled = Boolean(requestValue.responsePending);
       for (const option of question.options) {
         const element = document.createElement("option");
         element.value = option.label;
@@ -994,6 +1009,7 @@ function renderUserInputForm(requestValue) {
     } else {
       const input = document.createElement("input");
       input.name = question.id;
+      input.disabled = Boolean(requestValue.responsePending);
       input.type = question.isSecret ? "password" : "text";
       input.placeholder = question.question || "";
       field.append(input);
@@ -1006,6 +1022,7 @@ function renderUserInputForm(requestValue) {
   actions.className = "approval-actions";
   const submit = document.createElement("button");
   submit.className = "allow";
+  submit.disabled = Boolean(requestValue.responsePending);
   submit.type = "submit";
   submit.textContent = "Submit";
   actions.append(submit);
@@ -1040,25 +1057,53 @@ function renderMcpElicitationForm(requestValue) {
 
     if (fieldConfig.options.length > 0) {
       const select = document.createElement("select");
+      select.disabled = Boolean(requestValue.responsePending);
       select.name = fieldConfig.name;
       select.required = fieldConfig.required;
-      for (const option of fieldConfig.options) {
+      if (!fieldConfig.required) {
+        const empty = document.createElement("option");
+        empty.value = "";
+        empty.textContent = "";
+        select.append(empty);
+      }
+      fieldConfig.options.forEach((option, index) => {
         const element = document.createElement("option");
-        element.value = String(option);
-        element.textContent = String(option);
+        element.value = String(index);
+        element.textContent = formatJsonOption(option);
+        select.append(element);
+      });
+      field.append(select);
+    } else if (fieldConfig.type === "boolean" && !fieldConfig.required) {
+      const select = document.createElement("select");
+      select.disabled = Boolean(requestValue.responsePending);
+      select.name = fieldConfig.name;
+
+      for (const option of [
+        ["", ""],
+        ["true", "true"],
+        ["false", "false"],
+      ]) {
+        const element = document.createElement("option");
+        element.value = option[0];
+        element.textContent = option[1];
         select.append(element);
       }
       field.append(select);
     } else if (fieldConfig.type === "boolean") {
       const input = document.createElement("input");
+      input.disabled = Boolean(requestValue.responsePending);
       input.name = fieldConfig.name;
       input.type = "checkbox";
       field.append(input);
     } else {
       const input = document.createElement("input");
+      input.disabled = Boolean(requestValue.responsePending);
       input.name = fieldConfig.name;
       input.required = fieldConfig.required;
       input.type = fieldConfig.type === "number" || fieldConfig.type === "integer" ? "number" : "text";
+      if (fieldConfig.type === "integer") {
+        input.step = "1";
+      }
       input.placeholder = fieldConfig.description || "";
       field.append(input);
     }
@@ -1071,12 +1116,14 @@ function renderMcpElicitationForm(requestValue) {
 
   const submit = document.createElement("button");
   submit.className = "allow";
+  submit.disabled = Boolean(requestValue.responsePending);
   submit.type = "submit";
   submit.textContent = "Submit";
   actions.append(submit);
 
   const cancel = document.createElement("button");
   cancel.className = "deny";
+  cancel.disabled = Boolean(requestValue.responsePending);
   cancel.type = "button";
   cancel.textContent = "Cancel";
   cancel.addEventListener("click", () => {
@@ -1090,18 +1137,16 @@ function renderMcpElicitationForm(requestValue) {
     event.preventDefault();
     const data = new FormData(form);
     const content = {};
-    for (const fieldConfig of fields) {
-      if (fieldConfig.type === "boolean") {
-        content[fieldConfig.name] = data.get(fieldConfig.name) === "on";
-        continue;
+    try {
+      for (const fieldConfig of fields) {
+        const value = mcpFieldValue(fieldConfig, data);
+        if (value.shouldInclude) {
+          content[fieldConfig.name] = value.value;
+        }
       }
-
-      const rawValue = String(data.get(fieldConfig.name) || "").trim();
-      if (!fieldConfig.required && rawValue.length === 0) {
-        continue;
-      }
-
-      content[fieldConfig.name] = fieldConfig.type === "number" || fieldConfig.type === "integer" ? Number(rawValue) : rawValue;
+    } catch (error) {
+      setStatus(error instanceof Error ? error.message : String(error), true);
+      return;
     }
     void respondToApproval(requestValue, { action: "accept", content, _meta: null });
   });
@@ -1115,7 +1160,7 @@ function approvalTitle(method) {
   if (method === "item/permissions/requestApproval") return "Permission approval";
   if (method === "item/tool/requestUserInput") return "User input requested";
   if (method === "mcpServer/elicitation/request") return "MCP input requested";
-  return "Unsupported app-server request";
+  return "Unsupported request";
 }
 
 function approvalDescription(requestValue) {
@@ -1186,38 +1231,26 @@ function grantedPermissions(permissions) {
 }
 
 async function respondToApproval(requestValue, result) {
+  const pendingKey = requestValue.key || `${requestValue.source || "request"}:${String(requestValue.id)}`;
+  state.pendingApprovalResponses.add(pendingKey);
+  renderApprovals();
+
   try {
     const responseRequest = buildApprovalResponseRequest(requestValue, result);
     await request(responseRequest.type, responseRequest.payload);
 
-    if (requestValue.source === "ipc") {
-      removeMirroredRequest(requestValue.conversationId, requestValue.requestId);
-    } else {
+    if (requestValue.source !== "ipc") {
       state.approvals.delete(String(requestValue.id));
+      state.pendingApprovalResponses.delete(pendingKey);
     }
 
     setStatus("Approval sent", false);
     renderApprovals();
   } catch (error) {
+    state.pendingApprovalResponses.delete(pendingKey);
     setStatus(error instanceof Error ? error.message : String(error), true);
+    renderApprovals();
   }
-}
-
-function removeMirroredRequest(conversationId, requestId) {
-  if (typeof conversationId !== "string") {
-    return;
-  }
-
-  const thread = state.mirroredThreads.get(conversationId);
-  if (!thread || !Array.isArray(thread.requests)) {
-    return;
-  }
-
-  const next = cloneJson(thread);
-  next.requests = next.requests.filter((requestValue) => String(requestValue.id) !== String(requestId));
-  state.mirroredThreads.set(conversationId, normalizeMirroredThread(conversationId, next));
-  renderThreads();
-  renderSelectedThread({ preserveScroll: true });
 }
 
 function mcpElicitationFields(requestValue) {
@@ -1242,6 +1275,70 @@ function mcpElicitationFields(requestValue) {
       type: typeof type === "string" ? type : "string",
     }];
   });
+}
+
+function mcpFieldValue(fieldConfig, data) {
+  if (fieldConfig.options.length > 0) {
+    const rawIndex = String(data.get(fieldConfig.name) || "");
+    if (!fieldConfig.required && rawIndex.length === 0) {
+      return { shouldInclude: false, value: null };
+    }
+
+    const index = Number(rawIndex);
+    if (!Number.isInteger(index) || index < 0 || index >= fieldConfig.options.length) {
+      throw new Error(`Invalid value for ${fieldConfig.label}`);
+    }
+
+    return { shouldInclude: true, value: fieldConfig.options[index] };
+  }
+
+  if (fieldConfig.type === "boolean" && !fieldConfig.required) {
+    const rawValue = String(data.get(fieldConfig.name) || "");
+    if (rawValue.length === 0) {
+      return { shouldInclude: false, value: null };
+    }
+
+    return { shouldInclude: true, value: rawValue === "true" };
+  }
+
+  if (fieldConfig.type === "boolean") {
+    return { shouldInclude: true, value: data.get(fieldConfig.name) === "on" };
+  }
+
+  const rawValue = String(data.get(fieldConfig.name) || "").trim();
+  if (!fieldConfig.required && rawValue.length === 0) {
+    return { shouldInclude: false, value: null };
+  }
+  if (fieldConfig.required && rawValue.length === 0) {
+    throw new Error(`Missing value for ${fieldConfig.label}`);
+  }
+
+  if (fieldConfig.type !== "number" && fieldConfig.type !== "integer") {
+    return { shouldInclude: true, value: rawValue };
+  }
+
+  const numericValue = Number(rawValue);
+  if (!Number.isFinite(numericValue)) {
+    throw new Error(`Invalid number for ${fieldConfig.label}`);
+  }
+
+  if (fieldConfig.type === "integer" && !Number.isInteger(numericValue)) {
+    throw new Error(`Invalid integer for ${fieldConfig.label}`);
+  }
+
+  return { shouldInclude: true, value: numericValue };
+}
+
+function formatJsonOption(value) {
+  if (typeof value === "string") {
+    return value;
+  }
+
+  if (value === null) {
+    return "null";
+  }
+
+  return JSON.stringify(value);
 }
 
 function renderComposerState() {

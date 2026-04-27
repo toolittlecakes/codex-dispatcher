@@ -6,7 +6,12 @@ const followerResponseMethods = {
   "mcpServer/elicitation/request": "thread-follower-submit-mcp-server-elicitation-response",
 };
 
-export function collectApprovalRequests({ appServerRequests, mirroredThreads, streamOwners }) {
+export function collectApprovalRequests({
+  appServerRequests,
+  mirroredThreads,
+  pendingApprovalResponseKeys = new Set(),
+  streamOwners,
+}) {
   const requests = [];
 
   for (const request of appServerRequests || []) {
@@ -14,12 +19,8 @@ export function collectApprovalRequests({ appServerRequests, mirroredThreads, st
       continue;
     }
 
-    requests.push({
-      ...request,
-      key: `app:${String(request.id)}`,
-      requestId: String(request.id),
-      source: "appServer",
-    });
+    const key = `app:${String(request.id)}`;
+    requests.push(normalizeRequest(request, key, "appServer", pendingApprovalResponseKeys));
   }
 
   for (const [conversationId, conversation] of mirroredThreads || []) {
@@ -29,22 +30,28 @@ export function collectApprovalRequests({ appServerRequests, mirroredThreads, st
     }
 
     for (const request of conversation.requests) {
-      if (!isSupportedApprovalRequest(request)) {
+      if (request?.id == null) {
         continue;
       }
 
-      requests.push({
-        ...request,
+      const key = `ipc:${conversationId}:${String(request.id)}`;
+      requests.push(normalizeRequest(request, key, "ipc", pendingApprovalResponseKeys, {
         conversationId,
-        key: `ipc:${conversationId}:${String(request.id)}`,
         ownerClientId,
-        requestId: String(request.id),
-        source: "ipc",
-      });
+      }));
     }
   }
 
   return requests;
+}
+
+export function prunePendingApprovalResponses(pendingApprovalResponseKeys, activeRequests) {
+  const activeKeys = new Set(activeRequests.map((request) => request.key));
+  for (const key of pendingApprovalResponseKeys) {
+    if (!activeKeys.has(key)) {
+      pendingApprovalResponseKeys.delete(key);
+    }
+  }
 }
 
 export function buildApprovalResponseRequest(requestValue, result) {
@@ -87,6 +94,17 @@ export function buildApprovalResponseRequest(requestValue, result) {
 
 export function isSupportedApprovalRequest(request) {
   return Boolean(request?.id != null && followerResponseMethods[request.method]);
+}
+
+function normalizeRequest(request, key, source, pendingApprovalResponseKeys, extra = {}) {
+  return {
+    ...request,
+    ...extra,
+    key,
+    requestId: String(request.id),
+    responsePending: pendingApprovalResponseKeys.has(key),
+    source,
+  };
 }
 
 function requiredString(value, name) {
