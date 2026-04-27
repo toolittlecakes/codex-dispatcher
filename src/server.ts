@@ -696,7 +696,10 @@ async function refreshDispatcherOwnedConversation(threadId: string): Promise<voi
     return;
   }
 
-  dispatcherOwnedConversations.set(threadId, conversationFromThread(threadId, thread));
+  dispatcherOwnedConversations.set(
+    threadId,
+    conversationFromThread(threadId, thread, dispatcherOwnedConversations.get(threadId)),
+  );
   broadcastDispatcherOwnedSnapshot(threadId);
 }
 
