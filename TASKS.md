@@ -2,7 +2,7 @@
 
 Goal: make the dispatcher behave like the VS Code Codex extension for shared sessions, while keeping the mobile/PWA surface lighter.
 
-## 1. IPC state mirror
+## 1. IPC state mirror - done
 
 - Treat `thread-stream-state-changed` snapshots and patches as the primary live state source.
 - Keep a local conversation-state cache keyed by conversation id.

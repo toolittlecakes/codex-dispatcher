@@ -14,7 +14,7 @@ const state = {
   fastSyncTimer: 0,
   ipc: null,
   streamOwners: new Map(),
-  syncTimer: 0,
+  mirroredThreads: new Map(),
   isSyncing: false,
   lastThreadSignatures: new Map(),
 };
@@ -138,16 +138,6 @@ function closeSidebar() {
   dom.sidebarBackdrop.classList.add("hidden");
 }
 
-function startSyncLoop() {
-  if (state.syncTimer) {
-    window.clearInterval(state.syncTimer);
-  }
-
-  state.syncTimer = window.setInterval(() => {
-    void syncExternalState();
-  }, 1800);
-}
-
 function scheduleFastSync(delay = 220) {
   if (state.fastSyncTimer) {
     window.clearTimeout(state.fastSyncTimer);
@@ -177,7 +167,7 @@ async function syncExternalState() {
     }
 
     const nextSelectedSignature = state.lastThreadSignatures.get(state.selectedThreadId);
-    const hasInProgressTurn = Boolean(findInProgressTurn(state.currentThread));
+    const hasInProgressTurn = Boolean(findInProgressTurn(currentThreadState()));
     if (nextSelectedSignature !== previousSelectedSignature || hasInProgressTurn) {
       await refreshCurrentThread({ preserveScroll: true });
     }
@@ -195,11 +185,11 @@ function handleServerMessage(message) {
       dom.cwdInput.value = state.defaultCwd;
       setIpcStatus(message.ipc);
       setStreamOwners(message.streamOwners || []);
+      setMirroredConversations(message.mirroredConversations || []);
       for (const request of message.pendingServerRequests || []) {
         state.approvals.set(String(request.id), request);
       }
       renderApprovals();
-      startSyncLoop();
       void loadThreads();
       break;
 
@@ -257,17 +247,19 @@ function handleIpcBroadcast(broadcast, ipc) {
   if (method === "thread-stream-state-changed") {
     if (typeof params.conversationId === "string" && typeof broadcast.sourceClientId === "string") {
       setThreadOwner(params.conversationId, broadcast.sourceClientId);
+      applyThreadStreamChange(params.conversationId, params.change);
     }
-    scheduleFastSync();
     return;
   }
 
-  if (
-    method === "thread-read-state-changed" ||
-    method === "thread-archived" ||
-    method === "thread-unarchived" ||
-    method === "thread-queued-followups-changed"
-  ) {
+  if (method === "thread-read-state-changed") {
+    updateMirroredConversation(params.conversationId, (thread) => {
+      thread.hasUnreadTurn = Boolean(params.hasUnreadTurn);
+    });
+    return;
+  }
+
+  if (method === "thread-archived" || method === "thread-unarchived" || method === "thread-queued-followups-changed") {
     scheduleFastSync();
     return;
   }
@@ -377,8 +369,7 @@ async function createThread() {
   state.externalActiveTurnId = null;
   state.liveItems.clear();
   renderThreads();
-  renderThreadHeader();
-  renderMessages();
+  renderSelectedThread();
   await loadThreads();
 }
 
@@ -387,28 +378,26 @@ async function openThread(threadId) {
   state.externalActiveTurnId = null;
   state.liveItems.clear();
   closeSidebar();
+  state.currentThread = state.threads.find((thread) => thread.id === threadId) || state.currentThread;
   renderThreads();
+
+  if (state.mirroredThreads.has(threadId)) {
+    renderSelectedThread();
+    return;
+  }
 
   const result = await request("resumeThread", { threadId });
   state.currentThread = result.thread;
   trackExternalActiveTurn();
-  dom.cwdInput.value = result.cwd || result.thread?.cwd || state.defaultCwd;
-  renderThreadHeader();
-  renderMessages();
-  scrollMessagesToEnd();
+  dom.cwdInput.value = currentThreadState()?.cwd || result.cwd || result.thread?.cwd || state.defaultCwd;
+  renderSelectedThread();
 }
 
 async function refreshCurrentThread(options = {}) {
   if (!state.selectedThreadId) return;
-  const wasNearBottom = isNearMessageBottom();
   const result = await request("readThread", { threadId: state.selectedThreadId });
   state.currentThread = result.thread;
-  trackExternalActiveTurn();
-  renderThreadHeader();
-  renderMessages();
-  if (!options.preserveScroll || wasNearBottom) {
-    scrollMessagesToEnd();
-  }
+  renderSelectedThread({ preserveScroll: options.preserveScroll });
 }
 
 async function submitPrompt() {
@@ -536,12 +525,13 @@ function textInput(text) {
 }
 
 function restoreMessage(cwd) {
-  const currentCwd = cwd || state.currentThread?.cwd || state.defaultCwd || "/";
+  const thread = currentThreadState();
+  const currentCwd = cwd || thread?.cwd || state.defaultCwd || "/";
   return {
     cwd: currentCwd,
     context: {
       workspaceRoots: currentCwd ? [currentCwd] : [],
-      collaborationMode: state.currentThread?.latestCollaborationMode || null,
+      collaborationMode: thread?.latestCollaborationMode || null,
       prompt: "",
       addedFiles: [],
       fileAttachments: [],
@@ -550,6 +540,109 @@ function restoreMessage(cwd) {
       ideContext: null,
     },
   };
+}
+
+function setMirroredConversations(entries) {
+  state.mirroredThreads.clear();
+  for (const entry of entries || []) {
+    if (typeof entry?.threadId === "string" && isPlainObject(entry.conversation)) {
+      state.mirroredThreads.set(entry.threadId, normalizeMirroredThread(entry.threadId, entry.conversation));
+    }
+  }
+  renderThreads();
+  renderSelectedThread();
+}
+
+function applyThreadStreamChange(threadId, change) {
+  if (!isPlainObject(change)) {
+    return;
+  }
+
+  try {
+    if (change.type === "snapshot" && isPlainObject(change.conversationState)) {
+      state.mirroredThreads.set(threadId, normalizeMirroredThread(threadId, change.conversationState));
+      renderThreads();
+      renderSelectedThread({ preserveScroll: true });
+      return;
+    }
+
+    if (change.type === "patches" && Array.isArray(change.patches)) {
+      const current = state.mirroredThreads.get(threadId);
+      if (!current) {
+        console.warn(`Received IPC patches before snapshot for ${threadId}`);
+        return;
+      }
+
+      state.mirroredThreads.set(threadId, normalizeMirroredThread(threadId, applyJsonPatches(current, change.patches)));
+      renderThreads();
+      renderSelectedThread({ preserveScroll: true });
+    }
+  } catch (error) {
+    console.warn(`Failed to apply IPC stream change for ${threadId}`, error);
+  }
+}
+
+function updateMirroredConversation(threadId, update) {
+  if (typeof threadId !== "string") {
+    return;
+  }
+
+  const current = state.mirroredThreads.get(threadId);
+  if (!current) {
+    return;
+  }
+
+  const next = cloneJson(current);
+  update(next);
+  state.mirroredThreads.set(threadId, normalizeMirroredThread(threadId, next));
+  renderThreads();
+  renderSelectedThread({ preserveScroll: true });
+}
+
+function normalizeMirroredThread(threadId, conversation) {
+  const normalized = cloneJson(conversation);
+  normalized.id = typeof normalized.id === "string" ? normalized.id : threadId;
+  normalized.name = normalized.name || normalized.title || normalized.preview || "Untitled thread";
+  normalized.preview = normalized.preview || normalized.title || normalized.name;
+  normalized.status = normalized.status || deriveConversationStatus(normalized);
+  normalized.source = normalized.source || "vscode";
+  return normalized;
+}
+
+function currentThreadState() {
+  const mirrored = threadOwner(state.selectedThreadId) ? state.mirroredThreads.get(state.selectedThreadId) : null;
+  if (!mirrored) {
+    return state.currentThread;
+  }
+
+  return mergeThreadState(state.currentThread, mirrored);
+}
+
+function mergeThreadState(baseThread, mirroredThread) {
+  return {
+    ...(baseThread || {}),
+    ...mirroredThread,
+    id: mirroredThread.id || baseThread?.id || state.selectedThreadId,
+    name: mirroredThread.title || mirroredThread.name || baseThread?.name || baseThread?.preview,
+    preview: mirroredThread.preview || mirroredThread.title || baseThread?.preview,
+    cwd: mirroredThread.cwd || baseThread?.cwd || state.defaultCwd,
+    source: mirroredThread.source || baseThread?.source,
+  };
+}
+
+function renderSelectedThread(options = {}) {
+  const thread = currentThreadState();
+  if (thread?.cwd && document.activeElement !== dom.cwdInput) {
+    dom.cwdInput.value = thread.cwd;
+  }
+
+  const wasNearBottom = options.preserveScroll ? isNearMessageBottom() : true;
+  trackExternalActiveTurn();
+  renderThreadHeader();
+  renderMessages();
+  if (!options.preserveScroll || wasNearBottom) {
+    scrollMessagesToEnd();
+  }
 }
 
 function renderThreads() {
@@ -565,35 +658,40 @@ function renderThreads() {
 }
 
 function renderThreadRow(thread) {
+  const displayThread = mergeThreadState(thread, state.mirroredThreads.get(thread.id) || {});
   const button = document.createElement("button");
   button.type = "button";
-  button.className = `thread-row${thread.id === state.selectedThreadId ? " active" : ""}`;
+  button.className = `thread-row${displayThread.id === state.selectedThreadId ? " active" : ""}`;
   button.addEventListener("click", () => {
-    void openThread(thread.id);
+    void openThread(displayThread.id);
   });
 
   const main = document.createElement("div");
   main.className = "thread-row-main";
 
   const title = document.createElement("strong");
-  title.textContent = thread.name || thread.preview || "Untitled thread";
+  title.textContent = displayThread.name || displayThread.preview || "Untitled thread";
 
   const badge = document.createElement("span");
-  const ownerClientId = threadOwner(thread.id);
-  badge.className = `thread-badge ${ownerClientId || isRunningStatus(thread.status) ? "running" : ""}`;
-  badge.textContent = ownerClientId ? "IPC" : isRunningStatus(thread.status) ? statusLabel(thread.status) : sourceLabel(thread.source);
+  const ownerClientId = threadOwner(displayThread.id);
+  badge.className = `thread-badge ${ownerClientId || isRunningStatus(displayThread.status) ? "running" : ""}`;
+  badge.textContent = ownerClientId
+    ? "IPC"
+    : isRunningStatus(displayThread.status)
+      ? statusLabel(displayThread.status)
+      : sourceLabel(displayThread.source);
 
   main.append(title, badge);
 
   const meta = document.createElement("span");
-  meta.textContent = `${shortPath(thread.cwd) || sourceLabel(thread.source)} - ${formatTime(thread.updatedAt || thread.createdAt)}`;
+  meta.textContent = `${shortPath(displayThread.cwd) || sourceLabel(displayThread.source)} - ${formatTime(displayThread.updatedAt || displayThread.createdAt)}`;
 
   button.append(main, meta);
   return button;
 }
 
 function renderThreadHeader() {
-  const thread = state.currentThread;
+  const thread = currentThreadState();
   if (!thread) {
     dom.threadTitle.textContent = "No thread selected";
     dom.threadMeta.replaceChildren(metaChip("Connect and pick a session"));
@@ -626,7 +724,7 @@ function renderMessages() {
 }
 
 function collectItems() {
-  const turns = state.currentThread?.turns || [];
+  const turns = currentThreadState()?.turns || [];
   const items = [];
   for (const turn of turns) {
     for (const item of turn.items || []) {
@@ -1070,7 +1168,7 @@ function threadSignature(thread) {
 }
 
 function trackExternalActiveTurn() {
-  const turn = findInProgressTurn(state.currentThread);
+  const turn = findInProgressTurn(currentThreadState());
   state.externalActiveTurnId = turn && turn.id !== state.activeTurnId ? turn.id : null;
   renderComposerState();
 }
@@ -1132,6 +1230,126 @@ function stableLabel(value) {
   } catch {
     return String(value);
   }
+}
+
+function deriveConversationStatus(thread) {
+  if (findInProgressTurn(thread)) {
+    return { type: "running" };
+  }
+
+  if (thread?.resumeState === "needs_resume") {
+    return { type: "needs_resume" };
+  }
+
+  return { type: "idle" };
+}
+
+function applyJsonPatches(base, patches) {
+  let next = cloneJson(base);
+  for (const patch of patches) {
+    if (!isPlainObject(patch) || typeof patch.op !== "string") {
+      throw new Error("Invalid patch object");
+    }
+
+    const path = normalizePatchPath(patch.path);
+    if (path.length === 0) {
+      next = patch.op === "remove" ? null : cloneJson(patch.value ?? null);
+      continue;
+    }
+
+    const { target, key } = resolvePatchTarget(next, path);
+    if (patch.op === "remove") {
+      removePatchValue(target, key);
+      continue;
+    }
+
+    if (patch.op !== "add" && patch.op !== "replace") {
+      throw new Error(`Unsupported patch op ${patch.op}`);
+    }
+
+    setPatchValue(target, key, cloneJson(patch.value ?? null), patch.op);
+  }
+  return next;
+}
+
+function normalizePatchPath(path) {
+  if (Array.isArray(path)) {
+    return path;
+  }
+
+  if (typeof path !== "string") {
+    throw new Error("Invalid patch path");
+  }
+
+  if (path === "") {
+    return [];
+  }
+
+  return path
+    .replace(/^\//, "")
+    .split("/")
+    .map((part) => part.replace(/~1/g, "/").replace(/~0/g, "~"));
+}
+
+function resolvePatchTarget(root, path) {
+  let target = root;
+  for (const part of path.slice(0, -1)) {
+    if (!isPlainObject(target) && !Array.isArray(target)) {
+      throw new Error("Patch target is not traversable");
+    }
+    target = target[part];
+  }
+
+  if (!isPlainObject(target) && !Array.isArray(target)) {
+    throw new Error("Patch parent is not an object or array");
+  }
+
+  return { target, key: path[path.length - 1] };
+}
+
+function setPatchValue(target, key, value, op) {
+  if (!Array.isArray(target)) {
+    target[String(key)] = value;
+    return;
+  }
+
+  if (key === "-") {
+    target.push(value);
+    return;
+  }
+
+  const index = Number(key);
+  if (!Number.isInteger(index)) {
+    throw new Error("Array patch key is not an integer");
+  }
+
+  if (op === "add") {
+    target.splice(index, 0, value);
+    return;
+  }
+
+  target[index] = value;
+}
+
+function removePatchValue(target, key) {
+  if (Array.isArray(target)) {
+    const index = Number(key);
+    if (!Number.isInteger(index)) {
+      throw new Error("Array patch key is not an integer");
+    }
+    target.splice(index, 1);
+    return;
+  }
+
+  delete target[String(key)];
+}
+
+function isPlainObject(value) {
+  return typeof value === "object" && value !== null && !Array.isArray(value);
+}
+
+function cloneJson(value) {
+  return JSON.parse(JSON.stringify(value));
 }
 
 function shortPath(path) {
