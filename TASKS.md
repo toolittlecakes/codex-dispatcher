@@ -10,7 +10,7 @@ Goal: make the dispatcher behave like the VS Code Codex extension for shared ses
 - Keep polling only as explicit refresh/read behavior, not as the live update path.
 - Validation: Desktop/VS Code text deltas and turn state show in dispatcher during the same turn.
 
-## 2. IPC approval and elicitation forwarding
+## 2. IPC approval and elicitation forwarding - done
 
 - Parse owner conversation requests from mirrored state.
 - Render command, file, permission, user-input, and MCP elicitation requests for follower sessions.

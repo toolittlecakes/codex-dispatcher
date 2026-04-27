@@ -1,3 +1,4 @@
+import { buildApprovalResponseRequest, collectApprovalRequests } from "./approval-requests.js";
 import { applyJsonPatches, cloneJson, isPlainObject } from "./json-patch.js";
 
 const state = {
@@ -560,6 +561,7 @@ function setMirroredConversations(entries) {
     }
   }
   renderThreads();
+  renderApprovals();
   renderSelectedThread();
 }
 
@@ -573,6 +575,7 @@ function applyThreadStreamChange(threadId, change) {
     if (change.type === "snapshot" && isPlainObject(change.conversationState)) {
       state.mirroredThreads.set(threadId, normalizeMirroredThread(threadId, change.conversationState));
       renderThreads();
+      renderApprovals();
       renderSelectedThread({ preserveScroll: true });
       return;
     }
@@ -586,6 +589,7 @@ function applyThreadStreamChange(threadId, change) {
 
       state.mirroredThreads.set(threadId, normalizeMirroredThread(threadId, applyJsonPatches(current, change.patches)));
       renderThreads();
+      renderApprovals();
       renderSelectedThread({ preserveScroll: true });
       return;
     }
@@ -610,6 +614,7 @@ function updateMirroredConversation(threadId, update) {
   update(next);
   state.mirroredThreads.set(threadId, normalizeMirroredThread(threadId, next));
   renderThreads();
+  renderApprovals();
   renderSelectedThread({ preserveScroll: true });
 }
 
@@ -675,6 +680,7 @@ function dropMirroredThread(threadId, reason) {
   state.streamOwners.delete(threadId);
   clearSelectedMirrorThread(threadId, reason);
   renderThreads();
+  renderApprovals();
   if (threadId === state.selectedThreadId || !state.selectedThreadId) {
     renderSelectedThread({ preserveScroll: true });
   }
@@ -912,7 +918,11 @@ function inputText(input) {
 }
 
 function renderApprovals() {
-  const requests = Array.from(state.approvals.values());
+  const requests = collectApprovalRequests({
+    appServerRequests: Array.from(state.approvals.values()),
+    mirroredThreads: state.mirroredThreads,
+    streamOwners: state.streamOwners,
+  });
   dom.approvalTray.classList.toggle("hidden", requests.length === 0);
   dom.approvalCount.textContent = requests.length > 0 ? String(requests.length) : "";
   dom.approvalCount.className = requests.length > 0 ? "approval-count-badge" : "";
@@ -936,6 +946,11 @@ function renderApproval(requestValue) {
 
   if (requestValue.method === "item/tool/requestUserInput") {
     card.append(renderUserInputForm(requestValue));
+    return card;
+  }
+
+  if (requestValue.method === "mcpServer/elicitation/request" && mcpElicitationFields(requestValue).length > 0) {
+    card.append(renderMcpElicitationForm(requestValue));
     return card;
   }
 
@@ -1010,6 +1025,90 @@ function renderUserInputForm(requestValue) {
   return form;
 }
 
+function renderMcpElicitationForm(requestValue) {
+  const form = document.createElement("form");
+  form.className = "approval-form";
+  const fields = mcpElicitationFields(requestValue);
+
+  for (const fieldConfig of fields) {
+    const field = document.createElement("label");
+    field.className = "search-field";
+
+    const label = document.createElement("span");
+    label.textContent = fieldConfig.label;
+    field.append(label);
+
+    if (fieldConfig.options.length > 0) {
+      const select = document.createElement("select");
+      select.name = fieldConfig.name;
+      select.required = fieldConfig.required;
+      for (const option of fieldConfig.options) {
+        const element = document.createElement("option");
+        element.value = String(option);
+        element.textContent = String(option);
+        select.append(element);
+      }
+      field.append(select);
+    } else if (fieldConfig.type === "boolean") {
+      const input = document.createElement("input");
+      input.name = fieldConfig.name;
+      input.type = "checkbox";
+      field.append(input);
+    } else {
+      const input = document.createElement("input");
+      input.name = fieldConfig.name;
+      input.required = fieldConfig.required;
+      input.type = fieldConfig.type === "number" || fieldConfig.type === "integer" ? "number" : "text";
+      input.placeholder = fieldConfig.description || "";
+      field.append(input);
+    }
+
+    form.append(field);
+  }
+
+  const actions = document.createElement("div");
+  actions.className = "approval-actions";
+
+  const submit = document.createElement("button");
+  submit.className = "allow";
+  submit.type = "submit";
+  submit.textContent = "Submit";
+  actions.append(submit);
+
+  const cancel = document.createElement("button");
+  cancel.className = "deny";
+  cancel.type = "button";
+  cancel.textContent = "Cancel";
+  cancel.addEventListener("click", () => {
+    void respondToApproval(requestValue, { action: "cancel", content: null, _meta: null });
+  });
+  actions.append(cancel);
+
+  form.append(actions);
+
+  form.addEventListener("submit", (event) => {
+    event.preventDefault();
+    const data = new FormData(form);
+    const content = {};
+    for (const fieldConfig of fields) {
+      if (fieldConfig.type === "boolean") {
+        content[fieldConfig.name] = data.get(fieldConfig.name) === "on";
+        continue;
+      }
+
+      const rawValue = String(data.get(fieldConfig.name) || "").trim();
+      if (!fieldConfig.required && rawValue.length === 0) {
+        continue;
+      }
+
+      content[fieldConfig.name] = fieldConfig.type === "number" || fieldConfig.type === "integer" ? Number(rawValue) : rawValue;
+    }
+    void respondToApproval(requestValue, { action: "accept", content, _meta: null });
+  });
+
+  return form;
+}
+
 function approvalTitle(method) {
   if (method === "item/commandExecution/requestApproval") return "Command approval";
   if (method === "item/fileChange/requestApproval") return "File change approval";
@@ -1021,7 +1120,8 @@ function approvalTitle(method) {
 
 function approvalDescription(requestValue) {
   const params = requestValue.params || {};
-  return params.reason || params.message || params.cwd || requestValue.method;
+  const source = requestValue.source === "ipc" ? `${threadTitle(requestValue.conversationId)} - ` : "";
+  return `${source}${params.reason || params.message || params.cwd || requestValue.method}`;
 }
 
 function approvalBody(requestValue) {
@@ -1064,6 +1164,8 @@ function approvalActions(requestValue) {
 
     case "mcpServer/elicitation/request":
       return [
+        { label: "Accept", className: "allow", result: { action: "accept", content: {}, _meta: null } },
+        { label: "Decline", className: "secondary", result: { action: "decline", content: null, _meta: null } },
         { label: "Cancel", className: "deny", result: { action: "cancel", content: null, _meta: null } },
       ];
 
@@ -1084,12 +1186,62 @@ function grantedPermissions(permissions) {
 }
 
 async function respondToApproval(requestValue, result) {
-  await request("respondServerRequest", {
-    appServerRequestId: String(requestValue.id),
-    result,
+  try {
+    const responseRequest = buildApprovalResponseRequest(requestValue, result);
+    await request(responseRequest.type, responseRequest.payload);
+
+    if (requestValue.source === "ipc") {
+      removeMirroredRequest(requestValue.conversationId, requestValue.requestId);
+    } else {
+      state.approvals.delete(String(requestValue.id));
+    }
+
+    setStatus("Approval sent", false);
+    renderApprovals();
+  } catch (error) {
+    setStatus(error instanceof Error ? error.message : String(error), true);
+  }
+}
+
+function removeMirroredRequest(conversationId, requestId) {
+  if (typeof conversationId !== "string") {
+    return;
+  }
+
+  const thread = state.mirroredThreads.get(conversationId);
+  if (!thread || !Array.isArray(thread.requests)) {
+    return;
+  }
+
+  const next = cloneJson(thread);
+  next.requests = next.requests.filter((requestValue) => String(requestValue.id) !== String(requestId));
+  state.mirroredThreads.set(conversationId, normalizeMirroredThread(conversationId, next));
+  renderThreads();
+  renderSelectedThread({ preserveScroll: true });
+}
+
+function mcpElicitationFields(requestValue) {
+  const schema = requestValue.params?.requestedSchema;
+  if (!isPlainObject(schema) || !isPlainObject(schema.properties)) {
+    return [];
+  }
+
+  const required = Array.isArray(schema.required) ? new Set(schema.required.filter((name) => typeof name === "string")) : new Set();
+  return Object.entries(schema.properties).flatMap(([name, fieldSchema]) => {
+    if (!isPlainObject(fieldSchema)) {
+      return [];
+    }
+
+    const type = Array.isArray(fieldSchema.type) ? fieldSchema.type.find((value) => value !== "null") : fieldSchema.type;
+    return [{
+      description: typeof fieldSchema.description === "string" ? fieldSchema.description : "",
+      label: typeof fieldSchema.title === "string" ? fieldSchema.title : name,
+      name,
+      options: Array.isArray(fieldSchema.enum) ? fieldSchema.enum : [],
+      required: required.has(name),
+      type: typeof type === "string" ? type : "string",
+    }];
   });
-  state.approvals.delete(String(requestValue.id));
-  renderApprovals();
 }
 
 function renderComposerState() {
@@ -1179,6 +1331,7 @@ function setStreamOwners(entries) {
     }
   }
   renderThreads();
+  renderApprovals();
   if (selectedMirrorCleared) {
     renderSelectedThread({ preserveScroll: true });
     renderIpcStatus();
@@ -1198,6 +1351,7 @@ function setThreadOwner(threadId, ownerClientId) {
 
   state.streamOwners.set(threadId, ownerClientId);
   renderThreads();
+  renderApprovals();
   renderThreadHeader();
   renderComposerState();
   renderIpcStatus();
@@ -1261,6 +1415,11 @@ function selectedThreadOwner() {
 function threadOwner(threadId) {
   if (!threadId) return null;
   return state.streamOwners.get(threadId) || null;
+}
+
+function threadTitle(threadId) {
+  const thread = threadId ? state.mirroredThreads.get(threadId) || state.threads.find((item) => item.id === threadId) : null;
+  return thread?.name || thread?.title || thread?.preview || "IPC session";
 }
 
 function findInProgressTurn(thread) {
