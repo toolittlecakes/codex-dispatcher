@@ -800,7 +800,7 @@ function collectItems() {
       });
     }
     for (const item of turnItems) {
-      items.push(item);
+      items.push(renderableItem(item));
     }
     if (hasDisplayValue(turn.diff)) {
       items.push({
@@ -811,9 +811,20 @@ function collectItems() {
     }
   }
   for (const liveItem of state.liveItems.values()) {
-    items.push(liveItem);
+    items.push(renderableItem(liveItem));
   }
   return items;
+}
+
+function renderableItem(item) {
+  if (item && typeof item === "object") {
+    return item;
+  }
+  return {
+    type: "error",
+    message: "Malformed item",
+    additionalDetails: item,
+  };
 }
 
 function renderItem(item) {
@@ -908,9 +919,12 @@ function renderPlanItem(item) {
     const list = document.createElement("ol");
     list.className = "plan-list";
     for (const entry of item.plan) {
+      const planEntry = isPlainObject(entry) ? entry : {};
       const row = document.createElement("li");
-      row.className = `plan-step ${String(entry.status || "").toLowerCase()}`;
-      row.textContent = [entry.status, entry.step || entry.text].filter(Boolean).join(" - ");
+      row.className = `plan-step ${String(planEntry.status || "").toLowerCase()}`;
+      row.textContent = [planEntry.status, planEntry.step || planEntry.text || stringifyPretty(entry)]
+        .filter(Boolean)
+        .join(" - ");
       list.append(row);
     }
     body.append(list);
@@ -972,18 +986,19 @@ function renderFileChange(item) {
   const list = document.createElement("div");
   list.className = "file-change-list";
   for (const change of changes) {
+    const changeObject = isPlainObject(change) ? change : {};
     const row = document.createElement("div");
     row.className = "change-row";
     const kind = document.createElement("span");
     kind.className = "change-kind";
-    kind.textContent = fileChangeKind(change);
+    kind.textContent = fileChangeKind(changeObject);
     const path = document.createElement("span");
     path.className = "change-path";
-    path.textContent = change.path || change.move_path || "unknown";
+    path.textContent = fileChangePath(changeObject) || stringifyPretty(change);
     row.append(kind, path);
     list.append(row);
 
-    const diff = change.unified_diff || change.diff || change.content;
+    const diff = fileChangeDiff(changeObject);
     if (diff) {
       list.append(renderDetails("Patch", diff, true));
     }
@@ -1002,8 +1017,8 @@ function renderDiff(label, diff) {
 function renderImageItem(item) {
   const body = document.createElement("div");
   body.className = "message-body image-body";
-  const src = item.src || item.url || item.savedPath || item.path || item.result;
-  if (isDisplayableImageUrl(src)) {
+  const src = displayableImageSrc(item.src || item.url || item.result);
+  if (src) {
     const image = document.createElement("img");
     image.className = "image-preview";
     image.src = src;
@@ -1107,17 +1122,21 @@ function messageLabel(item) {
 function itemText(item) {
   switch (item.type) {
     case "userMessage":
-      return item.content.map(inputText).filter(Boolean).join("\n");
+      return Array.isArray(item.content)
+        ? item.content.map(inputText).filter(Boolean).join("\n")
+        : stringifyPretty(item.content);
     case "agentMessage":
       return item.text || "";
     case "reasoning":
       return [flattenTextParts(item.summary), flattenTextParts(item.content)].filter(Boolean).join("\n");
     case "plan":
       return item.text || "";
-    case "fileChange":
-      return (item.changes || [])
-        .map((change) => `${change.kind}: ${change.path}`)
-        .join("\n") || `${item.changes?.length || 0} file change(s)`;
+    case "fileChange": {
+      const changes = Array.isArray(item.changes) ? item.changes : [];
+      return changes
+        .map((change) => `${fileChangeKind(isPlainObject(change) ? change : {})}: ${fileChangePath(change) || stringifyPretty(change)}`)
+        .join("\n") || `${changes.length} file change(s)`;
+    }
     case "webSearch":
       return item.query || "";
     case "imageView":
@@ -1349,6 +1368,14 @@ function fileChangeKind(change) {
   return "change";
 }
 
+function fileChangePath(change) {
+  return change?.path || change?.move_path || "";
+}
+
+function fileChangeDiff(change) {
+  return change?.unified_diff || change?.diff || change?.content || "";
+}
+
 function isSafeUrl(value) {
   if (typeof value !== "string") return false;
   try {
@@ -1359,11 +1386,27 @@ function isSafeUrl(value) {
   }
 }
 
-function isDisplayableImageUrl(value) {
-  return typeof value === "string" && (value.startsWith("data:image/") || /^https?:\/\//.test(value));
+function displayableImageSrc(value) {
+  if (typeof value !== "string") return "";
+  const trimmed = value.trim();
+  if (trimmed.startsWith("data:image/") || /^https?:\/\//.test(trimmed)) {
+    return trimmed;
+  }
+
+  const compact = trimmed.replace(/\s/g, "");
+  if (!/^[A-Za-z0-9+/]+={0,2}$/.test(compact) || compact.length < 64) {
+    return "";
+  }
+
+  if (compact.startsWith("iVBORw0KGgo")) return `data:image/png;base64,${compact}`;
+  if (compact.startsWith("/9j/")) return `data:image/jpeg;base64,${compact}`;
+  if (compact.startsWith("R0lGOD")) return `data:image/gif;base64,${compact}`;
+  if (compact.startsWith("UklGR")) return `data:image/webp;base64,${compact}`;
+  return `data:image/png;base64,${compact}`;
 }
 
 function inputText(input) {
+  if (!input || typeof input !== "object") return stringifyPretty(input);
   if (input.type === "text") return input.text;
   if (input.type === "image") return `[image] ${input.url}`;
   if (input.type === "localImage") return `[local image] ${input.path}`;
