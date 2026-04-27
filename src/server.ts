@@ -4,6 +4,13 @@ import { resolve, sep } from "node:path";
 import { applyJsonPatches, cloneJson } from "../public/json-patch.js";
 import { CodexAppServer, type JsonObject, type JsonValue } from "./codex-app-server";
 import { CodexIpcBridge, type IpcBroadcastMessage } from "./codex-ipc";
+import {
+  buildDispatcherSnapshotParams,
+  buildDispatcherTurnStartRequest,
+  buildQueuedFollowUpsBroadcastParams,
+  dispatcherIpcHostId,
+  updateCollaborationModeSettings,
+} from "./dispatcher-owner";
 
 type ClientMessage = {
   type?: string;
@@ -446,12 +453,18 @@ async function handleDispatcherOwnerRequest(method: string, paramsValue: JsonVal
 
     case "thread-follower-set-model-and-reasoning":
       updateDispatcherOwnedConversation(conversationId, (conversation) => {
-        if (typeof params.model === "string") {
-          conversation.latestModel = params.model;
-        }
+        const model = requireJsonString(params.model, "model");
+        conversation.latestModel = model;
         if (typeof params.reasoningEffort === "string" || params.reasoningEffort === null) {
           conversation.latestReasoningEffort = params.reasoningEffort;
         }
+        const reasoningEffort =
+          params.reasoningEffort === undefined ? conversation.latestReasoningEffort : params.reasoningEffort;
+        conversation.latestCollaborationMode = updateCollaborationModeSettings(
+          conversation.latestCollaborationMode,
+          model,
+          reasoningEffort,
+        );
       });
       broadcastDispatcherOwnedSnapshot(conversationId);
       return { ok: true };
@@ -465,9 +478,12 @@ async function handleDispatcherOwnerRequest(method: string, paramsValue: JsonVal
 
     case "thread-follower-set-queued-follow-ups-state":
       updateDispatcherOwnedConversation(conversationId, (conversation) => {
-        conversation.queuedFollowUpsState = params.queuedFollowUpsState ?? params.state ?? null;
+        conversation.queuedFollowUpsState = params.state ?? null;
       });
-      ipcBridge.broadcast("thread-queued-followups-changed", { conversationId });
+      ipcBridge.broadcast(
+        "thread-queued-followups-changed",
+        buildQueuedFollowUpsBroadcastParams(conversationId, params.state ?? null),
+      );
       broadcastDispatcherOwnedSnapshot(conversationId);
       return { ok: true };
 
@@ -478,18 +494,14 @@ async function handleDispatcherOwnerRequest(method: string, paramsValue: JsonVal
 
 async function handleDispatcherOwnerStartTurn(conversationId: string, params: JsonObject): Promise<JsonValue> {
   const turnStartParams = requireJsonObject(params.turnStartParams, "turnStartParams");
-  const result = await appServer.request("turn/start", {
-    threadId: conversationId,
-    input: Array.isArray(turnStartParams.input) ? turnStartParams.input : [],
-    cwd: normalizeJsonString(turnStartParams.cwd),
-    attachments: Array.isArray(turnStartParams.attachments) ? turnStartParams.attachments : [],
-    approvalPolicy: turnStartParams.approvalPolicy ?? null,
-    approvalsReviewer: turnStartParams.approvalsReviewer ?? null,
-    sandboxPolicy: turnStartParams.sandboxPolicy ?? null,
-    model: turnStartParams.model ?? null,
-    effort: turnStartParams.effort ?? null,
-    collaborationMode: turnStartParams.collaborationMode ?? null,
-  });
+  const result = await appServer.request(
+    "turn/start",
+    buildDispatcherTurnStartRequest(
+      conversationId,
+      dispatcherOwnedConversations.get(conversationId),
+      turnStartParams,
+    ),
+  );
   scheduleDispatcherOwnedRefresh(conversationId, 0);
   return { result };
 }
@@ -604,14 +616,7 @@ function broadcastDispatcherOwnedSnapshot(threadId: string): void {
     return;
   }
 
-  ipcBridge.broadcast("thread-stream-state-changed", {
-    conversationId: threadId,
-    hostId: "dispatcher",
-    change: {
-      type: "snapshot",
-      conversationState: conversation,
-    },
-  });
+  ipcBridge.broadcast("thread-stream-state-changed", buildDispatcherSnapshotParams(threadId, conversation));
 }
 
 function updateDispatcherOwnedConversation(threadId: string, update: (conversation: JsonObject) => void): void {
@@ -625,6 +630,7 @@ function conversationFromThread(threadId: string, thread: JsonObject): JsonObjec
   return {
     ...cloneJsonObject(thread),
     id: threadId,
+    hostId: dispatcherIpcHostId,
     requests: pendingRequestsForThread(threadId),
   };
 }
@@ -632,6 +638,7 @@ function conversationFromThread(threadId: string, thread: JsonObject): JsonObjec
 function minimalDispatcherConversation(threadId: string): JsonObject {
   return {
     id: threadId,
+    hostId: dispatcherIpcHostId,
     title: null,
     name: null,
     preview: null,
@@ -860,15 +867,6 @@ function requireJsonString(value: JsonValue | undefined, name: string): string {
 
 function normalizeOptionalString(value: string | undefined): string | null {
   if (!value) {
-    return null;
-  }
-
-  const trimmed = value.trim();
-  return trimmed.length > 0 ? trimmed : null;
-}
-
-function normalizeJsonString(value: JsonValue | undefined): string | null {
-  if (typeof value !== "string") {
     return null;
   }
 
