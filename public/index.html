@@ -79,8 +79,38 @@
             <span class="session-mode" id="sessionModePill">App server</span>
             <span class="active-turn hidden" id="activeTurnPill">Active turn</span>
           </div>
+          <div class="composer-controls">
+            <label class="field model-field">
+              <span>Model</span>
+              <input id="modelInput" autocomplete="off" placeholder="Thread default" />
+            </label>
+            <label class="field reasoning-field">
+              <span>Reasoning</span>
+              <select id="reasoningSelect">
+                <option value="">Thread default</option>
+                <option value="low">Low</option>
+                <option value="medium">Medium</option>
+                <option value="high">High</option>
+                <option value="xhigh">XHigh</option>
+              </select>
+            </label>
+            <label class="field collaboration-field">
+              <span>Mode</span>
+              <select id="collaborationSelect">
+                <option value="inherit">Inherit</option>
+                <option value="off">Off</option>
+              </select>
+            </label>
+            <button class="ghost-button" id="compactButton" type="button">Compact</button>
+            <button class="ghost-button" id="editLastButton" type="button">Edit last</button>
+          </div>
+          <div class="attachment-strip hidden" id="attachmentStrip"></div>
+          <div class="queue-strip hidden" id="queueStrip"></div>
           <div class="composer-row">
             <textarea id="promptInput" rows="1" placeholder="Message Codex"></textarea>
+            <input class="hidden" id="attachmentInput" type="file" accept="image/*" multiple />
+            <button class="ghost-button icon-action" id="attachButton" type="button" title="Attach images" aria-label="Attach images">+</button>
+            <button class="ghost-button" id="queueButton" type="button">Queue</button>
             <button class="danger-button hidden" id="stopButton" type="button">Stop</button>
             <button class="send-button" id="sendButton" type="submit">Send</button>
           </div>

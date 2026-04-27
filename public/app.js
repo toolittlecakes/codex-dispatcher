@@ -18,6 +18,9 @@ const state = {
   activeTurnId: null,
   externalActiveTurnId: null,
   liveItems: new Map(),
+  pendingAttachments: [],
+  queuedFollowUps: new Map(),
+  editingTurn: null,
   defaultCwd: "",
   fastSyncTimer: 0,
   ipc: null,
@@ -29,15 +32,25 @@ const state = {
 
 const dom = {
   activeTurnPill: document.querySelector("#activeTurnPill"),
+  attachButton: document.querySelector("#attachButton"),
+  attachmentInput: document.querySelector("#attachmentInput"),
+  attachmentStrip: document.querySelector("#attachmentStrip"),
   approvalCount: document.querySelector("#approvalCount"),
   approvalList: document.querySelector("#approvalList"),
   approvalTray: document.querySelector("#approvalTray"),
+  collaborationSelect: document.querySelector("#collaborationSelect"),
+  compactButton: document.querySelector("#compactButton"),
   composer: document.querySelector("#composer"),
   cwdInput: document.querySelector("#cwdInput"),
+  editLastButton: document.querySelector("#editLastButton"),
   messages: document.querySelector("#messages"),
+  modelInput: document.querySelector("#modelInput"),
   newThreadButton: document.querySelector("#newThreadButton"),
   promptInput: document.querySelector("#promptInput"),
   ipcPill: document.querySelector("#ipcPill"),
+  queueButton: document.querySelector("#queueButton"),
+  queueStrip: document.querySelector("#queueStrip"),
+  reasoningSelect: document.querySelector("#reasoningSelect"),
   refreshButton: document.querySelector("#refreshButton"),
   searchInput: document.querySelector("#searchInput"),
   sendButton: document.querySelector("#sendButton"),
@@ -70,6 +83,39 @@ dom.refreshButton.addEventListener("click", () => {
 
 dom.newThreadButton.addEventListener("click", () => {
   void createThread();
+});
+
+dom.attachButton.addEventListener("click", () => {
+  dom.attachmentInput.click();
+});
+
+dom.attachmentInput.addEventListener("change", () => {
+  void addImageAttachments(dom.attachmentInput.files);
+  dom.attachmentInput.value = "";
+});
+
+dom.compactButton.addEventListener("click", () => {
+  void compactCurrentThread();
+});
+
+dom.editLastButton.addEventListener("click", () => {
+  startEditingLastUserTurn();
+});
+
+dom.queueButton.addEventListener("click", () => {
+  void queuePrompt();
+});
+
+dom.modelInput.addEventListener("change", () => {
+  void syncThreadSettings();
+});
+
+dom.reasoningSelect.addEventListener("change", () => {
+  void syncThreadSettings();
+});
+
+dom.collaborationSelect.addEventListener("change", () => {
+  void syncThreadSettings();
 });
 
 dom.threadsButton.addEventListener("click", () => {
@@ -267,7 +313,16 @@ function handleIpcBroadcast(broadcast, ipc) {
     return;
   }
 
-  if (method === "thread-archived" || method === "thread-unarchived" || method === "thread-queued-followups-changed") {
+  if (method === "thread-queued-followups-changed") {
+    if (typeof params.conversationId === "string" && Array.isArray(params.messages)) {
+      state.queuedFollowUps.set(params.conversationId, params.messages);
+      renderQueuedFollowUps();
+    }
+    scheduleFastSync();
+    return;
+  }
+
+  if (method === "thread-archived" || method === "thread-unarchived") {
     scheduleFastSync();
     return;
   }
@@ -345,12 +400,14 @@ async function handleCodexNotification(notification) {
 
   if (method === "turn/completed") {
     if (params.threadId !== state.selectedThreadId) return;
+    const completedThreadId = params.threadId;
     state.activeTurnId = null;
     state.externalActiveTurnId = null;
     state.liveItems.clear();
     renderComposerState();
     await refreshCurrentThread();
     await loadThreads();
+    await runNextQueuedFollowUp(completedThreadId);
     return;
   }
 
@@ -384,6 +441,9 @@ async function createThread() {
   state.currentThread = thread;
   state.externalActiveTurnId = null;
   state.liveItems.clear();
+  state.pendingAttachments = [];
+  state.editingTurn = null;
+  hydrateComposerControls(thread);
   renderThreads();
   renderSelectedThread();
   await loadThreads();
@@ -393,8 +453,11 @@ async function openThread(threadId) {
   state.selectedThreadId = threadId;
   state.externalActiveTurnId = null;
   state.liveItems.clear();
+  state.pendingAttachments = [];
+  state.editingTurn = null;
   closeSidebar();
   state.currentThread = state.threads.find((thread) => thread.id === threadId) || state.mirroredThreads.get(threadId) || null;
+  hydrateComposerControls(state.currentThread);
   renderThreads();
 
   if (state.mirroredThreads.has(threadId)) {
@@ -406,6 +469,7 @@ async function openThread(threadId) {
   state.currentThread = result.thread;
   trackExternalActiveTurn();
   dom.cwdInput.value = currentThreadState()?.cwd || result.cwd || result.thread?.cwd || state.defaultCwd;
+  hydrateComposerControls(currentThreadState());
   renderSelectedThread();
 }
 
@@ -418,10 +482,15 @@ async function refreshCurrentThread(options = {}) {
 
 async function submitPrompt() {
   const text = dom.promptInput.value.trim();
-  if (!text) return;
+  if (!text && state.pendingAttachments.length === 0) return;
   const ownerClientId = selectedThreadOwner();
   if (state.externalActiveTurnId && !state.activeTurnId && !ownerClientId) {
     setStatus("Live elsewhere", false);
+    return;
+  }
+
+  if (state.editingTurn) {
+    await saveEditedLastUserTurn(text);
     return;
   }
 
@@ -431,15 +500,22 @@ async function submitPrompt() {
 
   const threadId = state.selectedThreadId;
   const nextOwnerClientId = selectedThreadOwner();
+  const attachments = state.pendingAttachments;
+  const input = buildComposerInput(text, attachments);
+  const turnSettings = selectedTurnSettings();
   const payload = {
     threadId,
     text,
+    input,
     cwd: dom.cwdInput.value.trim(),
+    ...turnSettings,
   };
 
   dom.promptInput.value = "";
   dom.promptInput.style.height = "auto";
+  state.pendingAttachments = [];
   renderComposerState();
+  renderAttachments();
 
   try {
     if (nextOwnerClientId) {
@@ -451,17 +527,20 @@ async function submitPrompt() {
         params: steering
           ? {
               conversationId: threadId,
-              input: [textInput(text)],
+              input,
               attachments: [],
               restoreMessage: restoreMessage(payload.cwd),
             }
           : {
               conversationId: threadId,
               turnStartParams: {
-                input: [textInput(text)],
+                input,
                 cwd: payload.cwd || state.defaultCwd,
                 attachments: [],
-                inheritThreadSettings: true,
+                inheritThreadSettings: turnSettings.inheritThreadSettings,
+                model: turnSettings.model,
+                effort: turnSettings.effort,
+                collaborationMode: turnSettings.collaborationMode,
               },
             },
       });
@@ -486,9 +565,11 @@ async function submitPrompt() {
     scrollMessagesToEnd();
   } catch (error) {
     dom.promptInput.value = text;
+    state.pendingAttachments = attachments;
     dom.promptInput.style.height = "auto";
     dom.promptInput.style.height = `${Math.min(dom.promptInput.scrollHeight, 180)}px`;
     renderComposerState();
+    renderAttachments();
     setStatus(error instanceof Error ? error.message : String(error), true);
   }
 }
@@ -512,6 +593,177 @@ async function interruptTurn() {
     await request("interruptTurn", {
       threadId: state.selectedThreadId,
       turnId: state.activeTurnId,
+    });
+  } catch (error) {
+    setStatus(error instanceof Error ? error.message : String(error), true);
+  }
+}
+
+async function compactCurrentThread() {
+  if (!state.selectedThreadId) return;
+  const threadId = state.selectedThreadId;
+  const ownerClientId = selectedThreadOwner();
+  try {
+    if (ownerClientId) {
+      await request("ipcFollowerRequest", {
+        threadId,
+        ownerClientId,
+        method: "thread-follower-compact-thread",
+        params: { conversationId: threadId },
+      });
+    } else {
+      await request("compactThread", { threadId });
+      await refreshCurrentThread({ preserveScroll: true });
+    }
+    setStatus("Compact requested", false);
+  } catch (error) {
+    setStatus(error instanceof Error ? error.message : String(error), true);
+  }
+}
+
+function startEditingLastUserTurn() {
+  const turn = editableLastTurn(currentThreadState());
+  if (!turn) return;
+  state.editingTurn = {
+    threadId: state.selectedThreadId,
+    turnId: turn.turnId || turn.id,
+    originalText: userInputText(turn.params?.input || []),
+  };
+  dom.promptInput.value = state.editingTurn.originalText;
+  dom.promptInput.focus();
+  dom.promptInput.style.height = "auto";
+  dom.promptInput.style.height = `${Math.min(dom.promptInput.scrollHeight, 180)}px`;
+  renderComposerState();
+}
+
+async function saveEditedLastUserTurn(text) {
+  const editingTurn = state.editingTurn;
+  if (!editingTurn || editingTurn.threadId !== state.selectedThreadId || !text) return;
+  const ownerClientId = selectedThreadOwner();
+  const payload = {
+    threadId: editingTurn.threadId,
+    turnId: editingTurn.turnId,
+    text,
+    input: [textInput(text)],
+    cwd: dom.cwdInput.value.trim(),
+    ...selectedTurnSettings(),
+  };
+
+  dom.promptInput.value = "";
+  dom.promptInput.style.height = "auto";
+  state.editingTurn = null;
+  renderComposerState();
+
+  try {
+    if (ownerClientId) {
+      await request("ipcFollowerRequest", {
+        threadId: editingTurn.threadId,
+        ownerClientId,
+        method: "thread-follower-edit-last-user-turn",
+        params: {
+          conversationId: editingTurn.threadId,
+          turnId: editingTurn.turnId,
+          message: text,
+        },
+      });
+      scheduleFastSync();
+      return;
+    }
+
+    const result = await request("editLastUserTurn", payload);
+    state.activeTurnId = result.turn?.id || null;
+    await refreshCurrentThread();
+  } catch (error) {
+    state.editingTurn = editingTurn;
+    dom.promptInput.value = text;
+    dom.promptInput.style.height = `${Math.min(dom.promptInput.scrollHeight, 180)}px`;
+    renderComposerState();
+    setStatus(error instanceof Error ? error.message : String(error), true);
+  }
+}
+
+async function queuePrompt() {
+  const text = dom.promptInput.value.trim();
+  if (!state.selectedThreadId || !text) return;
+  const threadId = state.selectedThreadId;
+  const message = {
+    id: randomId(),
+    text,
+    context: restoreMessage(dom.cwdInput.value.trim()).context,
+    cwd: dom.cwdInput.value.trim() || currentThreadState()?.cwd || state.defaultCwd,
+    createdAt: Date.now(),
+  };
+  const messages = [...queuedMessages(threadId), message];
+  await setQueuedFollowUps(threadId, messages);
+  dom.promptInput.value = "";
+  dom.promptInput.style.height = "auto";
+  renderComposerState();
+}
+
+async function setQueuedFollowUps(threadId, messages) {
+  state.queuedFollowUps.set(threadId, messages);
+  renderQueuedFollowUps();
+  const ownerClientId = threadOwner(threadId);
+  try {
+    if (ownerClientId) {
+      await request("ipcFollowerRequest", {
+        threadId,
+        ownerClientId,
+        method: "thread-follower-set-queued-follow-ups-state",
+        params: {
+          conversationId: threadId,
+          state: { [threadId]: messages },
+        },
+      });
+      return;
+    }
+
+    await request("setQueuedFollowUps", {
+      threadId,
+      state: { [threadId]: messages },
+    });
+  } catch (error) {
+    setStatus(error instanceof Error ? error.message : String(error), true);
+  }
+}
+
+async function syncThreadSettings() {
+  if (!state.selectedThreadId) return;
+  const threadId = state.selectedThreadId;
+  const settings = selectedTurnSettings();
+  const ownerClientId = selectedThreadOwner();
+  try {
+    if (ownerClientId) {
+      if (currentThreadState()?.latestCollaborationMode && (settings.model || settings.effort)) {
+        await request("ipcFollowerRequest", {
+          threadId,
+          ownerClientId,
+          method: "thread-follower-set-model-and-reasoning",
+          params: {
+            conversationId: threadId,
+            model: settings.model,
+            reasoningEffort: settings.effort,
+          },
+        });
+      }
+      if (settings.collaborationMode !== null || settings.inheritThreadSettings !== false) {
+        return;
+      }
+      await request("ipcFollowerRequest", {
+        threadId,
+        ownerClientId,
+        method: "thread-follower-set-collaboration-mode",
+        params: { conversationId: threadId, collaborationMode: null },
+      });
+      return;
+    }
+
+    await request("setThreadSettings", {
+      threadId,
+      model: settings.model,
+      reasoningEffort: settings.effort,
+      collaborationMode: settings.collaborationMode,
+      inheritThreadSettings: settings.inheritThreadSettings,
     });
   } catch (error) {
     setStatus(error instanceof Error ? error.message : String(error), true);
@@ -556,6 +808,168 @@ function restoreMessage(cwd) {
       ideContext: null,
     },
   };
+}
+
+async function addImageAttachments(fileList) {
+  const files = Array.from(fileList || []).filter((file) => file.type.startsWith("image/"));
+  if (files.length === 0) return;
+  try {
+    const attachments = await Promise.all(files.map(readImageAttachment));
+    state.pendingAttachments.push(...attachments);
+    renderAttachments();
+    renderComposerState();
+  } catch (error) {
+    setStatus(error instanceof Error ? error.message : String(error), true);
+  }
+}
+
+function readImageAttachment(file) {
+  return new Promise((resolve, reject) => {
+    const reader = new FileReader();
+    reader.addEventListener("load", () => {
+      resolve({
+        id: randomId(),
+        name: file.name,
+        type: file.type,
+        url: String(reader.result || ""),
+      });
+    });
+    reader.addEventListener("error", () => reject(new Error(`Could not read ${file.name}`)));
+    reader.readAsDataURL(file);
+  });
+}
+
+function buildComposerInput(text, attachments) {
+  const input = [];
+  if (text) {
+    input.push(textInput(text));
+  }
+  for (const attachment of attachments) {
+    input.push({
+      type: "image",
+      url: attachment.url,
+    });
+  }
+  return input;
+}
+
+function selectedTurnSettings() {
+  const model = dom.modelInput.value.trim() || null;
+  const effort = dom.reasoningSelect.value || null;
+  const collaborationOff = dom.collaborationSelect.value === "off";
+  return {
+    model,
+    effort,
+    inheritThreadSettings: !collaborationOff,
+    collaborationMode: collaborationOff ? null : undefined,
+  };
+}
+
+function hydrateComposerControls(thread) {
+  const latestTurn = Array.isArray(thread?.turns) ? thread.turns.at(-1) : null;
+  const collaborationMode = thread?.latestCollaborationMode || latestTurn?.params?.collaborationMode || null;
+  const model = thread?.latestModel || collaborationMode?.settings?.model || latestTurn?.params?.model || "";
+  const effort =
+    thread?.latestReasoningEffort ||
+    collaborationMode?.settings?.reasoning_effort ||
+    latestTurn?.params?.effort ||
+    latestTurn?.params?.reasoningEffort ||
+    "";
+
+  dom.modelInput.value = typeof model === "string" ? model : "";
+  dom.reasoningSelect.value = typeof effort === "string" ? effort : "";
+  dom.collaborationSelect.value = "inherit";
+  dom.collaborationSelect.title = collaborationMode ? stringifyPretty(collaborationMode) : "No active collaboration mode";
+}
+
+function renderAttachments() {
+  dom.attachmentStrip.classList.toggle("hidden", state.pendingAttachments.length === 0);
+  dom.attachmentStrip.replaceChildren(...state.pendingAttachments.map(renderAttachmentChip));
+}
+
+function renderAttachmentChip(attachment) {
+  const chip = document.createElement("span");
+  chip.className = "attachment-chip";
+  const label = document.createElement("span");
+  label.textContent = attachment.name || "Image";
+  const remove = document.createElement("button");
+  remove.type = "button";
+  remove.textContent = "x";
+  remove.addEventListener("click", () => {
+    state.pendingAttachments = state.pendingAttachments.filter((item) => item.id !== attachment.id);
+    renderAttachments();
+    renderComposerState();
+  });
+  chip.append(label, remove);
+  return chip;
+}
+
+function renderQueuedFollowUps() {
+  const messages = queuedMessages(state.selectedThreadId);
+  dom.queueStrip.classList.toggle("hidden", messages.length === 0);
+  dom.queueStrip.replaceChildren(...messages.map(renderQueuedFollowUpChip));
+}
+
+function renderQueuedFollowUpChip(message) {
+  const chip = document.createElement("span");
+  chip.className = "queue-chip";
+  const label = document.createElement("span");
+  label.textContent = message.text || "Queued follow-up";
+  const remove = document.createElement("button");
+  remove.type = "button";
+  remove.textContent = "x";
+  remove.addEventListener("click", () => {
+    const threadId = state.selectedThreadId;
+    if (!threadId) return;
+    void setQueuedFollowUps(threadId, queuedMessages(threadId).filter((item) => item.id !== message.id));
+  });
+  chip.append(label, remove);
+  return chip;
+}
+
+function queuedMessages(threadId) {
+  if (!threadId) return [];
+  const messages = state.queuedFollowUps.get(threadId);
+  return Array.isArray(messages) ? messages : [];
+}
+
+async function runNextQueuedFollowUp(threadId) {
+  if (!threadId || threadOwner(threadId) || state.selectedThreadId !== threadId || state.activeTurnId) {
+    return;
+  }
+  const [nextMessage, ...remaining] = queuedMessages(threadId);
+  if (!nextMessage) return;
+
+  await setQueuedFollowUps(threadId, remaining);
+  const result = await request("startTurn", {
+    threadId,
+    text: nextMessage.text,
+    input: [textInput(nextMessage.text)],
+    cwd: nextMessage.cwd || dom.cwdInput.value.trim(),
+    ...selectedTurnSettings(),
+  });
+  state.activeTurnId = result.turn?.id || null;
+  renderComposerState();
+  await refreshCurrentThread();
+}
+
+function editableLastTurn(thread) {
+  const turns = Array.isArray(thread?.turns) ? thread.turns : [];
+  const turn = turns.at(-1);
+  if (!turn || turn.status === "inProgress") return null;
+  const turnId = turn.turnId || turn.id;
+  if (!turnId || !userInputText(turn.params?.input || [])) return null;
+  return turn;
+}
+
+function userInputText(input) {
+  return Array.isArray(input)
+    ? input.filter((item) => item?.type === "text").map((item) => item.text || "").join("\n").trim()
+    : "";
+}
+
+function randomId() {
+  return crypto.randomUUID ? crypto.randomUUID() : `${Date.now()}-${Math.random().toString(16).slice(2)}`;
 }
 
 function setMirroredConversations(entries) {
@@ -664,6 +1078,8 @@ function renderSelectedThread(options = {}) {
   trackExternalActiveTurn();
   renderThreadHeader();
   renderMessages();
+  renderAttachments();
+  renderQueuedFollowUps();
   if (!options.preserveScroll || wasNearBottom) {
     scrollMessagesToEnd();
   }
@@ -1838,11 +2254,19 @@ function renderComposerState() {
   const active = Boolean(state.activeTurnId);
   const externalActive = Boolean(state.externalActiveTurnId && !state.activeTurnId);
   const canFollowExternal = Boolean(externalActive && selectedThreadOwner());
+  const editing = Boolean(state.editingTurn);
+  const hasThread = Boolean(state.selectedThreadId);
+  const canEdit = Boolean(editableLastTurn(currentThreadState())) && !active && !externalActive;
   dom.stopButton.classList.toggle("hidden", !active && !canFollowExternal);
   dom.activeTurnPill.classList.toggle("hidden", !active && !externalActive);
   dom.activeTurnPill.textContent = active ? "Active turn" : canFollowExternal ? "Following" : "Live elsewhere";
-  dom.sendButton.disabled = externalActive && !canFollowExternal;
-  dom.sendButton.textContent = active || canFollowExternal ? "Steer" : externalActive ? "Live" : "Send";
+  dom.sendButton.disabled = !editing && externalActive && !canFollowExternal;
+  dom.sendButton.textContent = editing ? "Save" : active || canFollowExternal ? "Steer" : externalActive ? "Live" : "Send";
+  dom.attachButton.disabled = editing;
+  dom.queueButton.classList.toggle("hidden", editing || (!active && !canFollowExternal));
+  dom.compactButton.disabled = !hasThread || active || externalActive;
+  dom.editLastButton.disabled = !canEdit;
+  dom.editLastButton.textContent = editing ? "Editing" : "Edit last";
   renderSessionMode();
 }
 

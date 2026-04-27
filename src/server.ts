@@ -21,6 +21,13 @@ type ClientMessage = {
   method?: string;
   text?: string;
   cwd?: string;
+  input?: JsonValue;
+  model?: string | null;
+  effort?: string | null;
+  reasoningEffort?: string | null;
+  collaborationMode?: JsonValue;
+  inheritThreadSettings?: boolean;
+  state?: JsonValue;
   limit?: number;
   searchTerm?: string;
   appServerRequestId?: string;
@@ -296,11 +303,7 @@ async function routeClientMessage(message: ClientMessage): Promise<JsonValue> {
 
     case "startTurn": {
       const threadId = requireString(message.threadId, "threadId");
-      const result = await appServer.request("turn/start", {
-        threadId,
-        input: [textInput(requireString(message.text, "text"))],
-        cwd: normalizeOptionalString(message.cwd),
-      });
+      const result = await appServer.request("turn/start", buildClientTurnStartRequest(message, threadId));
       markDispatcherOwner(threadId);
       scheduleDispatcherOwnedRefresh(threadId, 0);
       return result;
@@ -311,7 +314,7 @@ async function routeClientMessage(message: ClientMessage): Promise<JsonValue> {
       const result = await appServer.request("turn/steer", {
         threadId,
         expectedTurnId: requireString(message.turnId, "turnId"),
-        input: [textInput(requireString(message.text, "text"))],
+        input: clientInput(message),
       });
       scheduleDispatcherOwnedRefresh(threadId, 0);
       return result;
@@ -325,6 +328,65 @@ async function routeClientMessage(message: ClientMessage): Promise<JsonValue> {
       });
       scheduleDispatcherOwnedRefresh(threadId, 0);
       return result;
+    }
+
+    case "compactThread": {
+      const threadId = requireString(message.threadId, "threadId");
+      const result = await appServer.request("thread/compact/start", { threadId });
+      scheduleDispatcherOwnedRefresh(threadId, 0);
+      return result ?? { ok: true };
+    }
+
+    case "editLastUserTurn": {
+      const threadId = requireString(message.threadId, "threadId");
+      const turnId = requireString(message.turnId, "turnId");
+      const thread = await readThreadObject(threadId);
+      validateEditableLastTurn(thread, turnId);
+      await appServer.request("thread/rollback", { threadId, numTurns: 1 });
+      const result = await appServer.request("turn/start", buildClientTurnStartRequest(message, threadId));
+      markDispatcherOwner(threadId);
+      scheduleDispatcherOwnedRefresh(threadId, 0);
+      return result;
+    }
+
+    case "setThreadSettings": {
+      const threadId = requireString(message.threadId, "threadId");
+      await ensureDispatcherOwnedConversation(threadId);
+      updateDispatcherOwnedConversation(threadId, (conversation) => {
+        const model = normalizeNullableString(message.model);
+        const reasoningEffort = normalizeNullableString(message.reasoningEffort ?? message.effort);
+        if (model !== undefined) {
+          conversation.latestModel = model;
+        }
+        if (reasoningEffort !== undefined) {
+          conversation.latestReasoningEffort = reasoningEffort;
+        }
+        if (message.inheritThreadSettings === false || message.collaborationMode !== undefined) {
+          conversation.latestCollaborationMode = message.collaborationMode ?? null;
+        } else {
+          const nextModel = model === undefined ? nullableConversationString(conversation.latestModel) : model;
+          const nextReasoningEffort = reasoningEffort === undefined ? conversation.latestReasoningEffort : reasoningEffort;
+          conversation.latestCollaborationMode = updateCollaborationModeSettings(
+            conversation.latestCollaborationMode,
+            nextModel,
+            nextReasoningEffort,
+          );
+        }
+      });
+      broadcastDispatcherOwnedSnapshot(threadId);
+      return { ok: true };
+    }
+
+    case "setQueuedFollowUps": {
+      const threadId = requireString(message.threadId, "threadId");
+      const stateValue = message.state ?? {};
+      await ensureDispatcherOwnedConversation(threadId);
+      updateDispatcherOwnedConversation(threadId, (conversation) => {
+        conversation.queuedFollowUpsState = stateValue;
+      });
+      ipcBridge.broadcast("thread-queued-followups-changed", buildQueuedFollowUpsBroadcastParams(threadId, stateValue));
+      broadcastDispatcherOwnedSnapshot(threadId);
+      return { ok: true };
     }
 
     case "ipcFollowerRequest": {
@@ -364,6 +426,68 @@ function textInput(text: string): JsonValue {
     text,
     text_elements: [],
   };
+}
+
+function buildClientTurnStartRequest(message: ClientMessage, threadId: string): JsonObject {
+  const params: JsonObject = {
+    threadId,
+    input: clientInput(message),
+    cwd: normalizeOptionalString(message.cwd),
+  };
+  const model = normalizeNullableString(message.model);
+  const effort = normalizeNullableString(message.effort ?? message.reasoningEffort);
+  if (model !== undefined) {
+    params.model = model;
+  }
+  if (effort !== undefined) {
+    params.effort = effort;
+  }
+  if (message.collaborationMode !== undefined || message.inheritThreadSettings === false) {
+    params.collaborationMode = message.collaborationMode ?? null;
+  }
+  return params;
+}
+
+function clientInput(message: ClientMessage): JsonValue[] {
+  if (Array.isArray(message.input) && message.input.length > 0) {
+    const input = message.input.filter(isJsonObject);
+    if (input.length > 0) {
+      return input;
+    }
+  }
+  return [textInput(requireString(message.text, "text"))];
+}
+
+async function readThreadObject(threadId: string): Promise<JsonObject> {
+  const result = await appServer.request("thread/read", {
+    threadId,
+    includeTurns: true,
+  });
+  const resultObject = asJsonObject(result);
+  const thread = asJsonObject(resultObject?.thread);
+  if (!thread) {
+    throw new Error(`Thread ${threadId} not found`);
+  }
+  return thread;
+}
+
+function validateEditableLastTurn(thread: JsonObject, turnId: string): void {
+  const turns = Array.isArray(thread.turns) ? thread.turns : [];
+  const lastTurn = asJsonObject(turns.at(-1));
+  if (!lastTurn || (lastTurn.turnId !== turnId && lastTurn.id !== turnId)) {
+    throw new Error("Only the most recent turn can be edited");
+  }
+  if (lastTurn.status === "inProgress" || lastTurn.status === "in_progress") {
+    throw new Error("Cannot edit while a turn is in progress");
+  }
+}
+
+async function ensureDispatcherOwnedConversation(threadId: string): Promise<void> {
+  if (dispatcherOwnedConversations.has(threadId)) {
+    return;
+  }
+  const thread = await readThreadObject(threadId);
+  dispatcherOwnedConversations.set(threadId, conversationFromThread(threadId, thread));
 }
 
 function applyIpcBroadcastEffects(broadcastMessage: IpcBroadcastMessage): boolean {
@@ -453,7 +577,7 @@ async function handleDispatcherOwnerRequest(method: string, paramsValue: JsonVal
 
     case "thread-follower-set-model-and-reasoning":
       updateDispatcherOwnedConversation(conversationId, (conversation) => {
-        const model = requireJsonString(params.model, "model");
+        const model = nullableJsonString(params.model, "model");
         conversation.latestModel = model;
         if (typeof params.reasoningEffort === "string" || params.reasoningEffort === null) {
           conversation.latestReasoningEffort = params.reasoningEffort;
@@ -865,8 +989,36 @@ function requireJsonString(value: JsonValue | undefined, name: string): string {
   return value;
 }
 
+function nullableJsonString(value: JsonValue | undefined, name: string): string | null {
+  if (value === null) {
+    return null;
+  }
+  if (typeof value !== "string") {
+    throw new Error(`Missing ${name}`);
+  }
+
+  const trimmed = value.trim();
+  return trimmed.length > 0 ? trimmed : null;
+}
+
+function nullableConversationString(value: JsonValue | undefined): string | null {
+  return typeof value === "string" && value.trim().length > 0 ? value : null;
+}
+
 function normalizeOptionalString(value: string | undefined): string | null {
   if (!value) {
+    return null;
+  }
+
+  const trimmed = value.trim();
+  return trimmed.length > 0 ? trimmed : null;
+}
+
+function normalizeNullableString(value: string | null | undefined): string | null | undefined {
+  if (value === undefined) {
+    return undefined;
+  }
+  if (value === null) {
     return null;
   }
 

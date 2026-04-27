@@ -30,7 +30,7 @@ Goal: make the dispatcher behave like the VS Code Codex extension for shared ses
 - Preserve scroll behavior and streaming updates without layout jumps.
 - Validation: common turn item types are readable on desktop and phone viewport sizes.
 
-## 5. Extension-like composer and controls
+## 5. Extension-like composer and controls - done
 
 - Add model/reasoning/collaboration controls, compact, edit-last-user-turn, attachments, and queued follow-ups.
 - Keep controls discoverable on mobile without copying VS Code chrome weight.

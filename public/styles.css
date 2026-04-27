@@ -771,13 +771,77 @@ h3 {
   margin: 0 auto;
 }
 
+.composer-controls {
+  display: grid;
+  grid-template-columns: minmax(110px, 1fr) minmax(116px, 0.7fr) minmax(94px, 0.5fr) auto auto;
+  gap: 8px;
+  align-items: end;
+  width: min(880px, 100%);
+  margin: 0 auto;
+}
+
+.composer-controls .ghost-button {
+  align-self: end;
+}
+
+.attachment-strip,
+.queue-strip {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 7px;
+  width: min(880px, 100%);
+  margin: 0 auto;
+}
+
+.attachment-chip,
+.queue-chip {
+  display: inline-flex;
+  align-items: center;
+  max-width: min(100%, 360px);
+  min-height: 30px;
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  background: var(--surface);
+  color: var(--muted);
+  font-size: 12px;
+  font-weight: 750;
+  gap: 7px;
+  padding: 4px 7px;
+}
+
+.attachment-chip span,
+.queue-chip span {
+  overflow: hidden;
+  min-width: 0;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.attachment-chip button,
+.queue-chip button {
+  width: 22px;
+  height: 22px;
+  min-height: 22px;
+  flex: 0 0 auto;
+  border-radius: 6px;
+  background: var(--surface-strong);
+  color: var(--muted);
+  padding: 0;
+  font-weight: 900;
+}
+
 .composer-row {
   display: grid;
-  grid-template-columns: minmax(0, 1fr) auto auto;
+  grid-template-columns: minmax(0, 1fr) auto auto auto auto;
   gap: 9px;
   align-items: end;
   width: min(880px, 100%);
   margin: 0 auto;
+}
+
+.icon-action {
+  width: 38px;
+  padding: 0;
 }
 
 .session-mode {
@@ -866,16 +930,28 @@ textarea {
     grid-template-columns: 1fr;
   }
 
-  .composer-row {
-    grid-template-columns: minmax(0, 1fr) auto;
+  .composer-controls {
+    grid-template-columns: 1fr 1fr;
   }
 
-  .danger-button {
-    grid-column: 1;
+  .model-field {
+    grid-column: 1 / -1;
+  }
+
+  .composer-row {
+    grid-template-columns: auto auto auto minmax(0, 1fr);
+  }
+
+  .composer-row textarea {
+    grid-column: 1 / -1;
+  }
+
+  .icon-action {
+    justify-self: start;
   }
 
   .send-button {
-    grid-column: 2;
+    justify-self: end;
   }
 
   .token-panel form {
