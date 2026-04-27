@@ -36,7 +36,7 @@ export function cloneJson(value) {
 
 function normalizePatchPath(path) {
   if (Array.isArray(path)) {
-    return path;
+    return path.map(validatePathPart);
   }
 
   if (typeof path !== "string") {
@@ -50,7 +50,15 @@ function normalizePatchPath(path) {
   return path
     .replace(/^\//, "")
     .split("/")
-    .map((part) => part.replace(/~1/g, "/").replace(/~0/g, "~"));
+    .map((part) => validatePathPart(part.replace(/~1/g, "/").replace(/~0/g, "~")));
+}
+
+function validatePathPart(part) {
+  if (part !== "__proto__" && part !== "prototype" && part !== "constructor") {
+    return part;
+  }
+
+  throw new Error(`Forbidden patch path segment ${part}`);
 }
 
 function resolvePatchTarget(root, path) {

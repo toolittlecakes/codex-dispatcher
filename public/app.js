@@ -674,10 +674,15 @@ function dropMirroredThread(threadId, reason) {
   state.mirroredThreads.delete(threadId);
   state.streamOwners.delete(threadId);
   if (threadId === state.selectedThreadId) {
+    const fallbackThread = state.threads.find((thread) => thread.id === threadId) || null;
+    state.currentThread = fallbackThread;
+    if (!fallbackThread) {
+      state.selectedThreadId = null;
+    }
     setStatus(reason, true);
   }
   renderThreads();
-  if (threadId === state.selectedThreadId) {
+  if (threadId === state.selectedThreadId || !state.selectedThreadId) {
     renderSelectedThread({ preserveScroll: true });
   }
   renderIpcStatus();

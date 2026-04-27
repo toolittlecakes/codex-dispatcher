@@ -46,4 +46,11 @@ describe("applyJsonPatches", () => {
       "Patch path does not exist",
     );
   });
+
+  test("rejects prototype pollution paths", () => {
+    expect(() => applyJsonPatches({}, [{ op: "add", path: ["__proto__", "polluted"], value: true }])).toThrow(
+      "Forbidden patch path segment __proto__",
+    );
+    expect({}.polluted).toBeUndefined();
+  });
 });
