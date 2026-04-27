@@ -939,7 +939,7 @@ textarea {
   }
 
   .composer-row {
-    grid-template-columns: auto auto auto minmax(0, 1fr);
+    grid-template-columns: auto auto minmax(0, 1fr) auto;
   }
 
   .composer-row textarea {
@@ -951,6 +951,7 @@ textarea {
   }
 
   .send-button {
+    grid-column: 4;
     justify-self: end;
   }
 

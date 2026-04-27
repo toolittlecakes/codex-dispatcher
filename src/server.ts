@@ -337,18 +337,6 @@ async function routeClientMessage(message: ClientMessage): Promise<JsonValue> {
       return result ?? { ok: true };
     }
 
-    case "editLastUserTurn": {
-      const threadId = requireString(message.threadId, "threadId");
-      const turnId = requireString(message.turnId, "turnId");
-      const thread = await readThreadObject(threadId);
-      validateEditableLastTurn(thread, turnId);
-      await appServer.request("thread/rollback", { threadId, numTurns: 1 });
-      const result = await appServer.request("turn/start", buildClientTurnStartRequest(message, threadId));
-      markDispatcherOwner(threadId);
-      scheduleDispatcherOwnedRefresh(threadId, 0);
-      return result;
-    }
-
     case "setThreadSettings": {
       const threadId = requireString(message.threadId, "threadId");
       await ensureDispatcherOwnedConversation(threadId);
@@ -469,17 +457,6 @@ async function readThreadObject(threadId: string): Promise<JsonObject> {
     throw new Error(`Thread ${threadId} not found`);
   }
   return thread;
-}
-
-function validateEditableLastTurn(thread: JsonObject, turnId: string): void {
-  const turns = Array.isArray(thread.turns) ? thread.turns : [];
-  const lastTurn = asJsonObject(turns.at(-1));
-  if (!lastTurn || (lastTurn.turnId !== turnId && lastTurn.id !== turnId)) {
-    throw new Error("Only the most recent turn can be edited");
-  }
-  if (lastTurn.status === "inProgress" || lastTurn.status === "in_progress") {
-    throw new Error("Cannot edit while a turn is in progress");
-  }
 }
 
 async function ensureDispatcherOwnedConversation(threadId: string): Promise<void> {
@@ -677,7 +654,10 @@ function markDispatcherOwnerFromResult(result: JsonValue): void {
   }
 
   const threadId = thread.id;
-  dispatcherOwnedConversations.set(threadId, conversationFromThread(threadId, thread));
+  dispatcherOwnedConversations.set(
+    threadId,
+    conversationFromThread(threadId, thread, dispatcherOwnedConversations.get(threadId)),
+  );
   broadcastDispatcherOwnedSnapshot(threadId);
 }
 
@@ -750,13 +730,28 @@ function updateDispatcherOwnedConversation(threadId: string, update: (conversati
   dispatcherOwnedConversations.set(threadId, next);
 }
 
-function conversationFromThread(threadId: string, thread: JsonObject): JsonObject {
+function conversationFromThread(threadId: string, thread: JsonObject, previous?: JsonObject): JsonObject {
   return {
+    ...preservedDispatcherConversationFields(previous),
     ...cloneJsonObject(thread),
     id: threadId,
     hostId: dispatcherIpcHostId,
     requests: pendingRequestsForThread(threadId),
   };
+}
+
+function preservedDispatcherConversationFields(previous: JsonObject | undefined): JsonObject {
+  if (!previous) {
+    return {};
+  }
+
+  const preserved: JsonObject = {};
+  for (const key of ["queuedFollowUpsState", "latestModel", "latestReasoningEffort", "latestCollaborationMode"]) {
+    if (previous[key] !== undefined) {
+      preserved[key] = cloneJson(previous[key]);
+    }
+  }
+  return preserved;
 }
 
 function minimalDispatcherConversation(threadId: string): JsonObject {

@@ -399,15 +399,20 @@ async function handleCodexNotification(notification) {
   }
 
   if (method === "turn/completed") {
-    if (params.threadId !== state.selectedThreadId) return;
     const completedThreadId = params.threadId;
-    state.activeTurnId = null;
-    state.externalActiveTurnId = null;
-    state.liveItems.clear();
-    renderComposerState();
-    await refreshCurrentThread();
-    await loadThreads();
-    await runNextQueuedFollowUp(completedThreadId);
+    if (completedThreadId === state.selectedThreadId) {
+      state.activeTurnId = null;
+      state.externalActiveTurnId = null;
+      state.liveItems.clear();
+      renderComposerState();
+      await refreshCurrentThread();
+      await loadThreads();
+    }
+    try {
+      await runNextQueuedFollowUp(completedThreadId);
+    } catch (error) {
+      setStatus(error instanceof Error ? error.message : String(error), true);
+    }
     return;
   }
 
@@ -622,6 +627,7 @@ async function compactCurrentThread() {
 }
 
 function startEditingLastUserTurn() {
+  if (!selectedThreadOwner()) return;
   const turn = editableLastTurn(currentThreadState());
   if (!turn) return;
   state.editingTurn = {
@@ -640,39 +646,28 @@ async function saveEditedLastUserTurn(text) {
   const editingTurn = state.editingTurn;
   if (!editingTurn || editingTurn.threadId !== state.selectedThreadId || !text) return;
   const ownerClientId = selectedThreadOwner();
-  const payload = {
-    threadId: editingTurn.threadId,
-    turnId: editingTurn.turnId,
-    text,
-    input: [textInput(text)],
-    cwd: dom.cwdInput.value.trim(),
-    ...selectedTurnSettings(),
-  };
-
+  if (!ownerClientId) {
+    setStatus("Edit last requires an IPC owner", true);
+    renderComposerState();
+    return;
+  }
   dom.promptInput.value = "";
   dom.promptInput.style.height = "auto";
   state.editingTurn = null;
   renderComposerState();
 
   try {
-    if (ownerClientId) {
-      await request("ipcFollowerRequest", {
-        threadId: editingTurn.threadId,
-        ownerClientId,
-        method: "thread-follower-edit-last-user-turn",
-        params: {
-          conversationId: editingTurn.threadId,
-          turnId: editingTurn.turnId,
-          message: text,
-        },
-      });
-      scheduleFastSync();
-      return;
-    }
-
-    const result = await request("editLastUserTurn", payload);
-    state.activeTurnId = result.turn?.id || null;
-    await refreshCurrentThread();
+    await request("ipcFollowerRequest", {
+      threadId: editingTurn.threadId,
+      ownerClientId,
+      method: "thread-follower-edit-last-user-turn",
+      params: {
+        conversationId: editingTurn.threadId,
+        turnId: editingTurn.turnId,
+        message: text,
+      },
+    });
+    scheduleFastSync();
   } catch (error) {
     state.editingTurn = editingTurn;
     dom.promptInput.value = text;
@@ -694,13 +689,18 @@ async function queuePrompt() {
     createdAt: Date.now(),
   };
   const messages = [...queuedMessages(threadId), message];
-  await setQueuedFollowUps(threadId, messages);
-  dom.promptInput.value = "";
-  dom.promptInput.style.height = "auto";
-  renderComposerState();
+  try {
+    await setQueuedFollowUps(threadId, messages);
+    dom.promptInput.value = "";
+    dom.promptInput.style.height = "auto";
+    renderComposerState();
+  } catch (error) {
+    setStatus(error instanceof Error ? error.message : String(error), true);
+  }
 }
 
 async function setQueuedFollowUps(threadId, messages) {
+  const previousMessages = queuedMessages(threadId);
   state.queuedFollowUps.set(threadId, messages);
   renderQueuedFollowUps();
   const ownerClientId = threadOwner(threadId);
@@ -723,7 +723,9 @@ async function setQueuedFollowUps(threadId, messages) {
       state: { [threadId]: messages },
     });
   } catch (error) {
-    setStatus(error instanceof Error ? error.message : String(error), true);
+    state.queuedFollowUps.set(threadId, previousMessages);
+    renderQueuedFollowUps();
+    throw error;
   }
 }
 
@@ -734,14 +736,16 @@ async function syncThreadSettings() {
   const ownerClientId = selectedThreadOwner();
   try {
     if (ownerClientId) {
-      if (currentThreadState()?.latestCollaborationMode && (settings.model || settings.effort)) {
+      const thread = currentThreadState();
+      const ownerModel = settings.model || thread?.latestModel || thread?.latestCollaborationMode?.settings?.model || null;
+      if (thread?.latestCollaborationMode && ownerModel && (settings.model || settings.effort)) {
         await request("ipcFollowerRequest", {
           threadId,
           ownerClientId,
           method: "thread-follower-set-model-and-reasoning",
           params: {
             conversationId: threadId,
-            model: settings.model,
+            model: ownerModel,
             reasoningEffort: settings.effort,
           },
         });
@@ -921,7 +925,8 @@ function renderQueuedFollowUpChip(message) {
   remove.addEventListener("click", () => {
     const threadId = state.selectedThreadId;
     if (!threadId) return;
-    void setQueuedFollowUps(threadId, queuedMessages(threadId).filter((item) => item.id !== message.id));
+    setQueuedFollowUps(threadId, queuedMessages(threadId).filter((item) => item.id !== message.id))
+      .catch((error) => setStatus(error instanceof Error ? error.message : String(error), true));
   });
   chip.append(label, remove);
   return chip;
@@ -934,23 +939,45 @@ function queuedMessages(threadId) {
 }
 
 async function runNextQueuedFollowUp(threadId) {
-  if (!threadId || threadOwner(threadId) || state.selectedThreadId !== threadId || state.activeTurnId) {
+  if (!threadId || threadOwner(threadId)) {
     return;
   }
-  const [nextMessage, ...remaining] = queuedMessages(threadId);
+  const isSelectedThread = state.selectedThreadId === threadId;
+  if (isSelectedThread && state.activeTurnId) {
+    return;
+  }
+  const queued = queuedMessages(threadId);
+  const [nextMessage, ...remaining] = queued;
   if (!nextMessage) return;
 
   await setQueuedFollowUps(threadId, remaining);
-  const result = await request("startTurn", {
-    threadId,
-    text: nextMessage.text,
-    input: [textInput(nextMessage.text)],
-    cwd: nextMessage.cwd || dom.cwdInput.value.trim(),
-    ...selectedTurnSettings(),
-  });
-  state.activeTurnId = result.turn?.id || null;
-  renderComposerState();
-  await refreshCurrentThread();
+  try {
+    const result = await request("startTurn", {
+      threadId,
+      text: nextMessage.text,
+      input: [textInput(nextMessage.text)],
+      cwd: nextMessage.cwd || (isSelectedThread ? dom.cwdInput.value.trim() : ""),
+      ...(isSelectedThread ? selectedTurnSettings() : {}),
+    });
+    if (isSelectedThread) {
+      state.activeTurnId = result.turn?.id || null;
+      renderComposerState();
+      await refreshCurrentThread();
+    }
+  } catch (error) {
+    try {
+      await setQueuedFollowUps(threadId, queued);
+    } catch (restoreError) {
+      state.queuedFollowUps.set(threadId, queued);
+      renderQueuedFollowUps();
+      throw new Error(
+        `${error instanceof Error ? error.message : String(error)}; queue restore failed: ${
+          restoreError instanceof Error ? restoreError.message : String(restoreError)
+        }`,
+      );
+    }
+    throw error;
+  }
 }
 
 function editableLastTurn(thread) {
@@ -2256,7 +2283,7 @@ function renderComposerState() {
   const canFollowExternal = Boolean(externalActive && selectedThreadOwner());
   const editing = Boolean(state.editingTurn);
   const hasThread = Boolean(state.selectedThreadId);
-  const canEdit = Boolean(editableLastTurn(currentThreadState())) && !active && !externalActive;
+  const canEdit = Boolean(selectedThreadOwner() && editableLastTurn(currentThreadState())) && !active && !externalActive;
   dom.stopButton.classList.toggle("hidden", !active && !canFollowExternal);
   dom.activeTurnPill.classList.toggle("hidden", !active && !externalActive);
   dom.activeTurnPill.textContent = active ? "Active turn" : canFollowExternal ? "Following" : "Live elsewhere";
