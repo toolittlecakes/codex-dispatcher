@@ -1,6 +1,7 @@
 import { randomBytes } from "node:crypto";
 import { networkInterfaces } from "node:os";
 import { resolve, sep } from "node:path";
+import { applyJsonPatches, cloneJson } from "../public/json-patch.js";
 import { CodexAppServer, type JsonObject, type JsonValue } from "./codex-app-server";
 import { CodexIpcBridge, type IpcBroadcastMessage } from "./codex-ipc";
 
@@ -310,9 +311,12 @@ function applyIpcBroadcastEffects(broadcastMessage: IpcBroadcastMessage): boolea
       return false;
     }
 
-    applyConversationMirror(threadId, params);
-
     const previousOwner = streamOwners.get(threadId);
+    if (!applyConversationMirror(threadId, params)) {
+      streamOwners.delete(threadId);
+      return previousOwner !== undefined;
+    }
+
     streamOwners.set(threadId, broadcastMessage.sourceClientId);
     return previousOwner !== broadcastMessage.sourceClientId;
   }
@@ -333,6 +337,7 @@ function applyIpcBroadcastEffects(broadcastMessage: IpcBroadcastMessage): boolea
     }
 
     streamOwners.delete(threadId);
+    mirroredConversations.delete(threadId);
     changed = true;
   }
   return changed;
@@ -352,43 +357,50 @@ function mirroredConversationsSnapshot(): JsonValue {
   }));
 }
 
-function applyConversationMirror(threadId: string, params: JsonObject): void {
+function applyConversationMirror(threadId: string, params: JsonObject): boolean {
   const change = asJsonObject(params.change);
   if (!change) {
-    return;
+    mirroredConversations.delete(threadId);
+    return false;
   }
 
   if (change.type === "snapshot") {
     const conversationState = asJsonObject(change.conversationState);
     if (!conversationState) {
-      return;
+      mirroredConversations.delete(threadId);
+      return false;
     }
 
     mirroredConversations.set(threadId, {
       ...cloneJsonObject(conversationState),
       id: typeof conversationState.id === "string" ? conversationState.id : threadId,
     });
-    return;
+    return true;
   }
 
   if (change.type !== "patches" || !Array.isArray(change.patches)) {
-    return;
+    mirroredConversations.delete(threadId);
+    return false;
   }
 
   const current = mirroredConversations.get(threadId);
   if (!current) {
     console.warn(`Received IPC patches before snapshot for ${threadId}`);
-    return;
+    return false;
   }
 
   try {
     const next = applyJsonPatches(current, change.patches);
     if (isJsonObject(next)) {
       mirroredConversations.set(threadId, next);
+      return true;
     }
   } catch (error) {
     console.warn(`Failed to apply IPC patches for ${threadId}: ${error instanceof Error ? error.message : String(error)}`);
   }
+
+  mirroredConversations.delete(threadId);
+  return false;
 }
 
 function requireFollowerRequestMethod(method: string | undefined): string {
@@ -411,132 +423,12 @@ function isJsonObject(value: JsonValue | undefined): value is JsonObject {
   return true;
 }
 
-function applyJsonPatches(base: JsonValue, patches: JsonValue[]): JsonValue {
-  let next = cloneJson(base);
-  for (const patchValue of patches) {
-    const patch = asJsonObject(patchValue);
-    if (!patch || typeof patch.op !== "string") {
-      throw new Error("Invalid patch object");
-    }
-
-    const path = normalizePatchPath(patch.path);
-    if (path.length === 0) {
-      next = patch.op === "remove" ? null : cloneJson(patch.value ?? null);
-      continue;
-    }
-
-    const { target, key } = resolvePatchTarget(next, path);
-    if (patch.op === "remove") {
-      removePatchValue(target, key);
-      continue;
-    }
-
-    if (patch.op !== "add" && patch.op !== "replace") {
-      throw new Error(`Unsupported patch op ${patch.op}`);
-    }
-
-    setPatchValue(target, key, cloneJson(patch.value ?? null), patch.op);
-  }
-
-  return next;
-}
-
-function normalizePatchPath(path: JsonValue | undefined): Array<string | number> {
-  if (Array.isArray(path)) {
-    return path.map((part) => {
-      if (typeof part === "string" || typeof part === "number") {
-        return part;
-      }
-      throw new Error("Invalid patch path part");
-    });
-  }
-
-  if (typeof path !== "string") {
-    throw new Error("Invalid patch path");
-  }
-
-  if (path === "") {
-    return [];
-  }
-
-  return path
-    .replace(/^\//, "")
-    .split("/")
-    .map((part) => part.replace(/~1/g, "/").replace(/~0/g, "~"));
-}
-
-function resolvePatchTarget(root: JsonValue, path: Array<string | number>): { target: JsonObject | JsonValue[]; key: string | number } {
-  let target = root;
-  for (const part of path.slice(0, -1)) {
-    if (!isJsonObject(target) && !Array.isArray(target)) {
-      throw new Error("Patch target is not traversable");
-    }
-    const nextTarget = Array.isArray(target) ? target[Number(part)] : target[String(part)];
-    if (nextTarget === undefined) {
-      throw new Error("Patch path does not exist");
-    }
-    target = nextTarget;
-  }
-
-  if (!isJsonObject(target) && !Array.isArray(target)) {
-    throw new Error("Patch parent is not an object or array");
-  }
-
-  const key = path[path.length - 1];
-  if (key === undefined) {
-    throw new Error("Patch key is missing");
-  }
-
-  return { target, key };
-}
-
-function setPatchValue(target: JsonObject | JsonValue[], key: string | number, value: JsonValue, op: string): void {
-  if (!Array.isArray(target)) {
-    target[String(key)] = value;
-    return;
-  }
-
-  if (key === "-") {
-    target.push(value);
-    return;
-  }
-
-  const index = Number(key);
-  if (!Number.isInteger(index)) {
-    throw new Error("Array patch key is not an integer");
-  }
-
-  if (op === "add") {
-    target.splice(index, 0, value);
-    return;
-  }
-
-  target[index] = value;
-}
-
-function removePatchValue(target: JsonObject | JsonValue[], key: string | number): void {
-  if (Array.isArray(target)) {
-    const index = Number(key);
-    if (!Number.isInteger(index)) {
-      throw new Error("Array patch key is not an integer");
-    }
-    target.splice(index, 1);
-    return;
-  }
-
-  delete target[String(key)];
-}
-
 function cloneJsonObject(value: JsonObject): JsonObject {
   const cloned = cloneJson(value);
   if (!isJsonObject(cloned)) {
     throw new Error("Cloned JSON object changed shape");
   }
   return cloned;
-}
-
-function cloneJson<T extends JsonValue>(value: T): T {
-  return JSON.parse(JSON.stringify(value)) as T;
 }
 
 async function serveStatic(pathname: string): Promise<Response> {

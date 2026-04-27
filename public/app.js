@@ -1,3 +1,5 @@
+import { applyJsonPatches, cloneJson, isPlainObject } from "./json-patch.js";
+
 const state = {
   token: new URLSearchParams(location.search).get("token") || localStorage.getItem("dispatcherToken") || "",
   ws: null,
@@ -264,8 +266,15 @@ function handleIpcBroadcast(broadcast, ipc) {
     return;
   }
 
-  if (method === "client-status-changed" && params.status === "connected") {
-    scheduleFastSync(500);
+  if (method === "client-status-changed") {
+    if (params.status === "disconnected" && typeof params.clientId === "string") {
+      dropMirrorsOwnedBy(params.clientId);
+      return;
+    }
+
+    if (params.status === "connected") {
+      scheduleFastSync(500);
+    }
   }
 }
 
@@ -354,8 +363,9 @@ async function loadThreads(options = {}) {
   state.threads = result.data || result.threads || [];
   updateThreadSignatures(state.threads);
   renderThreads();
-  if (options.openFirst !== false && !state.selectedThreadId && state.threads[0]) {
-    await openThread(state.threads[0].id);
+  const threads = visibleThreads();
+  if (options.openFirst !== false && !state.selectedThreadId && threads[0]) {
+    await openThread(threads[0].id);
   }
 }
 
@@ -378,7 +388,7 @@ async function openThread(threadId) {
   state.externalActiveTurnId = null;
   state.liveItems.clear();
   closeSidebar();
-  state.currentThread = state.threads.find((thread) => thread.id === threadId) || state.currentThread;
+  state.currentThread = state.threads.find((thread) => thread.id === threadId) || state.mirroredThreads.get(threadId) || null;
   renderThreads();
 
   if (state.mirroredThreads.has(threadId)) {
@@ -555,6 +565,7 @@ function setMirroredConversations(entries) {
 
 function applyThreadStreamChange(threadId, change) {
   if (!isPlainObject(change)) {
+    dropMirroredThread(threadId, "Invalid IPC stream change");
     return;
   }
 
@@ -569,16 +580,19 @@ function applyThreadStreamChange(threadId, change) {
     if (change.type === "patches" && Array.isArray(change.patches)) {
       const current = state.mirroredThreads.get(threadId);
       if (!current) {
-        console.warn(`Received IPC patches before snapshot for ${threadId}`);
+        dropMirroredThread(threadId, `Received IPC patches before snapshot for ${threadId}`);
         return;
       }
 
       state.mirroredThreads.set(threadId, normalizeMirroredThread(threadId, applyJsonPatches(current, change.patches)));
       renderThreads();
       renderSelectedThread({ preserveScroll: true });
+      return;
     }
+
+    dropMirroredThread(threadId, `Unsupported IPC stream change ${String(change.type)}`);
   } catch (error) {
-    console.warn(`Failed to apply IPC stream change for ${threadId}`, error);
+    dropMirroredThread(threadId, error instanceof Error ? error.message : String(error));
   }
 }
 
@@ -645,8 +659,33 @@ function renderSelectedThread(options = {}) {
   }
 }
 
+function dropMirrorsOwnedBy(ownerClientId) {
+  const threadIds = [];
+  for (const [threadId, threadOwnerClientId] of state.streamOwners.entries()) {
+    if (threadOwnerClientId === ownerClientId) threadIds.push(threadId);
+  }
+
+  for (const threadId of threadIds) {
+    dropMirroredThread(threadId, "IPC owner disconnected");
+  }
+}
+
+function dropMirroredThread(threadId, reason) {
+  state.mirroredThreads.delete(threadId);
+  state.streamOwners.delete(threadId);
+  if (threadId === state.selectedThreadId) {
+    setStatus(reason, true);
+  }
+  renderThreads();
+  if (threadId === state.selectedThreadId) {
+    renderSelectedThread({ preserveScroll: true });
+  }
+  renderIpcStatus();
+}
+
 function renderThreads() {
-  if (state.threads.length === 0) {
+  const threads = visibleThreads();
+  if (threads.length === 0) {
     const empty = document.createElement("div");
     empty.className = "empty-state";
     empty.textContent = "No threads found.";
@@ -654,7 +693,19 @@ function renderThreads() {
     return;
   }
 
-  dom.threadList.replaceChildren(...state.threads.map(renderThreadRow));
+  dom.threadList.replaceChildren(...threads.map(renderThreadRow));
+}
+
+function visibleThreads() {
+  const visible = state.threads.map((thread) => mergeThreadState(thread, state.mirroredThreads.get(thread.id) || {}));
+  const seen = new Set(visible.map((thread) => thread.id));
+  for (const [threadId, mirroredThread] of state.mirroredThreads.entries()) {
+    if (threadOwner(threadId) && !seen.has(threadId)) {
+      visible.push(mirroredThread);
+      seen.add(threadId);
+    }
+  }
+  return visible;
 }
 
 function renderThreadRow(thread) {
@@ -1112,9 +1163,16 @@ function renderIpcStatus() {
 
 function setStreamOwners(entries) {
   state.streamOwners.clear();
+  const ownedThreadIds = new Set();
   for (const entry of entries || []) {
     if (typeof entry?.threadId === "string" && typeof entry.ownerClientId === "string") {
       state.streamOwners.set(entry.threadId, entry.ownerClientId);
+      ownedThreadIds.add(entry.threadId);
+    }
+  }
+  for (const threadId of state.mirroredThreads.keys()) {
+    if (!ownedThreadIds.has(threadId)) {
+      state.mirroredThreads.delete(threadId);
     }
   }
   renderThreads();
@@ -1242,114 +1300,6 @@ function deriveConversationStatus(thread) {
   }
 
   return { type: "idle" };
-}
-
-function applyJsonPatches(base, patches) {
-  let next = cloneJson(base);
-  for (const patch of patches) {
-    if (!isPlainObject(patch) || typeof patch.op !== "string") {
-      throw new Error("Invalid patch object");
-    }
-
-    const path = normalizePatchPath(patch.path);
-    if (path.length === 0) {
-      next = patch.op === "remove" ? null : cloneJson(patch.value ?? null);
-      continue;
-    }
-
-    const { target, key } = resolvePatchTarget(next, path);
-    if (patch.op === "remove") {
-      removePatchValue(target, key);
-      continue;
-    }
-
-    if (patch.op !== "add" && patch.op !== "replace") {
-      throw new Error(`Unsupported patch op ${patch.op}`);
-    }
-
-    setPatchValue(target, key, cloneJson(patch.value ?? null), patch.op);
-  }
-  return next;
-}
-
-function normalizePatchPath(path) {
-  if (Array.isArray(path)) {
-    return path;
-  }
-
-  if (typeof path !== "string") {
-    throw new Error("Invalid patch path");
-  }
-
-  if (path === "") {
-    return [];
-  }
-
-  return path
-    .replace(/^\//, "")
-    .split("/")
-    .map((part) => part.replace(/~1/g, "/").replace(/~0/g, "~"));
-}
-
-function resolvePatchTarget(root, path) {
-  let target = root;
-  for (const part of path.slice(0, -1)) {
-    if (!isPlainObject(target) && !Array.isArray(target)) {
-      throw new Error("Patch target is not traversable");
-    }
-    target = target[part];
-  }
-
-  if (!isPlainObject(target) && !Array.isArray(target)) {
-    throw new Error("Patch parent is not an object or array");
-  }
-
-  return { target, key: path[path.length - 1] };
-}
-
-function setPatchValue(target, key, value, op) {
-  if (!Array.isArray(target)) {
-    target[String(key)] = value;
-    return;
-  }
-
-  if (key === "-") {
-    target.push(value);
-    return;
-  }
-
-  const index = Number(key);
-  if (!Number.isInteger(index)) {
-    throw new Error("Array patch key is not an integer");
-  }
-
-  if (op === "add") {
-    target.splice(index, 0, value);
-    return;
-  }
-
-  target[index] = value;
-}
-
-function removePatchValue(target, key) {
-  if (Array.isArray(target)) {
-    const index = Number(key);
-    if (!Number.isInteger(index)) {
-      throw new Error("Array patch key is not an integer");
-    }
-    target.splice(index, 1);
-    return;
-  }
-
-  delete target[String(key)];
-}
-
-function isPlainObject(value) {
-  return typeof value === "object" && value !== null && !Array.isArray(value);
-}
-
-function cloneJson(value) {
-  return JSON.parse(JSON.stringify(value));
 }
 
 function shortPath(path) {

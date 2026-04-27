@@ -6,6 +6,7 @@
   "scripts": {
     "dev": "bun run src/server.ts",
     "dev:tunnel": "bun run src/cloudflare-tunnel.ts",
+    "test": "bun test",
     "typecheck": "tsc --noEmit"
   },
   "devDependencies": {
