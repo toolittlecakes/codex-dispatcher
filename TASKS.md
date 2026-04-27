@@ -17,7 +17,7 @@ Goal: make the dispatcher behave like the VS Code Codex extension for shared ses
 - Send decisions through the matching `thread-follower-*` IPC methods.
 - Validation: an approval requested in VS Code/Desktop can be accepted or denied from dispatcher.
 
-## 3. Dispatcher owner mode
+## 3. Dispatcher owner mode - done
 
 - Respond to IPC discovery when dispatcher owns a conversation.
 - Handle follower start, steer, interrupt, approvals, compact, settings, and queued follow-up requests.

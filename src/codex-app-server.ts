@@ -78,6 +78,10 @@ export class CodexAppServer {
     return Array.from(this.serverRequests.values());
   }
 
+  getPendingServerRequest(id: string): AppServerRequest | null {
+    return this.serverRequests.get(id) ?? null;
+  }
+
   onEvent(listener: (event: CodexAppServerEvent) => void): () => void {
     this.listeners.add(listener);
     return () => {

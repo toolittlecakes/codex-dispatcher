@@ -35,6 +35,8 @@ const ipcBridge = new CodexIpcBridge();
 const clients = new Set<Bun.ServerWebSocket<WsData>>();
 const streamOwners = new Map<string, string>();
 const mirroredConversations = new Map<string, JsonObject>();
+const dispatcherOwnedConversations = new Map<string, JsonObject>();
+const dispatcherOwnedRefreshTimers = new Map<string, ReturnType<typeof setTimeout>>();
 
 const followerRequestMethods = new Set([
   "thread-follower-start-turn",
@@ -52,14 +54,37 @@ const followerRequestMethods = new Set([
   "thread-follower-set-queued-follow-ups-state",
 ]);
 
+const dispatcherOwnerRequestMethods = new Set([
+  "thread-follower-start-turn",
+  "thread-follower-steer-turn",
+  "thread-follower-interrupt-turn",
+  "thread-follower-compact-thread",
+  "thread-follower-set-model-and-reasoning",
+  "thread-follower-set-collaboration-mode",
+  "thread-follower-command-approval-decision",
+  "thread-follower-file-approval-decision",
+  "thread-follower-permissions-request-approval-response",
+  "thread-follower-submit-user-input",
+  "thread-follower-submit-mcp-server-elicitation-response",
+  "thread-follower-set-queued-follow-ups-state",
+]);
+
 appServer.onEvent((event) => {
   if (event.type === "notification") {
     broadcast({ type: "codexNotification", notification: event.notification });
+    const threadId = notificationThreadId(event.notification);
+    if (threadId && dispatcherOwnedConversations.has(threadId)) {
+      scheduleDispatcherOwnedRefresh(threadId);
+    }
     return;
   }
 
   if (event.type === "serverRequest") {
     broadcast({ type: "serverRequest", request: event.request });
+    const threadId = requestThreadId(event.request);
+    if (threadId && dispatcherOwnedConversations.has(threadId)) {
+      scheduleDispatcherOwnedRefresh(threadId, 0);
+    }
     return;
   }
 
@@ -88,6 +113,12 @@ ipcBridge.onEvent((event) => {
     if (ownersChanged) {
       broadcast({ type: "threadStreamOwners", streamOwners: streamOwnersSnapshot() });
     }
+    if (event.broadcast.method === "client-status-changed") {
+      const params = asJsonObject(event.broadcast.params);
+      if (params?.status === "connected") {
+        broadcastDispatcherOwnedSnapshots();
+      }
+    }
     return;
   }
 
@@ -109,6 +140,14 @@ ipcBridge.onEvent((event) => {
     broadcast({ type: "threadStreamOwners", streamOwners: streamOwnersSnapshot() });
   }
 });
+
+for (const method of dispatcherOwnerRequestMethods) {
+  ipcBridge.addRequestHandler(
+    method,
+    (requestMessage) => canHandleDispatcherOwnerRequest(requestMessage.method, requestMessage.params),
+    (requestMessage) => handleDispatcherOwnerRequest(requestMessage.method, requestMessage.params),
+  );
+}
 
 await appServer.start();
 await ipcBridge.start();
@@ -231,13 +270,16 @@ async function routeClientMessage(message: ClientMessage): Promise<JsonValue> {
         includeTurns: true,
       });
 
-    case "startThread":
-      return appServer.request("thread/start", {
+    case "startThread": {
+      const result = await appServer.request("thread/start", {
         cwd: normalizeOptionalString(message.cwd) ?? defaultCwd,
         serviceName: "codex_mobile_dispatcher",
         experimentalRawEvents: false,
         persistExtendedHistory: true,
       });
+      markDispatcherOwnerFromResult(result);
+      return result;
+    }
 
     case "resumeThread":
       return appServer.request("thread/resume", {
@@ -245,25 +287,38 @@ async function routeClientMessage(message: ClientMessage): Promise<JsonValue> {
         persistExtendedHistory: true,
       });
 
-    case "startTurn":
-      return appServer.request("turn/start", {
-        threadId: requireString(message.threadId, "threadId"),
+    case "startTurn": {
+      const threadId = requireString(message.threadId, "threadId");
+      const result = await appServer.request("turn/start", {
+        threadId,
         input: [textInput(requireString(message.text, "text"))],
         cwd: normalizeOptionalString(message.cwd),
       });
+      markDispatcherOwner(threadId);
+      scheduleDispatcherOwnedRefresh(threadId, 0);
+      return result;
+    }
 
-    case "steerTurn":
-      return appServer.request("turn/steer", {
-        threadId: requireString(message.threadId, "threadId"),
+    case "steerTurn": {
+      const threadId = requireString(message.threadId, "threadId");
+      const result = await appServer.request("turn/steer", {
+        threadId,
         expectedTurnId: requireString(message.turnId, "turnId"),
         input: [textInput(requireString(message.text, "text"))],
       });
+      scheduleDispatcherOwnedRefresh(threadId, 0);
+      return result;
+    }
 
-    case "interruptTurn":
-      return appServer.request("turn/interrupt", {
-        threadId: requireString(message.threadId, "threadId"),
+    case "interruptTurn": {
+      const threadId = requireString(message.threadId, "threadId");
+      const result = await appServer.request("turn/interrupt", {
+        threadId,
         turnId: requireString(message.turnId, "turnId"),
       });
+      scheduleDispatcherOwnedRefresh(threadId, 0);
+      return result;
+    }
 
     case "ipcFollowerRequest": {
       const threadId = requireString(message.threadId, "threadId");
@@ -284,6 +339,7 @@ async function routeClientMessage(message: ClientMessage): Promise<JsonValue> {
     }
 
     case "respondServerRequest":
+      scheduleRefreshForServerRequest(requireString(message.appServerRequestId, "appServerRequestId"));
       appServer.respondToServerRequest(
         requireString(message.appServerRequestId, "appServerRequestId"),
         message.result ?? null,
@@ -345,6 +401,282 @@ function applyIpcBroadcastEffects(broadcastMessage: IpcBroadcastMessage): boolea
     changed = true;
   }
   return changed;
+}
+
+async function handleDispatcherOwnerRequest(method: string, paramsValue: JsonValue | undefined): Promise<JsonValue> {
+  const params = requireJsonObject(paramsValue, "params");
+  const conversationId = requireJsonString(params.conversationId, "conversationId");
+  if (!dispatcherOwnedConversations.has(conversationId)) {
+    throw new Error(`Dispatcher does not own thread ${conversationId}`);
+  }
+
+  switch (method) {
+    case "thread-follower-start-turn":
+      return handleDispatcherOwnerStartTurn(conversationId, params);
+
+    case "thread-follower-steer-turn":
+      return handleDispatcherOwnerSteerTurn(conversationId, params);
+
+    case "thread-follower-interrupt-turn":
+      return handleDispatcherOwnerInterruptTurn(conversationId);
+
+    case "thread-follower-compact-thread": {
+      const result = await appServer.request("thread/compact/start", { threadId: conversationId });
+      scheduleDispatcherOwnedRefresh(conversationId, 0);
+      return result ?? { ok: true };
+    }
+
+    case "thread-follower-command-approval-decision":
+    case "thread-follower-file-approval-decision": {
+      const requestId = requireJsonString(params.requestId, "requestId");
+      const decision = requireJsonString(params.decision, "decision");
+      appServer.respondToServerRequest(requestId, { decision });
+      scheduleDispatcherOwnedRefresh(conversationId, 0);
+      return { ok: true };
+    }
+
+    case "thread-follower-permissions-request-approval-response":
+    case "thread-follower-submit-user-input":
+    case "thread-follower-submit-mcp-server-elicitation-response": {
+      const requestId = requireJsonString(params.requestId, "requestId");
+      appServer.respondToServerRequest(requestId, params.response ?? null);
+      scheduleDispatcherOwnedRefresh(conversationId, 0);
+      return { ok: true };
+    }
+
+    case "thread-follower-set-model-and-reasoning":
+      updateDispatcherOwnedConversation(conversationId, (conversation) => {
+        if (typeof params.model === "string") {
+          conversation.latestModel = params.model;
+        }
+        if (typeof params.reasoningEffort === "string" || params.reasoningEffort === null) {
+          conversation.latestReasoningEffort = params.reasoningEffort;
+        }
+      });
+      broadcastDispatcherOwnedSnapshot(conversationId);
+      return { ok: true };
+
+    case "thread-follower-set-collaboration-mode":
+      updateDispatcherOwnedConversation(conversationId, (conversation) => {
+        conversation.latestCollaborationMode = params.collaborationMode ?? null;
+      });
+      broadcastDispatcherOwnedSnapshot(conversationId);
+      return { ok: true };
+
+    case "thread-follower-set-queued-follow-ups-state":
+      updateDispatcherOwnedConversation(conversationId, (conversation) => {
+        conversation.queuedFollowUpsState = params.queuedFollowUpsState ?? params.state ?? null;
+      });
+      ipcBridge.broadcast("thread-queued-followups-changed", { conversationId });
+      broadcastDispatcherOwnedSnapshot(conversationId);
+      return { ok: true };
+
+    default:
+      throw new Error(`Unsupported dispatcher owner method: ${method}`);
+  }
+}
+
+async function handleDispatcherOwnerStartTurn(conversationId: string, params: JsonObject): Promise<JsonValue> {
+  const turnStartParams = requireJsonObject(params.turnStartParams, "turnStartParams");
+  const result = await appServer.request("turn/start", {
+    threadId: conversationId,
+    input: Array.isArray(turnStartParams.input) ? turnStartParams.input : [],
+    cwd: normalizeJsonString(turnStartParams.cwd),
+    attachments: Array.isArray(turnStartParams.attachments) ? turnStartParams.attachments : [],
+    approvalPolicy: turnStartParams.approvalPolicy ?? null,
+    approvalsReviewer: turnStartParams.approvalsReviewer ?? null,
+    sandboxPolicy: turnStartParams.sandboxPolicy ?? null,
+    model: turnStartParams.model ?? null,
+    effort: turnStartParams.effort ?? null,
+    collaborationMode: turnStartParams.collaborationMode ?? null,
+  });
+  scheduleDispatcherOwnedRefresh(conversationId, 0);
+  return { result };
+}
+
+async function handleDispatcherOwnerSteerTurn(conversationId: string, params: JsonObject): Promise<JsonValue> {
+  const turnId = findInProgressTurnId(dispatcherOwnedConversations.get(conversationId));
+  if (!turnId) {
+    throw new Error(`No active turn for thread ${conversationId}`);
+  }
+
+  const result = await appServer.request("turn/steer", {
+    threadId: conversationId,
+    expectedTurnId: turnId,
+    input: Array.isArray(params.input) ? params.input : [],
+  });
+  scheduleDispatcherOwnedRefresh(conversationId, 0);
+  return { result };
+}
+
+async function handleDispatcherOwnerInterruptTurn(conversationId: string): Promise<JsonValue> {
+  const turnId = findInProgressTurnId(dispatcherOwnedConversations.get(conversationId));
+  if (!turnId) {
+    return { ok: true };
+  }
+
+  const result = await appServer.request("turn/interrupt", {
+    threadId: conversationId,
+    turnId,
+  });
+  scheduleDispatcherOwnedRefresh(conversationId, 0);
+  return result ?? { ok: true };
+}
+
+function canHandleDispatcherOwnerRequest(method: string, paramsValue: JsonValue | undefined): boolean {
+  if (!dispatcherOwnerRequestMethods.has(method)) {
+    return false;
+  }
+
+  const params = asJsonObject(paramsValue);
+  const conversationId = typeof params?.conversationId === "string" ? params.conversationId : null;
+  return Boolean(conversationId && dispatcherOwnedConversations.has(conversationId));
+}
+
+function markDispatcherOwnerFromResult(result: JsonValue): void {
+  const resultObject = asJsonObject(result);
+  const thread = asJsonObject(resultObject?.thread);
+  if (!thread || typeof thread.id !== "string") {
+    return;
+  }
+
+  const threadId = thread.id;
+  dispatcherOwnedConversations.set(threadId, conversationFromThread(threadId, thread));
+  broadcastDispatcherOwnedSnapshot(threadId);
+}
+
+function markDispatcherOwner(threadId: string): void {
+  if (!dispatcherOwnedConversations.has(threadId)) {
+    dispatcherOwnedConversations.set(threadId, minimalDispatcherConversation(threadId));
+  }
+  broadcastDispatcherOwnedSnapshot(threadId);
+}
+
+function scheduleDispatcherOwnedRefresh(threadId: string, delayMs = 120): void {
+  const existing = dispatcherOwnedRefreshTimers.get(threadId);
+  if (existing) {
+    clearTimeout(existing);
+  }
+
+  const timer = setTimeout(() => {
+    dispatcherOwnedRefreshTimers.delete(threadId);
+    void refreshDispatcherOwnedConversation(threadId);
+  }, delayMs);
+  dispatcherOwnedRefreshTimers.set(threadId, timer);
+}
+
+async function refreshDispatcherOwnedConversation(threadId: string): Promise<void> {
+  if (!dispatcherOwnedConversations.has(threadId)) {
+    return;
+  }
+
+  const result = await appServer.request("thread/read", {
+    threadId,
+    includeTurns: true,
+  });
+  const resultObject = asJsonObject(result);
+  const thread = asJsonObject(resultObject?.thread);
+  if (!thread) {
+    return;
+  }
+
+  dispatcherOwnedConversations.set(threadId, conversationFromThread(threadId, thread));
+  broadcastDispatcherOwnedSnapshot(threadId);
+}
+
+function scheduleRefreshForServerRequest(requestId: string): void {
+  const request = appServer.getPendingServerRequest(requestId);
+  const threadId = request ? requestThreadId(request) : null;
+  if (threadId && dispatcherOwnedConversations.has(threadId)) {
+    scheduleDispatcherOwnedRefresh(threadId, 0);
+  }
+}
+
+function broadcastDispatcherOwnedSnapshots(): void {
+  for (const threadId of dispatcherOwnedConversations.keys()) {
+    broadcastDispatcherOwnedSnapshot(threadId);
+  }
+}
+
+function broadcastDispatcherOwnedSnapshot(threadId: string): void {
+  const conversation = dispatcherOwnedConversations.get(threadId);
+  if (!conversation) {
+    return;
+  }
+
+  ipcBridge.broadcast("thread-stream-state-changed", {
+    conversationId: threadId,
+    hostId: "dispatcher",
+    change: {
+      type: "snapshot",
+      conversationState: conversation,
+    },
+  });
+}
+
+function updateDispatcherOwnedConversation(threadId: string, update: (conversation: JsonObject) => void): void {
+  const current = dispatcherOwnedConversations.get(threadId) ?? minimalDispatcherConversation(threadId);
+  const next = cloneJsonObject(current);
+  update(next);
+  dispatcherOwnedConversations.set(threadId, next);
+}
+
+function conversationFromThread(threadId: string, thread: JsonObject): JsonObject {
+  return {
+    ...cloneJsonObject(thread),
+    id: threadId,
+    requests: pendingRequestsForThread(threadId),
+  };
+}
+
+function minimalDispatcherConversation(threadId: string): JsonObject {
+  return {
+    id: threadId,
+    title: null,
+    name: null,
+    preview: null,
+    cwd: defaultCwd,
+    source: "appServer",
+    status: { type: "running" },
+    turns: [],
+    requests: pendingRequestsForThread(threadId),
+  };
+}
+
+function pendingRequestsForThread(threadId: string): JsonValue[] {
+  return appServer.getPendingServerRequests().filter((request) => requestThreadId(request) === threadId);
+}
+
+function notificationThreadId(notification: JsonObject): string | null {
+  return requestThreadId({ params: notification.params ?? {} });
+}
+
+function requestThreadId(request: { params: JsonValue }): string | null {
+  const params = asJsonObject(request.params);
+  return typeof params?.threadId === "string" ? params.threadId : null;
+}
+
+function findInProgressTurnId(conversation: JsonObject | undefined): string | null {
+  const turns = Array.isArray(conversation?.turns) ? conversation.turns : [];
+  for (let index = turns.length - 1; index >= 0; index -= 1) {
+    const turn = asJsonObject(turns[index]);
+    if (!turn) {
+      continue;
+    }
+
+    const status = turn.status;
+    if (status !== "inProgress" && status !== "in_progress") {
+      continue;
+    }
+
+    if (typeof turn.turnId === "string") {
+      return turn.turnId;
+    }
+    if (typeof turn.id === "string") {
+      return turn.id;
+    }
+  }
+  return null;
 }
 
 function streamOwnersSnapshot(): JsonValue {
@@ -509,8 +841,34 @@ function requireString(value: string | undefined, name: string): string {
   return value;
 }
 
+function requireJsonObject(value: JsonValue | undefined, name: string): JsonObject {
+  const object = asJsonObject(value);
+  if (!object) {
+    throw new Error(`Missing ${name}`);
+  }
+
+  return object;
+}
+
+function requireJsonString(value: JsonValue | undefined, name: string): string {
+  if (typeof value !== "string" || value.trim().length === 0) {
+    throw new Error(`Missing ${name}`);
+  }
+
+  return value;
+}
+
 function normalizeOptionalString(value: string | undefined): string | null {
   if (!value) {
+    return null;
+  }
+
+  const trimmed = value.trim();
+  return trimmed.length > 0 ? trimmed : null;
+}
+
+function normalizeJsonString(value: JsonValue | undefined): string | null {
+  if (typeof value !== "string") {
     return null;
   }
 

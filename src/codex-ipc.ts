@@ -81,6 +81,11 @@ type PendingDiscoveryRequest = {
   timeout: ReturnType<typeof setTimeout>;
 };
 
+type IpcRequestHandler = {
+  canHandle: (request: IpcRequestMessage) => boolean;
+  handle: (request: IpcRequestMessage) => Promise<JsonValue> | JsonValue;
+};
+
 export type CodexIpcPeer = {
   clientId: string;
   clientType: string;
@@ -144,6 +149,7 @@ export class CodexIpcBridge {
   private readonly listeners = new Set<(event: CodexIpcEvent) => void>();
   private readonly pendingResponses = new Map<string, PendingResponse>();
   private readonly peers = new Map<string, CodexIpcPeer>();
+  private readonly requestHandlers = new Map<string, IpcRequestHandler>();
 
   private socket: Socket | null = null;
   private detachReader: (() => void) | null = null;
@@ -222,6 +228,33 @@ export class CodexIpcBridge {
     options: { targetClientId?: string } = {},
   ): Promise<IpcResponseMessage> {
     return this.sendRequest(method, params, options);
+  }
+
+  addRequestHandler(
+    method: string,
+    canHandle: (request: IpcRequestMessage) => boolean,
+    handle: (request: IpcRequestMessage) => Promise<JsonValue> | JsonValue,
+  ): () => void {
+    this.requestHandlers.set(method, { canHandle, handle });
+    return () => {
+      this.requestHandlers.delete(method);
+    };
+  }
+
+  broadcast(method: string, params: JsonValue): boolean {
+    const socket = this.socket;
+    if (!socket || !socket.writable || this.clientId === initializingClientId) {
+      return false;
+    }
+
+    writeFrame(socket, {
+      type: "broadcast",
+      method,
+      sourceClientId: this.clientId,
+      version: methodVersion(method),
+      params,
+    });
+    return true;
   }
 
   private async connect(clientType: string): Promise<void> {
@@ -347,7 +380,7 @@ export class CodexIpcBridge {
         return;
 
       case "request":
-        this.handleRequest(message);
+        void this.handleRequest(message);
         return;
     }
   }
@@ -377,24 +410,57 @@ export class CodexIpcBridge {
       return;
     }
 
+    const handler = this.getRequestHandler(message.request);
     writeFrame(this.socket, {
       type: "client-discovery-response",
       requestId: message.requestId,
-      response: { canHandle: false },
+      response: { canHandle: Boolean(handler) },
     });
   }
 
-  private handleRequest(message: IpcRequestMessage): void {
+  private async handleRequest(message: IpcRequestMessage): Promise<void> {
     if (!this.socket || !this.socket.writable) {
       return;
     }
 
-    writeFrame(this.socket, {
-      type: "response",
-      requestId: message.requestId,
-      resultType: "error",
-      error: "no-handler-for-request",
-    });
+    const handler = this.getRequestHandler(message);
+    if (!handler) {
+      writeFrame(this.socket, {
+        type: "response",
+        requestId: message.requestId,
+        resultType: "error",
+        error: "no-handler-for-request",
+      });
+      return;
+    }
+
+    try {
+      const result = await handler.handle(message);
+      writeFrame(this.socket, {
+        type: "response",
+        requestId: message.requestId,
+        resultType: "success",
+        method: message.method,
+        handledByClientId: this.clientId,
+        result,
+      });
+    } catch (error) {
+      writeFrame(this.socket, {
+        type: "response",
+        requestId: message.requestId,
+        resultType: "error",
+        error: toError(error).message,
+      });
+    }
+  }
+
+  private getRequestHandler(message: IpcRequestMessage): IpcRequestHandler | null {
+    const handler = this.requestHandlers.get(message.method);
+    if (!handler || !handler.canHandle(message)) {
+      return null;
+    }
+
+    return handler;
   }
 
   private applyClientStatusBroadcast(params: JsonValue | undefined): void {
