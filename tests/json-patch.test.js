@@ -66,6 +66,18 @@ describe("applyJsonPatches", () => {
     );
   });
 
+  test("rejects missing final object keys for replace and remove", () => {
+    expect(() => applyJsonPatches({ turn: {} }, [{ op: "replace", path: ["turn", "status"], value: "done" }])).toThrow(
+      "Object replace patch key does not exist",
+    );
+    expect(() => applyJsonPatches({ turn: {} }, [{ op: "remove", path: ["turn", "status"] }])).toThrow(
+      "Object remove patch key does not exist",
+    );
+    expect(applyJsonPatches({ turn: {} }, [{ op: "add", path: ["turn", "status"], value: "done" }])).toEqual({
+      turn: { status: "done" },
+    });
+  });
+
   test("rejects unsupported root operations", () => {
     expect(() => applyJsonPatches({ a: 1 }, [{ op: "move", path: "", value: { b: 2 } }])).toThrow("Unsupported patch op move");
   });

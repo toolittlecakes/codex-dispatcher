@@ -95,6 +95,9 @@ function resolvePatchTarget(root, path) {
 
 function setPatchValue(target, key, value, op) {
   if (!Array.isArray(target)) {
+    if (op === "replace" && !hasOwn(target, String(key))) {
+      throw new Error("Object replace patch key does not exist");
+    }
     target[String(key)] = value;
     return;
   }
@@ -137,5 +140,12 @@ function removePatchValue(target, key) {
     return;
   }
 
+  if (!hasOwn(target, String(key))) {
+    throw new Error("Object remove patch key does not exist");
+  }
   delete target[String(key)];
+}
+
+function hasOwn(value, key) {
+  return Object.prototype.hasOwnProperty.call(value, key);
 }
