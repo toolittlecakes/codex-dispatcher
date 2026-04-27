@@ -111,6 +111,9 @@ function setPatchValue(target, key, value, op) {
   }
 
   if (key === "-") {
+    if (op !== "add") {
+      throw new Error("Array '-' patch key is only valid for add");
+    }
     target.push(value);
     return;
   }

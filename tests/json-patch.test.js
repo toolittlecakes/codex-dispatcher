@@ -67,6 +67,9 @@ describe("applyJsonPatches", () => {
     expect(() => applyJsonPatches({ turns: [] }, [{ op: "add", path: ["turns", 1], value: {} }])).toThrow(
       "Array add patch index is out of bounds",
     );
+    expect(() => applyJsonPatches({ turns: [] }, [{ op: "replace", path: ["turns", "-"], value: {} }])).toThrow(
+      "Array '-' patch key is only valid for add",
+    );
   });
 
   test("rejects missing final object keys for replace and remove", () => {
