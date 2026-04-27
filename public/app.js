@@ -673,14 +673,7 @@ function dropMirrorsOwnedBy(ownerClientId) {
 function dropMirroredThread(threadId, reason) {
   state.mirroredThreads.delete(threadId);
   state.streamOwners.delete(threadId);
-  if (threadId === state.selectedThreadId) {
-    const fallbackThread = state.threads.find((thread) => thread.id === threadId) || null;
-    state.currentThread = fallbackThread;
-    if (!fallbackThread) {
-      state.selectedThreadId = null;
-    }
-    setStatus(reason, true);
-  }
+  clearSelectedMirrorThread(threadId, reason);
   renderThreads();
   if (threadId === state.selectedThreadId || !state.selectedThreadId) {
     renderSelectedThread({ preserveScroll: true });
@@ -1167,6 +1160,7 @@ function renderIpcStatus() {
 }
 
 function setStreamOwners(entries) {
+  const previousOwnedThreadIds = new Set(state.streamOwners.keys());
   state.streamOwners.clear();
   const ownedThreadIds = new Set();
   for (const entry of entries || []) {
@@ -1178,6 +1172,9 @@ function setStreamOwners(entries) {
   for (const threadId of state.mirroredThreads.keys()) {
     if (!ownedThreadIds.has(threadId)) {
       state.mirroredThreads.delete(threadId);
+      if (previousOwnedThreadIds.has(threadId)) {
+        clearSelectedMirrorThread(threadId, "IPC owner disconnected");
+      }
     }
   }
   renderThreads();
@@ -1197,6 +1194,19 @@ function setThreadOwner(threadId, ownerClientId) {
   renderThreadHeader();
   renderComposerState();
   renderIpcStatus();
+}
+
+function clearSelectedMirrorThread(threadId, reason) {
+  if (threadId !== state.selectedThreadId) {
+    return;
+  }
+
+  const fallbackThread = state.threads.find((thread) => thread.id === threadId) || null;
+  state.currentThread = fallbackThread;
+  if (!fallbackThread) {
+    state.selectedThreadId = null;
+  }
+  setStatus(reason, true);
 }
 
 function showTokenPanel(show) {

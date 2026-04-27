@@ -4,6 +4,7 @@ export function applyJsonPatches(base, patches) {
     if (!isPlainObject(patch) || typeof patch.op !== "string") {
       throw new Error("Invalid patch object");
     }
+    validatePatchOp(patch.op);
 
     const path = normalizePatchPath(patch.path);
     if (path.length === 0) {
@@ -15,10 +16,6 @@ export function applyJsonPatches(base, patches) {
     if (patch.op === "remove") {
       removePatchValue(target, key);
       continue;
-    }
-
-    if (patch.op !== "add" && patch.op !== "replace") {
-      throw new Error(`Unsupported patch op ${patch.op}`);
     }
 
     setPatchValue(target, key, cloneJson(patch.value ?? null), patch.op);
@@ -59,6 +56,14 @@ function validatePathPart(part) {
   }
 
   throw new Error(`Forbidden patch path segment ${part}`);
+}
+
+function validatePatchOp(op) {
+  if (op === "add" || op === "replace" || op === "remove") {
+    return;
+  }
+
+  throw new Error(`Unsupported patch op ${op}`);
 }
 
 function resolvePatchTarget(root, path) {
@@ -105,10 +110,16 @@ function setPatchValue(target, key, value, op) {
   }
 
   if (op === "add") {
+    if (index < 0 || index > target.length) {
+      throw new Error("Array add patch index is out of bounds");
+    }
     target.splice(index, 0, value);
     return;
   }
 
+  if (index < 0 || index >= target.length) {
+    throw new Error("Array replace patch index is out of bounds");
+  }
   target[index] = value;
 }
 
@@ -117,6 +128,9 @@ function removePatchValue(target, key) {
     const index = Number(key);
     if (!Number.isInteger(index)) {
       throw new Error("Array patch key is not an integer");
+    }
+    if (index < 0 || index >= target.length) {
+      throw new Error("Array remove patch index is out of bounds");
     }
 
     target.splice(index, 1);

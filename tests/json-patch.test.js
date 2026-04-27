@@ -53,4 +53,20 @@ describe("applyJsonPatches", () => {
     );
     expect({}.polluted).toBeUndefined();
   });
+
+  test("rejects invalid final array indexes", () => {
+    expect(() => applyJsonPatches({ turns: [] }, [{ op: "replace", path: ["turns", 0], value: {} }])).toThrow(
+      "Array replace patch index is out of bounds",
+    );
+    expect(() => applyJsonPatches({ turns: [] }, [{ op: "remove", path: ["turns", 0] }])).toThrow(
+      "Array remove patch index is out of bounds",
+    );
+    expect(() => applyJsonPatches({ turns: [] }, [{ op: "add", path: ["turns", 1], value: {} }])).toThrow(
+      "Array add patch index is out of bounds",
+    );
+  });
+
+  test("rejects unsupported root operations", () => {
+    expect(() => applyJsonPatches({ a: 1 }, [{ op: "move", path: "", value: { b: 2 } }])).toThrow("Unsupported patch op move");
+  });
 });

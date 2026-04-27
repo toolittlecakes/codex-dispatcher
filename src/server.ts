@@ -100,10 +100,14 @@ ipcBridge.onEvent((event) => {
     return;
   }
 
+  const ownersCleared = clearIpcMirrorsIfDisconnected(event.snapshot.status);
   broadcast({
     type: "codexIpcStatus",
     ipc: event.snapshot,
   });
+  if (ownersCleared) {
+    broadcast({ type: "threadStreamOwners", streamOwners: streamOwnersSnapshot() });
+  }
 });
 
 await appServer.start();
@@ -355,6 +359,17 @@ function mirroredConversationsSnapshot(): JsonValue {
     threadId,
     conversation,
   }));
+}
+
+function clearIpcMirrorsIfDisconnected(status: string): boolean {
+  if (status !== "disconnected" && status !== "error" && status !== "closed") {
+    return false;
+  }
+
+  const changed = streamOwners.size > 0 || mirroredConversations.size > 0;
+  streamOwners.clear();
+  mirroredConversations.clear();
+  return changed;
 }
 
 function applyConversationMirror(threadId: string, params: JsonObject): boolean {
