@@ -41,6 +41,15 @@ describe("applyJsonPatches", () => {
     expect(applyJsonPatches({ a: 1 }, [{ op: "replace", path: "", value: { b: 2 } }])).toEqual({ b: 2 });
   });
 
+  test("rejects malformed JSON pointer strings", () => {
+    expect(() => applyJsonPatches({ a: { b: 1 } }, [{ op: "replace", path: "a/b", value: 2 }])).toThrow(
+      "Invalid JSON pointer path",
+    );
+    expect(() => applyJsonPatches({ "~2": 1 }, [{ op: "replace", path: "/~2", value: 2 }])).toThrow(
+      "Invalid JSON pointer escape",
+    );
+  });
+
   test("fails visibly on out-of-order patches", () => {
     expect(() => applyJsonPatches({ turns: [] }, [{ op: "replace", path: ["turns", 0, "status"], value: "done" }])).toThrow(
       "Patch path does not exist",
@@ -91,5 +100,11 @@ describe("applyJsonPatches", () => {
 
   test("rejects unsupported root operations", () => {
     expect(() => applyJsonPatches({ a: 1 }, [{ op: "move", path: "", value: { b: 2 } }])).toThrow("Unsupported patch op move");
+  });
+
+  test("requires value for add and replace patches", () => {
+    expect(() => applyJsonPatches({ a: 1 }, [{ op: "replace", path: "/a" }])).toThrow("Patch op replace requires value");
+    expect(() => applyJsonPatches({ a: 1 }, [{ op: "add", path: "/b" }])).toThrow("Patch op add requires value");
+    expect(applyJsonPatches({ a: 1 }, [{ op: "replace", path: "/a", value: null }])).toEqual({ a: null });
   });
 });

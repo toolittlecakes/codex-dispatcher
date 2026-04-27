@@ -5,10 +5,11 @@ export function applyJsonPatches(base, patches) {
       throw new Error("Invalid patch object");
     }
     validatePatchOp(patch.op);
+    validatePatchValue(patch);
 
     const path = normalizePatchPath(patch.path);
     if (path.length === 0) {
-      next = patch.op === "remove" ? null : cloneJson(patch.value ?? null);
+      next = patch.op === "remove" ? null : cloneJson(patch.value);
       continue;
     }
 
@@ -18,7 +19,7 @@ export function applyJsonPatches(base, patches) {
       continue;
     }
 
-    setPatchValue(target, key, cloneJson(patch.value ?? null), patch.op);
+    setPatchValue(target, key, cloneJson(patch.value), patch.op);
   }
   return next;
 }
@@ -44,10 +45,14 @@ function normalizePatchPath(path) {
     return [];
   }
 
+  if (!path.startsWith("/")) {
+    throw new Error("Invalid JSON pointer path");
+  }
+
   return path
-    .replace(/^\//, "")
+    .slice(1)
     .split("/")
-    .map((part) => validatePathPart(part.replace(/~1/g, "/").replace(/~0/g, "~")));
+    .map((part) => validatePathPart(decodePointerPathPart(part)));
 }
 
 function validatePathPart(part) {
@@ -72,6 +77,20 @@ function validatePatchOp(op) {
   }
 
   throw new Error(`Unsupported patch op ${op}`);
+}
+
+function validatePatchValue(patch) {
+  if ((patch.op === "add" || patch.op === "replace") && !hasOwn(patch, "value")) {
+    throw new Error(`Patch op ${patch.op} requires value`);
+  }
+}
+
+function decodePointerPathPart(part) {
+  if (/~(?![01])/u.test(part)) {
+    throw new Error("Invalid JSON pointer escape");
+  }
+
+  return part.replace(/~1/g, "/").replace(/~0/g, "~");
 }
 
 function resolvePatchTarget(root, path) {
