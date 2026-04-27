@@ -51,6 +51,14 @@ function normalizePatchPath(path) {
 }
 
 function validatePathPart(part) {
+  if (typeof part !== "string" && typeof part !== "number") {
+    throw new Error("Invalid patch path part");
+  }
+
+  if (typeof part === "number") {
+    return part;
+  }
+
   if (part !== "__proto__" && part !== "prototype" && part !== "constructor") {
     return part;
   }

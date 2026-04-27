@@ -51,6 +51,9 @@ describe("applyJsonPatches", () => {
     expect(() => applyJsonPatches({}, [{ op: "add", path: ["__proto__", "polluted"], value: true }])).toThrow(
       "Forbidden patch path segment __proto__",
     );
+    expect(() => applyJsonPatches({}, [{ op: "add", path: [[["__proto__"]], "polluted"], value: true }])).toThrow(
+      "Invalid patch path part",
+    );
     expect({}.polluted).toBeUndefined();
   });
 
