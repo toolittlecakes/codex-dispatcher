@@ -1,0 +1,8 @@
+{
+  "name": "Codex Dispatcher",
+  "short_name": "Codex",
+  "start_url": "/",
+  "display": "standalone",
+  "background_color": "#f4f6f8",
+  "theme_color": "#126b5a"
+}
