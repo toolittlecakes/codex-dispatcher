@@ -182,11 +182,13 @@ body {
 
 #root {
   width: 100vw;
-  height: 100vh;
-  height: 100dvh;
+  height: var(--codex-dispatcher-viewport-height, 100vh);
+  height: var(--codex-dispatcher-viewport-height, 100dvh);
   min-width: 0;
   min-height: 0;
   overflow: hidden;
+  position: fixed;
+  inset: 0;
 }
 </style>`;
   }
@@ -571,6 +573,14 @@ body {
     "--vscode-terminal-ansiBrightWhite": "#8c959f",
   };
   const root = document.documentElement;
+  const applyViewportHeight = () => {
+    const height = window.visualViewport?.height || window.innerHeight;
+    root.style.setProperty("--codex-dispatcher-viewport-height", Math.max(0, Math.floor(height)) + "px");
+  };
+  applyViewportHeight();
+  window.addEventListener("resize", applyViewportHeight, { passive: true });
+  window.visualViewport?.addEventListener("resize", applyViewportHeight, { passive: true });
+  window.visualViewport?.addEventListener("scroll", applyViewportHeight, { passive: true });
   if (token) {
     const cleanUrl = new URL(window.location.href);
     cleanUrl.searchParams.delete("token");
