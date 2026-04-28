@@ -21,6 +21,7 @@ const state = {
   pendingAttachments: [],
   queuedFollowUps: new Map(),
   editingTurn: null,
+  security: null,
   defaultCwd: "",
   fastSyncTimer: 0,
   ipc: null,
@@ -53,6 +54,7 @@ const dom = {
   reasoningSelect: document.querySelector("#reasoningSelect"),
   refreshButton: document.querySelector("#refreshButton"),
   searchInput: document.querySelector("#searchInput"),
+  securityPanel: document.querySelector("#securityPanel"),
   sendButton: document.querySelector("#sendButton"),
   sessionModePill: document.querySelector("#sessionModePill"),
   sidebarBackdrop: document.querySelector("#sidebarBackdrop"),
@@ -238,6 +240,7 @@ function handleServerMessage(message) {
       state.defaultCwd = message.defaultCwd || "";
       dom.cwdInput.value = state.defaultCwd;
       setIpcStatus(message.ipc);
+      setSecurity(message.security);
       setStreamOwners(message.streamOwners || []);
       setMirroredConversations(message.mirroredConversations || []);
       for (const request of message.pendingServerRequests || []) {
@@ -286,6 +289,10 @@ function handleServerMessage(message) {
 
     case "threadStreamOwners":
       setStreamOwners(message.streamOwners || []);
+      break;
+
+    case "dispatcherSecurity":
+      setSecurity(message.security);
       break;
 
     default:
@@ -769,6 +776,23 @@ async function syncThreadSettings() {
       collaborationMode: settings.collaborationMode,
       inheritThreadSettings: settings.inheritThreadSettings,
     });
+  } catch (error) {
+    setStatus(error instanceof Error ? error.message : String(error), true);
+  }
+}
+
+async function rotateAccessToken() {
+  try {
+    const result = await request("rotateToken");
+    if (typeof result?.token === "string") {
+      state.token = result.token;
+      localStorage.setItem("dispatcherToken", result.token);
+      const url = new URL(location.href);
+      url.searchParams.set("token", result.token);
+      history.replaceState(null, "", url);
+    }
+    setSecurity(result?.security);
+    setStatus("Token rotated", false);
   } catch (error) {
     setStatus(error instanceof Error ? error.message : String(error), true);
   }
@@ -2316,6 +2340,82 @@ function setIpcStatus(ipc) {
 
   state.ipc = ipc;
   renderIpcStatus();
+}
+
+function setSecurity(security) {
+  if (!security) {
+    return;
+  }
+  state.security = security;
+  renderSecurity();
+}
+
+function renderSecurity() {
+  const security = state.security;
+  dom.securityPanel.classList.toggle("hidden", !security);
+  if (!security) return;
+
+  const remoteUrl = typeof security.remoteUrl === "string" ? security.remoteUrl : "";
+  const lanUrls = Array.isArray(security.lanUrls) ? security.lanUrls : [];
+  const sessions = Array.isArray(security.activeSessions) ? security.activeSessions : [];
+  const primaryUrl = remoteUrl || lanUrls[0] || security.localUrl || "";
+
+  const title = document.createElement("div");
+  title.className = "security-title";
+  title.textContent = remoteUrl ? "Cloudflare tunnel" : "Local access";
+
+  const chips = document.createElement("div");
+  chips.className = "security-chips";
+  chips.append(
+    securityChip(`Token ${security.tokenFingerprint || "unknown"}`),
+    securityChip(`${sessions.length} ${sessions.length === 1 ? "session" : "sessions"}`),
+  );
+  if (primaryUrl) {
+    chips.append(securityChip(shortAccessUrl(primaryUrl)));
+  }
+
+  const actions = document.createElement("div");
+  actions.className = "security-actions";
+  if (primaryUrl) {
+    const open = document.createElement("a");
+    open.className = "ghost-button";
+    open.href = accessUrlWithToken(primaryUrl);
+    open.target = "_blank";
+    open.rel = "noreferrer";
+    open.textContent = remoteUrl ? "Open tunnel" : "Open local";
+    actions.append(open);
+  }
+  const rotate = document.createElement("button");
+  rotate.className = "ghost-button";
+  rotate.type = "button";
+  rotate.textContent = "Rotate token";
+  rotate.addEventListener("click", () => {
+    void rotateAccessToken();
+  });
+  actions.append(rotate);
+
+  dom.securityPanel.replaceChildren(title, chips, actions);
+}
+
+function securityChip(text) {
+  const chip = document.createElement("span");
+  chip.className = "security-chip";
+  chip.textContent = text;
+  return chip;
+}
+
+function accessUrlWithToken(baseUrl) {
+  const url = new URL(baseUrl);
+  url.searchParams.set("token", state.token);
+  return url.toString();
+}
+
+function shortAccessUrl(value) {
+  try {
+    return new URL(value).host;
+  } catch {
+    return value;
+  }
 }
 
 function renderIpcStatus() {

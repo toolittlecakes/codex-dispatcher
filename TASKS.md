@@ -36,7 +36,7 @@ Goal: make the dispatcher behave like the VS Code Codex extension for shared ses
 - Keep controls discoverable on mobile without copying VS Code chrome weight.
 - Validation: parity-critical extension actions have dispatcher equivalents.
 
-## 6. Tunnel and security hardening
+## 6. Tunnel and security hardening - done
 
 - Make Cloudflare tunnel startup/status explicit in the UI.
 - Add token rotation/session visibility and safer remote-access defaults.

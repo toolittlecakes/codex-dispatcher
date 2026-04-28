@@ -397,7 +397,8 @@ h3 {
   color: var(--red);
 }
 
-.token-panel {
+.token-panel,
+.security-panel {
   align-self: start;
   margin: 22px auto 0;
   width: min(520px, calc(100% - 32px));
@@ -406,6 +407,16 @@ h3 {
   background: var(--surface);
   box-shadow: var(--shadow);
   padding: 18px;
+}
+
+.security-panel {
+  display: grid;
+  grid-template-columns: minmax(110px, auto) minmax(0, 1fr) auto;
+  width: min(880px, calc(100% - 32px));
+  box-shadow: none;
+  gap: 10px;
+  align-items: center;
+  padding: 12px 14px;
 }
 
 .token-panel p {
@@ -423,6 +434,36 @@ h3 {
   flex: 1;
   height: 42px;
   padding: 0 12px;
+}
+
+.security-title {
+  font-size: 13px;
+  font-weight: 900;
+}
+
+.security-chips,
+.security-actions {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 7px;
+  min-width: 0;
+}
+
+.security-actions {
+  justify-content: flex-end;
+}
+
+.security-chip {
+  overflow: hidden;
+  max-width: 230px;
+  border-radius: 999px;
+  background: var(--surface-strong);
+  color: var(--muted);
+  font-size: 11px;
+  font-weight: 850;
+  padding: 5px 8px;
+  text-overflow: ellipsis;
+  white-space: nowrap;
 }
 
 .messages {
@@ -920,6 +961,15 @@ textarea {
 
   .messages {
     padding: 14px 10px;
+  }
+
+  .security-panel {
+    grid-template-columns: 1fr;
+    margin-top: 10px;
+  }
+
+  .security-actions {
+    justify-content: flex-start;
   }
 
   .message.user {

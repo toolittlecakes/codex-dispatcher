@@ -1,4 +1,4 @@
-import { randomBytes } from "node:crypto";
+import { createHash, randomBytes } from "node:crypto";
 import { networkInterfaces } from "node:os";
 import { resolve, sep } from "node:path";
 import { applyJsonPatches, cloneJson } from "../public/json-patch.js";
@@ -36,13 +36,18 @@ type ClientMessage = {
 };
 
 type WsData = {
+  connectionId: string;
   connectedAt: number;
+  remoteAddress: string | null;
+  userAgent: string | null;
 };
 
 const port = Number(process.env.PORT ?? "8787");
 const host = process.env.HOST ?? "0.0.0.0";
-const dispatcherToken = process.env.DISPATCHER_TOKEN ?? randomBytes(18).toString("base64url");
+let dispatcherToken = process.env.DISPATCHER_TOKEN ?? randomBytes(18).toString("base64url");
+let tokenCreatedAt = Date.now();
 const defaultCwd = process.env.CODEX_DISPATCHER_CWD ?? process.cwd();
+const dispatcherRemoteUrl = normalizeBaseUrl(process.env.DISPATCHER_REMOTE_URL);
 const publicRoot = resolve(import.meta.dir, "../public");
 const appServer = new CodexAppServer();
 const ipcBridge = new CodexIpcBridge();
@@ -178,7 +183,14 @@ try {
         return new Response("Unauthorized", { status: 401 });
       }
 
-      if (bunServer.upgrade(request, { data: { connectedAt: Date.now() } })) {
+      if (bunServer.upgrade(request, {
+        data: {
+          connectionId: randomBytes(8).toString("base64url"),
+          connectedAt: Date.now(),
+          remoteAddress: clientAddress(request),
+          userAgent: request.headers.get("user-agent"),
+        },
+      })) {
         return undefined;
       }
 
@@ -196,13 +208,16 @@ try {
         codexCliPath: appServer.codexCliPath,
         defaultCwd,
         ipc: ipcBridge.getSnapshot(),
+        security: securitySnapshot(ws.data.connectionId),
         streamOwners: streamOwnersSnapshot(),
         mirroredConversations: mirroredConversationsSnapshot(),
         pendingServerRequests: appServer.getPendingServerRequests(),
       });
+      broadcastSecurity();
     },
     close(ws) {
       clients.delete(ws);
+      broadcastSecurity();
     },
     message(ws, rawMessage) {
       void handleClientMessage(ws, rawMessage);
@@ -375,6 +390,17 @@ async function routeClientMessage(message: ClientMessage): Promise<JsonValue> {
       ipcBridge.broadcast("thread-queued-followups-changed", buildQueuedFollowUpsBroadcastParams(threadId, stateValue));
       broadcastDispatcherOwnedSnapshot(threadId);
       return { ok: true };
+    }
+
+    case "rotateToken": {
+      dispatcherToken = randomBytes(18).toString("base64url");
+      tokenCreatedAt = Date.now();
+      const snapshot = securitySnapshot();
+      broadcastSecurity();
+      return {
+        token: dispatcherToken,
+        security: snapshot,
+      };
     }
 
     case "ipcFollowerRequest": {
@@ -822,6 +848,39 @@ function mirroredConversationsSnapshot(): JsonValue {
   }));
 }
 
+function securitySnapshot(currentConnectionId?: string): JsonObject {
+  return {
+    tokenFingerprint: tokenFingerprint(dispatcherToken),
+    tokenCreatedAt,
+    localUrl: `http://localhost:${port}`,
+    lanUrls: lanAddresses().map((address) => `http://${address}:${port}`),
+    remoteUrl: dispatcherRemoteUrl,
+    activeSessions: Array.from(clients).map((client) => ({
+      id: client.data.connectionId,
+      connectedAt: client.data.connectedAt,
+      current: client.data.connectionId === currentConnectionId,
+      remoteAddress: client.data.remoteAddress,
+      userAgent: client.data.userAgent,
+    })),
+  };
+}
+
+function broadcastSecurity(): void {
+  broadcast({
+    type: "dispatcherSecurity",
+    security: securitySnapshot(),
+  });
+}
+
+function tokenFingerprint(token: string): string {
+  return createHash("sha256").update(token).digest("hex").slice(0, 12);
+}
+
+function clientAddress(request: Request): string | null {
+  const forwarded = request.headers.get("cf-connecting-ip") || request.headers.get("x-forwarded-for");
+  return forwarded?.split(",")[0]?.trim() || null;
+}
+
 function clearIpcMirrorsIfDisconnected(status: string): boolean {
   if (status !== "disconnected" && status !== "error" && status !== "closed") {
     return false;
@@ -1022,6 +1081,21 @@ function normalizeNullableString(value: string | null | undefined): string | nul
 
   const trimmed = value.trim();
   return trimmed.length > 0 ? trimmed : null;
+}
+
+function normalizeBaseUrl(value: string | undefined): string | null {
+  if (!value) {
+    return null;
+  }
+  try {
+    const url = new URL(value);
+    url.pathname = "";
+    url.search = "";
+    url.hash = "";
+    return url.toString().replace(/\/$/, "");
+  } catch {
+    return null;
+  }
 }
 
 function lanAddresses(): string[] {

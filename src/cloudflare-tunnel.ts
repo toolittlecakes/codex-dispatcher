@@ -11,15 +11,26 @@ let shuttingDown = false;
 let dispatcher: ChildProcess | null = null;
 let tunnel: ChildProcess | null = null;
 
-dispatcher = await startDispatcher();
-tunnel = await startCloudflareTunnel();
+try {
+  const tunnelStart = await startCloudflareTunnel();
+  tunnel = tunnelStart.child;
+  dispatcher = await startDispatcher(tunnelStart.url);
+
+  console.log("");
+  console.log(`Remote URL: ${tunnelStart.url}/?token=${encodeURIComponent(token)}`);
+  console.log(`Local URL:  http://localhost:${port}/?token=${encodeURIComponent(token)}`);
+  console.log("");
+} catch (error) {
+  console.error(error instanceof Error ? error.message : String(error));
+  shutdown(1);
+}
 
 process.once("SIGINT", () => shutdown(0));
 process.once("SIGTERM", () => shutdown(0));
 
 await new Promise<never>(() => {});
 
-function startDispatcher(): Promise<ChildProcess> {
+function startDispatcher(remoteUrl: string): Promise<ChildProcess> {
   return new Promise((resolve, reject) => {
     const child = spawn(process.execPath, ["run", "src/server.ts"], {
       stdio: ["inherit", "pipe", "pipe"],
@@ -28,6 +39,7 @@ function startDispatcher(): Promise<ChildProcess> {
         PORT: port,
         HOST: host,
         DISPATCHER_TOKEN: token,
+        DISPATCHER_REMOTE_URL: remoteUrl,
       },
     });
 
@@ -66,7 +78,7 @@ function startDispatcher(): Promise<ChildProcess> {
   });
 }
 
-function startCloudflareTunnel(): Promise<ChildProcess> {
+function startCloudflareTunnel(): Promise<{ child: ChildProcess; url: string }> {
   return new Promise((resolve, reject) => {
     const child = spawn(cloudflaredPath, ["--no-autoupdate", "tunnel", "--url", localTarget], {
       stdio: ["inherit", "pipe", "pipe"],
@@ -80,11 +92,7 @@ function startCloudflareTunnel(): Promise<ChildProcess> {
       const url = findTryCloudflareUrl(text);
       if (!ready && url) {
         ready = true;
-        console.log("");
-        console.log(`Remote URL: ${url}/?token=${encodeURIComponent(token)}`);
-        console.log(`Local URL:  http://localhost:${port}/?token=${encodeURIComponent(token)}`);
-        console.log("");
-        resolve(child);
+        resolve({ child, url });
       }
     };
 
