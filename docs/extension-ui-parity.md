@@ -10,7 +10,7 @@ Source inspected: `~/.vscode/extensions/openai.chatgpt-26.422.62136-darwin-arm64
 - User action controls are hidden by default with `opacity-0` and become visible on `group-hover` and `group-focus-within`.
 - User actions are Copy plus Edit. Edit is conditional; it is only rendered when the message can be edited.
 - Assistant actions use a separate row: `mt-3 flex h-5 items-center justify-start gap-0.5`.
-- Assistant actions include Copy, rating, Fork in the full extension, but this dispatcher intentionally keeps only Fork for the phone-first surface.
+- Assistant actions include Copy, rating, and Fork in the full extension. This dispatcher keeps Copy and Fork, and omits rating.
 - Assistant timestamp is the part that fades in on hover; the action row itself remains present.
 
 ## Composer
@@ -28,4 +28,3 @@ Source inspected: `~/.vscode/extensions/openai.chatgpt-26.422.62136-darwin-arm64
 - Intermediate work is summarized with terse labels: `Thinking`, `Working for ...`, `Worked for ...`, `Ran ...`, `Searched web`, and `Explored ...`.
 - Detail-heavy tool output is collapsed under compact accordions by default.
 - Content should be clipped by the bottom composer area. Text may scroll behind the dock visually, but the dock surface must be opaque so it does not show through.
-

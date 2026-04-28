@@ -1575,6 +1575,9 @@ function renderMessageActions(item) {
   actions.className = `message-actions ${item.type === "agentMessage" ? "assistant-actions" : "user-actions"}`;
 
   if (item.type === "agentMessage") {
+    actions.append(messageActionButton("copy", "Copy message", () => {
+      void copyText(itemText(item));
+    }));
     actions.append(messageActionButton("fork", "Fork thread", () => {
       void forkThread();
     }));
