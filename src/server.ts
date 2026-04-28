@@ -316,6 +316,11 @@ async function routeClientMessage(message: ClientMessage, connectionId?: string)
         persistExtendedHistory: true,
       });
 
+    case "forkThread":
+      return appServer.request("thread/fork", {
+        threadId: requireString(message.threadId, "threadId"),
+      });
+
     case "startTurn": {
       const threadId = requireString(message.threadId, "threadId");
       const result = await appServer.request("turn/start", buildClientTurnStartRequest(message, threadId));

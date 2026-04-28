@@ -485,6 +485,26 @@ async function openThread(threadId) {
   renderSelectedThread();
 }
 
+async function forkThread(threadId = state.selectedThreadId) {
+  if (!threadId) return;
+  try {
+    const result = await request("forkThread", { threadId });
+    await loadThreads({ openFirst: false });
+    const forkedThread = result?.thread || result?.data || result;
+    const forkedThreadId = typeof forkedThread?.id === "string"
+      ? forkedThread.id
+      : typeof result?.threadId === "string"
+        ? result.threadId
+        : null;
+    if (forkedThreadId) {
+      await openThread(forkedThreadId);
+    }
+    setStatus("Fork created", false);
+  } catch (error) {
+    setStatus(error instanceof Error ? error.message : String(error), true);
+  }
+}
+
 async function refreshCurrentThread(options = {}) {
   if (!state.selectedThreadId) return;
   const result = await request("readThread", { threadId: state.selectedThreadId });
@@ -1169,7 +1189,7 @@ function renderThreads() {
     return;
   }
 
-  dom.threadList.replaceChildren(...threads.map(renderThreadRow));
+  dom.threadList.replaceChildren(...groupThreadsByProject(threads).map(renderProjectGroup));
 }
 
 function visibleThreads() {
@@ -1184,11 +1204,81 @@ function visibleThreads() {
   return visible;
 }
 
-function renderThreadRow(thread) {
+function groupThreadsByProject(threads) {
+  const nodeMap = new Map();
+  const roots = [];
+  for (const thread of threads) {
+    const displayThread = mergeThreadState(thread, state.mirroredThreads.get(thread.id) || {});
+    nodeMap.set(displayThread.id, { thread: displayThread, children: [] });
+  }
+
+  for (const node of nodeMap.values()) {
+    const parentThreadId = subAgentParentThreadId(node.thread);
+    const parent = parentThreadId ? nodeMap.get(parentThreadId) : null;
+    if (parent && parent !== node) {
+      parent.children.push(node);
+    } else {
+      roots.push(node);
+    }
+  }
+
+  const groupsByKey = new Map();
+  for (const node of roots) {
+    const project = projectInfo(node.thread);
+    const current = groupsByKey.get(project.key) || {
+      ...project,
+      nodes: [],
+      latestUpdatedAt: 0,
+    };
+    current.nodes.push(node);
+    current.latestUpdatedAt = Math.max(current.latestUpdatedAt, latestNodeTimestamp(node));
+    groupsByKey.set(project.key, current);
+  }
+
+  return Array.from(groupsByKey.values()).sort((a, b) => b.latestUpdatedAt - a.latestUpdatedAt);
+}
+
+function renderProjectGroup(group) {
+  const section = document.createElement("section");
+  section.className = "project-group";
+
+  const heading = document.createElement("div");
+  heading.className = "project-heading";
+  const title = document.createElement("strong");
+  title.textContent = group.name;
+  const path = document.createElement("span");
+  path.textContent = group.path;
+  heading.append(title, path);
+
+  const tree = document.createElement("div");
+  tree.className = "thread-tree";
+  for (const node of group.nodes) {
+    tree.append(renderThreadNode(node, 0));
+  }
+
+  section.append(heading, tree);
+  return section;
+}
+
+function renderThreadNode(node, depth) {
+  const fragment = document.createDocumentFragment();
+  fragment.append(renderThreadRow(node.thread, depth));
+  for (const child of node.children) {
+    fragment.append(renderThreadNode(child, depth + 1));
+  }
+  return fragment;
+}
+
+function renderThreadRow(thread, depth = 0) {
   const displayThread = mergeThreadState(thread, state.mirroredThreads.get(thread.id) || {});
   const button = document.createElement("button");
   button.type = "button";
-  button.className = `thread-row${displayThread.id === state.selectedThreadId ? " active" : ""}`;
+  button.className = [
+    "thread-row",
+    isSubAgentThread(displayThread) ? "subagent" : "",
+    displayThread.id === state.selectedThreadId ? "active" : "",
+  ].filter(Boolean).join(" ");
+  button.style.setProperty("--thread-depth", String(Math.min(depth, 5)));
   button.addEventListener("click", () => {
     void openThread(displayThread.id);
   });
@@ -1215,6 +1305,47 @@ function renderThreadRow(thread) {
 
   button.append(main, meta);
   return button;
+}
+
+function latestNodeTimestamp(node) {
+  return Math.max(
+    timestampValue(node.thread.updatedAt || node.thread.createdAt),
+    ...node.children.map(latestNodeTimestamp),
+  );
+}
+
+function projectInfo(thread) {
+  const path = typeof thread?.cwd === "string" && thread.cwd ? thread.cwd : "No project";
+  return {
+    key: normalizedProjectPath(path),
+    name: projectName(path),
+    path: shortPath(path),
+  };
+}
+
+function normalizedProjectPath(path) {
+  if (typeof path !== "string" || !path) return "unknown";
+  const worktreeMatch = path.match(/\/\.codex\/worktrees\/[^/]+\/(.+)$/);
+  if (worktreeMatch) {
+    return worktreeMatch[1];
+  }
+  return path;
+}
+
+function projectName(path) {
+  const normalized = normalizedProjectPath(path);
+  if (normalized === "unknown") return "No project";
+  const parts = normalized.split("/").filter(Boolean);
+  return parts.at(-1) || normalized;
+}
+
+function subAgentParentThreadId(thread) {
+  const threadSpawn = thread?.source?.subAgent?.thread_spawn;
+  return typeof threadSpawn?.parent_thread_id === "string" ? threadSpawn.parent_thread_id : null;
+}
+
+function isSubAgentThread(thread) {
+  return Boolean(thread?.source?.subAgent);
 }
 
 function renderThreadHeader() {
@@ -1257,17 +1388,31 @@ function renderMessages() {
 function collectItems() {
   const turns = currentThreadState()?.turns || [];
   const items = [];
+  const editableTurn = editableLastTurn(currentThreadState());
+  const editableTurnId = editableTurn?.turnId || editableTurn?.id || null;
   for (const [turnIndex, turn] of turns.entries()) {
     const turnItems = turn.items || [];
+    const turnId = turn.turnId || turn.id || null;
     if (!turnItems.some((item) => item?.type === "userMessage") && Array.isArray(turn.params?.input)) {
       items.push({
         type: "userMessage",
         id: `turn-${turn.turnId || turnIndex}-input`,
+        turnId,
+        editable: Boolean(turnId && editableTurnId && turnId === editableTurnId),
         content: turn.params.input,
       });
     }
-    for (const item of turnItems) {
-      items.push(renderableItem(item));
+    const renderableTurnItems = turnItems.map(renderableItem);
+    const lastAgentMessageIndex = findLastIndex(renderableTurnItems, (item) => item.type === "agentMessage");
+    for (const [itemIndex, renderable] of renderableTurnItems.entries()) {
+      if (renderable.type === "userMessage") {
+        renderable.turnId = renderable.turnId || turnId;
+        renderable.editable = Boolean(turnId && editableTurnId && turnId === editableTurnId);
+      }
+      if (renderable.type === "agentMessage") {
+        renderable.showActions = itemIndex === lastAgentMessageIndex;
+      }
+      items.push(renderable);
     }
     if (hasDisplayValue(turn.diff)) {
       items.push({
@@ -1304,7 +1449,70 @@ function renderItem(item) {
   element.append(label);
 
   element.append(renderItemBody(item));
+  const actions = renderMessageActions(item);
+  if (actions) {
+    element.append(actions);
+  }
   return element;
+}
+
+function renderMessageActions(item) {
+  if (item.type !== "agentMessage" && item.type !== "userMessage") {
+    return null;
+  }
+  if (item.type === "agentMessage" && !item.showActions) {
+    return null;
+  }
+
+  const actions = document.createElement("div");
+  actions.className = "message-actions";
+
+  actions.append(messageActionButton("⧉", "Copy message", () => {
+    void copyText(itemText(item));
+  }));
+
+  if (state.selectedThreadId) {
+    actions.append(messageActionButton("⑂", "Fork thread", () => {
+      void forkThread();
+    }));
+  }
+
+  if (item.type === "userMessage" && item.editable) {
+    actions.append(messageActionButton("✎", "Edit message", () => {
+      startEditingLastUserTurn();
+    }));
+  }
+
+  return actions;
+}
+
+function findLastIndex(items, predicate) {
+  for (let index = items.length - 1; index >= 0; index -= 1) {
+    if (predicate(items[index], index)) {
+      return index;
+    }
+  }
+  return -1;
+}
+
+function messageActionButton(label, title, onClick) {
+  const button = document.createElement("button");
+  button.type = "button";
+  button.className = "message-action";
+  button.textContent = label;
+  button.title = title;
+  button.setAttribute("aria-label", title);
+  button.addEventListener("click", onClick);
+  return button;
+}
+
+async function copyText(text) {
+  try {
+    await navigator.clipboard.writeText(text || "");
+    setStatus("Copied", false);
+  } catch (error) {
+    setStatus(error instanceof Error ? error.message : String(error), true);
+  }
 }
 
 function renderItemBody(item) {
@@ -1417,7 +1625,7 @@ function renderCommandExecution(item) {
     body.append(renderKeyValueBody([["Exit code", String(item.exitCode)]]));
   }
   if (item.aggregatedOutput) {
-    body.append(renderDetails("Output", item.aggregatedOutput, true));
+    body.append(renderDetails("Output", item.aggregatedOutput));
   }
   return body;
 }
@@ -1467,7 +1675,7 @@ function renderFileChange(item) {
 
     const diff = fileChangeDiff(changeObject);
     if (diff) {
-      list.append(renderDetails("Patch", diff, true));
+      list.append(renderDetails("Patch", diff));
     }
   }
   body.append(list);
@@ -1477,7 +1685,7 @@ function renderFileChange(item) {
 function renderDiff(label, diff) {
   const body = document.createElement("div");
   body.className = "message-body";
-  body.append(renderDetails(label, formatDiffValue(diff), true, true));
+  body.append(renderDetails(label, formatDiffValue(diff), false, true));
   return body;
 }
 
@@ -2651,13 +2859,20 @@ function turnCount(thread) {
 
 function formatTime(value) {
   if (!value) return "";
-  const date = new Date(value);
+  const date = new Date(typeof value === "number" && value < 100000000000 ? value * 1000 : value);
   return new Intl.DateTimeFormat(undefined, {
     month: "short",
     day: "numeric",
     hour: "2-digit",
     minute: "2-digit",
   }).format(date);
+}
+
+function timestampValue(value) {
+  if (!value) return 0;
+  if (typeof value === "number") return value;
+  const timestamp = Date.parse(value);
+  return Number.isFinite(timestamp) ? timestamp : 0;
 }
 
 function debounce(fn, delay) {
