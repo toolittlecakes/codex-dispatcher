@@ -41,7 +41,7 @@
           <button class="icon-button mobile-only" id="threadsButton" type="button" aria-label="Open threads">☰</button>
           <div class="thread-title-block">
             <div class="thread-title-row">
-              <div class="thread-title" id="threadTitle">No thread selected</div>
+              <div class="thread-title" id="threadTitle">CODEX</div>
               <div class="status-cluster">
                 <div class="ipc-pill" id="ipcPill">IPC starting</div>
                 <div class="status-pill" id="statusPill">Starting</div>
@@ -73,46 +73,54 @@
         </section>
 
         <form class="composer" id="composer">
-          <div class="composer-top">
-            <label class="field cwd-field">
-              <span>CWD</span>
-              <input id="cwdInput" autocomplete="off" />
-            </label>
-            <span class="session-mode" id="sessionModePill">App server</span>
-            <span class="active-turn hidden" id="activeTurnPill">Active turn</span>
-          </div>
-          <div class="composer-controls">
-            <label class="field model-field">
-              <span>Model</span>
-              <input id="modelInput" autocomplete="off" placeholder="Thread default" />
-            </label>
-            <label class="field reasoning-field">
-              <span>Reasoning</span>
-              <select id="reasoningSelect">
-                <option value="">Thread default</option>
-                <option value="low">Low</option>
-                <option value="medium">Medium</option>
-                <option value="high">High</option>
-                <option value="xhigh">XHigh</option>
-              </select>
-            </label>
-            <label class="field collaboration-field">
-              <span>Mode</span>
-              <select id="collaborationSelect">
-                <option value="inherit">Inherit</option>
-                <option value="off">Off</option>
-              </select>
-            </label>
-            <button class="ghost-button" id="compactButton" type="button">Compact</button>
-            <button class="ghost-button" id="editLastButton" type="button">Edit last</button>
-          </div>
           <div class="attachment-strip hidden" id="attachmentStrip"></div>
           <div class="queue-strip hidden" id="queueStrip"></div>
           <div class="composer-row">
             <textarea id="promptInput" rows="1" placeholder="Ask Codex anything. @ to use plugins or mention files"></textarea>
             <input class="hidden" id="attachmentInput" type="file" accept="image/*" multiple />
             <button class="ghost-button icon-action" id="attachButton" type="button" title="Attach images" aria-label="Attach images">+</button>
-            <button class="ghost-button" id="queueButton" type="button" title="Queue follow-up">Queue</button>
+            <details class="composer-settings">
+              <summary aria-label="Composer settings">
+                <span aria-hidden="true">⚙</span>
+                <span>Custom</span>
+              </summary>
+              <div class="composer-settings-panel">
+                <div class="composer-controls">
+                  <label class="field model-field">
+                    <span>Model</span>
+                    <input id="modelInput" autocomplete="off" placeholder="Thread default" />
+                  </label>
+                  <label class="field reasoning-field">
+                    <span>Reasoning</span>
+                    <select id="reasoningSelect" aria-label="Reasoning effort">
+                      <option value="">Thread default</option>
+                      <option value="low">Low</option>
+                      <option value="medium">Medium</option>
+                      <option value="high">High</option>
+                      <option value="xhigh">XHigh</option>
+                    </select>
+                  </label>
+                  <label class="field collaboration-field">
+                    <span>Mode</span>
+                    <select id="collaborationSelect" aria-label="Collaboration mode">
+                      <option value="inherit">Inherit</option>
+                      <option value="off">Off</option>
+                    </select>
+                  </label>
+                  <button class="ghost-button" id="compactButton" type="button" title="Compact thread" aria-label="Compact thread">Compact</button>
+                  <button class="ghost-button" id="editLastButton" type="button" title="Edit last user turn" aria-label="Edit last user turn">Edit</button>
+                </div>
+                <div class="composer-top">
+                  <label class="field cwd-field">
+                    <span>CWD</span>
+                    <input id="cwdInput" autocomplete="off" aria-label="Working directory" />
+                  </label>
+                  <span class="session-mode" id="sessionModePill">App server</span>
+                  <span class="active-turn hidden" id="activeTurnPill">Active turn</span>
+                </div>
+              </div>
+            </details>
+            <button class="ghost-button hidden" id="queueButton" type="button" title="Queue follow-up">Queue</button>
             <button class="danger-button hidden" id="stopButton" type="button" title="Stop" aria-label="Stop">■</button>
             <button class="send-button" id="sendButton" type="submit" title="Send" aria-label="Send">↑</button>
           </div>

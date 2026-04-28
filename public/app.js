@@ -1220,8 +1220,8 @@ function renderThreadRow(thread) {
 function renderThreadHeader() {
   const thread = currentThreadState();
   if (!thread) {
-    dom.threadTitle.textContent = "No thread selected";
-    dom.threadMeta.replaceChildren(metaChip("Connect and pick a session"));
+    dom.threadTitle.textContent = "CODEX";
+    dom.threadMeta.replaceChildren(metaChip("Tasks"));
     renderSessionMode();
     return;
   }
@@ -2326,7 +2326,9 @@ function renderComposerState() {
   dom.queueButton.classList.toggle("hidden", editing || (!active && !canFollowExternal));
   dom.compactButton.disabled = !hasThread || active || externalActive;
   dom.editLastButton.disabled = !canEdit;
-  dom.editLastButton.textContent = editing ? "Editing" : "Edit last";
+  dom.editLastButton.textContent = editing ? "Editing" : "Edit";
+  dom.editLastButton.title = editing ? "Editing last user turn" : "Edit last user turn";
+  dom.editLastButton.setAttribute("aria-label", dom.editLastButton.title);
   renderSessionMode();
 }
 
