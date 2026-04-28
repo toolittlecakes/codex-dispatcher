@@ -46,7 +46,7 @@ Goal: make the dispatcher behave like the VS Code Codex extension for shared ses
 ## 7. Codex UI parity pass - in progress
 
 - Sidebar: group by project, nest subagent threads under parent threads, collapse noisy child trees by default, and avoid rendering full subagent prompts as sidebar titles.
-- Message actions: keep Copy, Fork, and Edit, remove like/dislike, show actions only on hover/focus or selected message context, and use compact icon buttons.
-- Composer: keep the opaque bottom composer, move model/reasoning/context controls into extension-like inline controls, and make context-window state visible.
+- Message actions: user messages show Copy and conditional Edit on hover/focus; assistant messages keep the persistent Fork action.
+- Composer: keep the opaque bottom composer, move `Work locally` below the bordered composer surface, move model/reasoning/context controls into extension-like inline controls, and make context-window state visible.
 - Intermediate work: render tool calls, command output, diffs, and file changes as a compact timeline with collapsed detail by default.
 - Validation: verify desktop and mobile with `agent-browser`, including no horizontal overflow and last message scrollability above the composer.

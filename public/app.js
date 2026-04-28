@@ -1495,31 +1495,30 @@ function renderMessages() {
 }
 
 function collectItems() {
-  const turns = currentThreadState()?.turns || [];
+  const thread = currentThreadState();
+  const turns = thread?.turns || [];
   const items = [];
-  const editableTurn = editableLastTurn(currentThreadState());
+  const canEditLastTurn = Boolean(selectedThreadOwner() && !state.activeTurnId && !state.externalActiveTurnId);
+  const editableTurn = canEditLastTurn ? editableLastTurn(thread) : null;
   const editableTurnId = editableTurn?.turnId || editableTurn?.id || null;
   for (const [turnIndex, turn] of turns.entries()) {
     const turnItems = turn.items || [];
     const turnId = turn.turnId || turn.id || null;
+    const isEditableTurn = Boolean(turnId && editableTurnId && turnId === editableTurnId);
     if (!turnItems.some((item) => item?.type === "userMessage") && Array.isArray(turn.params?.input)) {
       items.push({
         type: "userMessage",
         id: `turn-${turn.turnId || turnIndex}-input`,
         turnId,
-        editable: Boolean(turnId && editableTurnId && turnId === editableTurnId),
+        editable: isEditableTurn,
         content: turn.params.input,
       });
     }
     const renderableTurnItems = turnItems.map(renderableItem);
-    const lastAgentMessageIndex = findLastIndex(renderableTurnItems, (item) => item.type === "agentMessage");
-    for (const [itemIndex, renderable] of renderableTurnItems.entries()) {
+    for (const renderable of renderableTurnItems) {
       if (renderable.type === "userMessage") {
         renderable.turnId = renderable.turnId || turnId;
-        renderable.editable = Boolean(turnId && editableTurnId && turnId === editableTurnId);
-      }
-      if (renderable.type === "agentMessage") {
-        renderable.showActions = itemIndex === lastAgentMessageIndex;
+        renderable.editable = isEditableTurn;
       }
       items.push(renderable);
     }
@@ -1571,41 +1570,31 @@ function renderMessageActions(item) {
   if (item.type !== "agentMessage" && item.type !== "userMessage") {
     return null;
   }
-  if (item.type === "agentMessage" && !item.showActions) {
-    return null;
-  }
-  if (item.type === "userMessage" && !item.editable) {
-    return null;
-  }
 
   const actions = document.createElement("div");
-  actions.className = "message-actions";
+  actions.className = `message-actions ${item.type === "agentMessage" ? "assistant-actions" : "user-actions"}`;
 
   if (item.type === "agentMessage") {
-    actions.append(messageActionButton("copy", "Copy message", () => {
-      void copyText(itemText(item));
-    }));
     actions.append(messageActionButton("fork", "Fork thread", () => {
       void forkThread();
     }));
   }
 
   if (item.type === "userMessage") {
-    actions.append(messageActionButton("edit", "Edit message", () => {
-      startEditingLastUserTurn();
+    actions.append(messageActionButton("copy", "Copy message", () => {
+      void copyText(itemText(item));
     }));
-  }
-
-  return actions;
-}
-
-function findLastIndex(items, predicate) {
-  for (let index = items.length - 1; index >= 0; index -= 1) {
-    if (predicate(items[index], index)) {
-      return index;
+    if (item.editable) {
+      actions.append(messageActionButton("edit", "Edit message", () => {
+        startEditingLastUserTurn();
+      }));
     }
   }
-  return -1;
+
+  if (actions.childElementCount === 0) {
+    return null;
+  }
+  return actions;
 }
 
 function messageActionButton(icon, title, onClick) {

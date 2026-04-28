@@ -20,7 +20,7 @@
   --shadow: 0 18px 54px rgba(0, 0, 0, 0.09);
   --content-width: 980px;
   --composer-width: 1000px;
-  --composer-reserved-height: 190px;
+  --composer-reserved-height: 24px;
 }
 
 * {
@@ -481,6 +481,7 @@ a {
 }
 
 .chat-header {
+  grid-row: 1;
   display: flex;
   align-items: center;
   gap: 12px;
@@ -556,6 +557,7 @@ a {
 
 .token-panel,
 .security-panel {
+  grid-row: 2;
   align-self: start;
   width: min(480px, calc(100% - 32px));
   margin: 32px auto 0;
@@ -585,6 +587,7 @@ a {
 }
 
 .security-panel {
+  grid-row: 3;
   display: grid;
   grid-template-columns: minmax(100px, auto) minmax(0, 1fr) auto;
   width: min(var(--content-width), calc(100% - 32px));
@@ -627,13 +630,14 @@ a {
 }
 
 .messages {
+  grid-row: 4;
   display: flex;
   min-height: 0;
   flex-direction: column;
   gap: 14px;
   overflow: auto;
   overflow-x: hidden;
-  padding: 24px clamp(18px, 5vw, 56px) calc(22px + var(--composer-reserved-height));
+  padding: 24px clamp(18px, 5vw, 56px) 24px;
   scroll-padding-bottom: var(--composer-reserved-height);
 }
 
@@ -932,6 +936,7 @@ a {
 }
 
 .approval-tray {
+  grid-row: 5;
   border-top: 1px solid #ead48a;
   background: var(--amber-soft);
   padding: 12px 18px;
@@ -985,7 +990,7 @@ a {
   display: flex;
   align-items: center;
   gap: 8px;
-  height: 0;
+  height: 26px;
   opacity: 0;
   overflow: visible;
   pointer-events: none;
@@ -1000,6 +1005,12 @@ a {
 
 .message.user .message-actions {
   justify-content: flex-end;
+}
+
+.message.agent .assistant-actions {
+  justify-content: flex-start;
+  opacity: 1;
+  pointer-events: auto;
 }
 
 .message-action {
@@ -1031,18 +1042,31 @@ a {
   color: #333;
 }
 
-.composer {
+.composer-stack {
+  position: relative;
+  z-index: 2;
+  grid-row: 6;
   display: grid;
   align-self: end;
-  align-content: start;
-  grid-auto-rows: max-content;
   width: min(var(--composer-width), calc(100% - 40px));
   max-width: 100%;
-  gap: 7px;
+  gap: 8px;
   margin: 0 auto max(14px, env(safe-area-inset-bottom));
+  background: #fff;
+}
+
+.composer {
+  display: grid;
+  align-content: start;
+  grid-auto-rows: max-content;
+  width: 100%;
+  max-width: 100%;
+  gap: 7px;
+  margin: 0;
   border: 1px solid #d5d5d5;
   border-radius: 30px;
   background: #fff;
+  background-clip: padding-box;
   box-shadow: 0 12px 34px rgba(0, 0, 0, 0.08);
   padding: 14px 16px 12px;
 }
@@ -1221,7 +1245,7 @@ a {
   align-items: center;
   min-height: 22px;
   color: #777;
-  padding: 0 4px;
+  padding: 0 18px;
 }
 
 .attachment-strip,
@@ -1419,7 +1443,7 @@ a {
 
   .messages {
     gap: 16px;
-    padding: 18px 24px calc(18px + var(--composer-reserved-height));
+    padding: 18px 24px;
   }
 
   .message,
@@ -1436,8 +1460,12 @@ a {
     max-width: 86%;
   }
 
-  .composer {
+  .composer-stack {
     width: calc(100% - 24px);
+    gap: 7px;
+  }
+
+  .composer {
     border-radius: 28px;
     padding: 12px 14px 10px;
   }
@@ -1516,6 +1544,10 @@ a {
   .messages {
     padding-right: 16px;
     padding-left: 16px;
+  }
+
+  .composer-stack {
+    width: calc(100% - 16px);
   }
 
   .composer-controls {
