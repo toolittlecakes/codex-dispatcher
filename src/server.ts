@@ -263,14 +263,14 @@ async function handleClientMessage(ws: Bun.ServerWebSocket<WsData>, rawMessage: 
   }
 
   try {
-    const result = await routeClientMessage(message);
+    const result = await routeClientMessage(message, ws.data.connectionId);
     respond(ws, message.requestId, true, result, null);
   } catch (error) {
     respond(ws, message.requestId, false, null, error instanceof Error ? error.message : String(error));
   }
 }
 
-async function routeClientMessage(message: ClientMessage): Promise<JsonValue> {
+async function routeClientMessage(message: ClientMessage, connectionId?: string): Promise<JsonValue> {
   switch (message.type) {
     case "listThreads":
       return appServer.request("thread/list", {
@@ -395,7 +395,7 @@ async function routeClientMessage(message: ClientMessage): Promise<JsonValue> {
     case "rotateToken": {
       dispatcherToken = randomBytes(18).toString("base64url");
       tokenCreatedAt = Date.now();
-      const snapshot = securitySnapshot();
+      const snapshot = securitySnapshot(connectionId);
       broadcastSecurity();
       return {
         token: dispatcherToken,
