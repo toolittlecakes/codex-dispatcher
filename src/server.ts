@@ -213,7 +213,7 @@ try {
         mirroredConversations: mirroredConversationsSnapshot(),
         pendingServerRequests: appServer.getPendingServerRequests(),
       });
-      broadcastSecurity();
+      broadcastSecurity(ws.data.connectionId);
     },
     close(ws) {
       clients.delete(ws);
@@ -865,10 +865,10 @@ function securitySnapshot(currentConnectionId?: string): JsonObject {
   };
 }
 
-function broadcastSecurity(): void {
+function broadcastSecurity(currentConnectionId?: string): void {
   broadcast({
     type: "dispatcherSecurity",
-    security: securitySnapshot(),
+    security: securitySnapshot(currentConnectionId),
   });
 }
 
