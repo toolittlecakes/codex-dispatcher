@@ -4,6 +4,16 @@ Phone-friendly Codex UI served from the Codex VS Code extension webview. The dis
 
 ## Quick start
 
+Install without Bun:
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/toolittlecakes/codex-dispatcher/main/scripts/install.sh | sh
+codex-dispatcher doctor
+codex-dispatcher
+```
+
+The installer currently ships a macOS arm64 binary. It installs to `~/.local/bin` by default; set `CODEX_DISPATCHER_INSTALL_DIR` to choose another directory.
+
 From this checkout:
 
 ```bash
@@ -50,7 +60,7 @@ Open that URL on the phone. The first request uses the token to set an HttpOnly 
 - VS Code Codex extension webview assets
 - `cloudflared` for remote phone access
 
-Bun is required when running from source or building the binary. It is not required to run a compiled `codex-dispatcher` binary.
+Bun is required only when running from source or building the binary. It is not required for the direct install path above.
 
 If the VS Code Codex extension is missing, `codex-dispatcher` tries to install `openai.chatgpt` through the `code` CLI. If `code` is unavailable, set `CODEX_EXTENSION_WEBVIEW_ROOT` to the extension `webview` directory.
 
