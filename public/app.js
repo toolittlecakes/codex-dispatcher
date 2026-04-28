@@ -29,6 +29,7 @@ const state = {
   mirroredThreads: new Map(),
   isSyncing: false,
   lastThreadSignatures: new Map(),
+  expandedThreadIds: readStringSet("expandedThreadIds"),
 };
 
 const dom = {
@@ -46,6 +47,8 @@ const dom = {
   editLastButton: document.querySelector("#editLastButton"),
   messages: document.querySelector("#messages"),
   modelInput: document.querySelector("#modelInput"),
+  modelSummary: document.querySelector("#modelSummary"),
+  contextPill: document.querySelector("#contextPill"),
   newThreadButton: document.querySelector("#newThreadButton"),
   promptInput: document.querySelector("#promptInput"),
   ipcPill: document.querySelector("#ipcPill"),
@@ -928,6 +931,7 @@ function hydrateComposerControls(thread) {
   dom.reasoningSelect.value = typeof effort === "string" ? effort : "";
   dom.collaborationSelect.value = "inherit";
   dom.collaborationSelect.title = collaborationMode ? stringifyPretty(collaborationMode) : "No active collaboration mode";
+  renderComposerControlSummary(thread);
 }
 
 function renderAttachments() {
@@ -1262,15 +1266,39 @@ function renderProjectGroup(group) {
 
 function renderThreadNode(node, depth) {
   const fragment = document.createDocumentFragment();
-  fragment.append(renderThreadRow(node.thread, depth));
-  for (const child of node.children) {
-    fragment.append(renderThreadNode(child, depth + 1));
+  const hasChildren = node.children.length > 0;
+  const expanded = hasChildren && (state.expandedThreadIds.has(node.thread.id) || nodeHasSelectedDescendant(node));
+  fragment.append(renderThreadRow(node.thread, depth, { hasChildren, expanded }));
+  if (expanded) {
+    for (const child of node.children) {
+      fragment.append(renderThreadNode(child, depth + 1));
+    }
   }
   return fragment;
 }
 
-function renderThreadRow(thread, depth = 0) {
+function renderThreadRow(thread, depth = 0, options = {}) {
   const displayThread = mergeThreadState(thread, state.mirroredThreads.get(thread.id) || {});
+  const row = document.createElement("div");
+  row.className = "thread-node-row";
+  row.style.setProperty("--thread-depth", String(Math.min(depth, 5)));
+
+  if (options.hasChildren) {
+    const toggle = document.createElement("button");
+    toggle.type = "button";
+    toggle.className = "thread-toggle";
+    toggle.textContent = options.expanded ? "⌄" : "›";
+    toggle.title = options.expanded ? "Collapse subagents" : "Expand subagents";
+    toggle.setAttribute("aria-label", toggle.title);
+    toggle.addEventListener("click", (event) => {
+      event.stopPropagation();
+      toggleThreadExpanded(displayThread.id);
+    });
+    row.append(toggle);
+  } else {
+    row.append(document.createElement("span"));
+  }
+
   const button = document.createElement("button");
   button.type = "button";
   button.className = [
@@ -1278,7 +1306,6 @@ function renderThreadRow(thread, depth = 0) {
     isSubAgentThread(displayThread) ? "subagent" : "",
     displayThread.id === state.selectedThreadId ? "active" : "",
   ].filter(Boolean).join(" ");
-  button.style.setProperty("--thread-depth", String(Math.min(depth, 5)));
   button.addEventListener("click", () => {
     void openThread(displayThread.id);
   });
@@ -1287,7 +1314,7 @@ function renderThreadRow(thread, depth = 0) {
   main.className = "thread-row-main";
 
   const title = document.createElement("strong");
-  title.textContent = displayThread.name || displayThread.preview || "Untitled thread";
+  title.textContent = displayThreadTitle(displayThread);
 
   const badge = document.createElement("span");
   const ownerClientId = threadOwner(displayThread.id);
@@ -1301,10 +1328,88 @@ function renderThreadRow(thread, depth = 0) {
   main.append(title, badge);
 
   const meta = document.createElement("span");
-  meta.textContent = `${shortPath(displayThread.cwd) || sourceLabel(displayThread.source)} - ${formatTime(displayThread.updatedAt || displayThread.createdAt)}`;
+  meta.textContent = displayThreadMeta(displayThread);
 
   button.append(main, meta);
-  return button;
+  row.append(button);
+  return row;
+}
+
+function toggleThreadExpanded(threadId) {
+  if (!threadId) return;
+  if (state.expandedThreadIds.has(threadId)) {
+    state.expandedThreadIds.delete(threadId);
+  } else {
+    state.expandedThreadIds.add(threadId);
+  }
+  writeStringSet("expandedThreadIds", state.expandedThreadIds);
+  renderThreads();
+}
+
+function nodeContainsThread(node, threadId) {
+  if (!threadId) return false;
+  if (node.thread.id === threadId) return true;
+  return node.children.some((child) => nodeContainsThread(child, threadId));
+}
+
+function nodeHasSelectedDescendant(node) {
+  return node.children.some((child) => nodeContainsThread(child, state.selectedThreadId));
+}
+
+function displayThreadTitle(thread) {
+  if (!isSubAgentThread(thread)) {
+    return thread.name || thread.preview || "Untitled thread";
+  }
+
+  const subAgent = subAgentInfo(thread);
+  return subAgent.nickname || subAgent.role || compactTitle(thread.name || thread.preview, 42) || "Subagent";
+}
+
+function displayThreadMeta(thread) {
+  const time = formatTime(thread.updatedAt || thread.createdAt);
+  if (isSubAgentThread(thread)) {
+    const subAgent = subAgentInfo(thread);
+    return [subAgent.role && subAgent.role !== displayThreadTitle(thread) ? subAgent.role : "sub-agent", time].filter(Boolean).join(" - ");
+  }
+
+  return `${shortPath(thread.cwd) || sourceLabel(thread.source)} - ${time}`;
+}
+
+function subAgentInfo(thread) {
+  const subAgent = thread?.source?.subAgent || {};
+  const spawn = subAgent.thread_spawn || subAgent.threadSpawn || {};
+  const nickname = firstString(
+    thread.agentNickname,
+    thread.agent_nickname,
+    subAgent.agentNickname,
+    subAgent.agent_nickname,
+    spawn.agentNickname,
+    spawn.agent_nickname,
+  );
+  const role = firstString(
+    thread.agentRole,
+    thread.agent_role,
+    subAgent.agentRole,
+    subAgent.agent_role,
+    spawn.agentRole,
+    spawn.agent_role,
+  );
+  return { nickname, role };
+}
+
+function firstString(...values) {
+  for (const value of values) {
+    if (typeof value === "string" && value.trim()) {
+      return value.trim();
+    }
+  }
+  return "";
+}
+
+function compactTitle(value, limit) {
+  const text = typeof value === "string" ? value.replace(/\s+/g, " ").trim() : "";
+  if (text.length <= limit) return text;
+  return `${text.slice(0, Math.max(0, limit - 1)).trim()}…`;
 }
 
 function latestNodeTimestamp(node) {
@@ -1446,7 +1551,9 @@ function renderItem(item) {
   const label = document.createElement("span");
   label.className = "message-label";
   label.textContent = messageLabel(item);
-  element.append(label);
+  if (label.textContent) {
+    element.append(label);
+  }
 
   element.append(renderItemBody(item));
   const actions = renderMessageActions(item);
@@ -1467,18 +1574,18 @@ function renderMessageActions(item) {
   const actions = document.createElement("div");
   actions.className = "message-actions";
 
-  actions.append(messageActionButton("⧉", "Copy message", () => {
+  actions.append(messageActionButton("copy", "Copy message", () => {
     void copyText(itemText(item));
   }));
 
   if (state.selectedThreadId) {
-    actions.append(messageActionButton("⑂", "Fork thread", () => {
+    actions.append(messageActionButton("fork", "Fork thread", () => {
       void forkThread();
     }));
   }
 
   if (item.type === "userMessage" && item.editable) {
-    actions.append(messageActionButton("✎", "Edit message", () => {
+    actions.append(messageActionButton("edit", "Edit message", () => {
       startEditingLastUserTurn();
     }));
   }
@@ -1495,15 +1602,48 @@ function findLastIndex(items, predicate) {
   return -1;
 }
 
-function messageActionButton(label, title, onClick) {
+function messageActionButton(icon, title, onClick) {
   const button = document.createElement("button");
   button.type = "button";
   button.className = "message-action";
-  button.textContent = label;
   button.title = title;
   button.setAttribute("aria-label", title);
+  button.append(svgIcon(icon));
   button.addEventListener("click", onClick);
   return button;
+}
+
+function svgIcon(name) {
+  const svg = document.createElementNS("http://www.w3.org/2000/svg", "svg");
+  svg.setAttribute("viewBox", "0 0 24 24");
+  svg.setAttribute("aria-hidden", "true");
+  svg.setAttribute("focusable", "false");
+
+  const paths = {
+    copy: [
+      "M8 8h10a2 2 0 0 1 2 2v8a2 2 0 0 1-2 2H8a2 2 0 0 1-2-2v-8a2 2 0 0 1 2-2Z",
+      "M4 14H3a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h10a2 2 0 0 1 2 2v1",
+    ],
+    fork: [
+      "M6 3v6a3 3 0 0 0 3 3h6",
+      "M18 9l3 3-3 3",
+      "M6 21v-6",
+      "M6 3a2 2 0 1 0 0 4 2 2 0 0 0 0-4Z",
+      "M6 17a2 2 0 1 0 0 4 2 2 0 0 0 0-4Z",
+    ],
+    edit: [
+      "M4 20h4l11-11a2.8 2.8 0 0 0-4-4L4 16v4Z",
+      "M13.5 6.5l4 4",
+    ],
+  };
+
+  for (const d of paths[name] || paths.copy) {
+    const path = document.createElementNS("http://www.w3.org/2000/svg", "path");
+    path.setAttribute("d", d);
+    svg.append(path);
+  }
+
+  return svg;
 }
 
 async function copyText(text) {
@@ -1619,9 +1759,9 @@ function renderPlanItem(item) {
 function renderCommandExecution(item) {
   const body = document.createElement("div");
   body.className = "message-body tool-body";
-  body.append(renderToolSummary(item.command || "Command", item.status, item.cwd));
+  body.append(renderToolSummary(`Ran ${shortCommand(item.command || "command")}`, item.status, item.cwd));
   body.append(renderDetails("Command", item.command || ""));
-  if (item.exitCode != null) {
+  if (item.exitCode != null && item.exitCode !== 0) {
     body.append(renderKeyValueBody([["Exit code", String(item.exitCode)]]));
   }
   if (item.aggregatedOutput) {
@@ -1774,15 +1914,15 @@ function messageLabel(item) {
     case "plan":
       return "Plan";
     case "commandExecution":
-      return `Command - ${item.status || ""}`;
+      return "";
     case "fileChange":
       return `File change - ${item.status || ""}`;
     case "turnDiff":
       return "Diff";
     case "mcpToolCall":
-      return "MCP tool";
+      return "";
     case "dynamicToolCall":
-      return "Tool";
+      return "";
     case "todo-list":
       return "Plan";
     case "planImplementation":
@@ -1790,8 +1930,14 @@ function messageLabel(item) {
     case "error":
       return "Error";
     default:
-      return item.type || "Item";
+      return "";
   }
+}
+
+function shortCommand(command) {
+  const text = String(command || "").replace(/\s+/g, " ").trim();
+  if (text.length <= 96) return text;
+  return `${text.slice(0, 95).trim()}…`;
 }
 
 function itemText(item) {
@@ -2537,7 +2683,95 @@ function renderComposerState() {
   dom.editLastButton.textContent = editing ? "Editing" : "Edit";
   dom.editLastButton.title = editing ? "Editing last user turn" : "Edit last user turn";
   dom.editLastButton.setAttribute("aria-label", dom.editLastButton.title);
+  renderComposerControlSummary(currentThreadState());
   renderSessionMode();
+}
+
+function renderComposerControlSummary(thread) {
+  const model = dom.modelInput.value.trim();
+  const effort = dom.reasoningSelect.value;
+  const modelLabel = model ? compactModelName(model) : "Custom";
+  dom.modelSummary.textContent = effort ? `${modelLabel} / ${effort}` : modelLabel;
+  dom.modelSummary.title = model ? `Model ${model}${effort ? `, ${effort}` : ""}` : "Thread default model";
+
+  const context = contextWindowSummary(thread);
+  dom.contextPill.textContent = context.label;
+  dom.contextPill.title = context.title;
+  dom.contextPill.classList.toggle("unknown", context.unknown);
+}
+
+function compactModelName(model) {
+  return String(model || "")
+    .replace(/^openai\//, "")
+    .replace(/^gpt-/, "")
+    .replace(/^codex-/, "")
+    .slice(0, 18);
+}
+
+function contextWindowSummary(thread) {
+  const latestTurn = Array.isArray(thread?.turns) ? thread.turns.at(-1) : null;
+  const candidates = [
+    thread?.contextWindow,
+    thread?.context,
+    thread?.usage,
+    thread?.latestUsage,
+    thread?.tokenUsage,
+    latestTurn?.contextWindow,
+    latestTurn?.usage,
+    latestTurn?.tokenUsage,
+    latestTurn?.params?.context,
+  ].filter(isPlainObject);
+
+  for (const candidate of candidates) {
+    const percent = numericField(candidate, [
+      "percent",
+      "percentage",
+      "contextPercent",
+      "contextPercentage",
+      "context_window_percentage",
+      "contextWindowPercentage",
+    ]);
+    if (percent != null) {
+      const normalized = percent <= 1 ? percent * 100 : percent;
+      return {
+        label: `Context ${Math.round(normalized)}%`,
+        title: `Context window ${Math.round(normalized)}% full`,
+        unknown: false,
+      };
+    }
+
+    const remaining = numericField(candidate, ["remaining", "remainingTokens", "tokensRemaining", "availableTokens"]);
+    if (remaining != null) {
+      return {
+        label: `Context ${formatTokenCount(remaining)} left`,
+        title: `${Math.round(remaining).toLocaleString()} context tokens remaining`,
+        unknown: false,
+      };
+    }
+  }
+
+  return {
+    label: "Context --",
+    title: "Context window usage is not exposed for this thread yet",
+    unknown: true,
+  };
+}
+
+function numericField(object, keys) {
+  for (const key of keys) {
+    const value = object?.[key];
+    if (typeof value === "number" && Number.isFinite(value)) {
+      return value;
+    }
+  }
+  return null;
+}
+
+function formatTokenCount(value) {
+  if (value >= 1000) {
+    return `${Math.round(value / 100) / 10}k`;
+  }
+  return String(Math.round(value));
 }
 
 function renderSessionMode() {
@@ -2830,6 +3064,19 @@ function stableLabel(value) {
   } catch {
     return String(value);
   }
+}
+
+function readStringSet(key) {
+  try {
+    const values = JSON.parse(localStorage.getItem(key) || "[]");
+    return new Set(Array.isArray(values) ? values.filter((value) => typeof value === "string") : []);
+  } catch {
+    return new Set();
+  }
+}
+
+function writeStringSet(key, values) {
+  localStorage.setItem(key, JSON.stringify(Array.from(values)));
 }
 
 function deriveConversationStatus(thread) {

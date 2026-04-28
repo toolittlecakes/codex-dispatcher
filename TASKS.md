@@ -42,3 +42,11 @@ Goal: make the dispatcher behave like the VS Code Codex extension for shared ses
 - Add token rotation/session visibility and safer remote-access defaults.
 - Document the later relay path separately from the current Cloudflare path.
 - Validation: phone access works from another network with visible connection/security state.
+
+## 7. Codex UI parity pass - in progress
+
+- Sidebar: group by project, nest subagent threads under parent threads, collapse noisy child trees by default, and avoid rendering full subagent prompts as sidebar titles.
+- Message actions: keep Copy, Fork, and Edit, remove like/dislike, show actions only on hover/focus or selected message context, and use compact icon buttons.
+- Composer: keep the opaque bottom composer, move model/reasoning/context controls into extension-like inline controls, and make context-window state visible.
+- Intermediate work: render tool calls, command output, diffs, and file changes as a compact timeline with collapsed detail by default.
+- Validation: verify desktop and mobile with `agent-browser`, including no horizontal overflow and last message scrollability above the composer.

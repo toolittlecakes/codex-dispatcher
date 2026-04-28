@@ -308,8 +308,33 @@ a {
   gap: 2px;
 }
 
-.thread-row {
+.thread-node-row {
   --thread-depth: 0;
+  display: grid;
+  grid-template-columns: 22px minmax(0, 1fr);
+  align-items: stretch;
+  padding-left: calc(var(--thread-depth) * 14px);
+}
+
+.thread-toggle {
+  align-self: center;
+  width: 22px;
+  height: 32px;
+  border-radius: 7px;
+  background: transparent;
+  color: #8a8a8a;
+  font-size: 18px;
+  line-height: 1;
+  padding: 0;
+}
+
+.thread-toggle:hover,
+.thread-toggle:focus-visible {
+  background: #e4e4e4;
+  color: #555;
+}
+
+.thread-row {
   position: relative;
   display: grid;
   width: 100%;
@@ -318,7 +343,7 @@ a {
   border-radius: 8px;
   background: transparent;
   color: #686868;
-  padding: 7px 10px 7px calc(12px + (var(--thread-depth) * 16px));
+  padding: 7px 10px;
   text-align: left;
 }
 
@@ -335,7 +360,7 @@ a {
   position: absolute;
   top: 12px;
   bottom: 12px;
-  left: calc(6px + (var(--thread-depth) * 16px));
+  left: -13px;
   width: 2px;
   border-radius: 999px;
   background: #d4d4d4;
@@ -574,6 +599,7 @@ a {
 }
 
 .message {
+  position: relative;
   display: grid;
   width: min(var(--content-width), 100%);
   max-width: 100%;
@@ -905,8 +931,18 @@ a {
 .message-actions {
   display: flex;
   align-items: center;
-  gap: 10px;
-  min-height: 28px;
+  gap: 8px;
+  height: 0;
+  opacity: 0;
+  overflow: visible;
+  pointer-events: none;
+  transition: opacity 120ms ease;
+}
+
+.message:hover .message-actions,
+.message:focus-within .message-actions {
+  opacity: 1;
+  pointer-events: auto;
 }
 
 .message.user .message-actions {
@@ -917,14 +953,23 @@ a {
   display: inline-flex;
   align-items: center;
   justify-content: center;
-  width: 28px;
-  height: 28px;
-  min-height: 28px;
+  width: 26px;
+  height: 26px;
+  min-height: 26px;
   border-radius: 999px;
   background: transparent;
   color: #777;
-  font-size: 17px;
   padding: 0;
+}
+
+.message-action svg {
+  width: 17px;
+  height: 17px;
+  fill: none;
+  stroke: currentColor;
+  stroke-linecap: round;
+  stroke-linejoin: round;
+  stroke-width: 1.8;
 }
 
 .message-action:hover,
@@ -951,7 +996,7 @@ a {
 
 .composer-row {
   display: grid;
-  grid-template-columns: auto auto minmax(0, 1fr) auto auto;
+  grid-template-columns: auto auto auto minmax(0, 1fr) auto auto;
   gap: 8px;
   align-items: center;
   position: relative;
@@ -1081,6 +1126,25 @@ a {
 .composer-settings summary:hover,
 .composer-settings[open] summary {
   background: var(--surface-soft);
+}
+
+.composer-chip {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  height: 38px;
+  max-width: 170px;
+  border-radius: 999px;
+  color: #777;
+  font-size: 14px;
+  font-weight: 500;
+  padding: 0 10px;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.composer-chip.unknown {
+  color: #a3a3a3;
 }
 
 .composer-settings-panel {
@@ -1295,7 +1359,7 @@ a {
   }
 
   .composer-row {
-    grid-template-columns: auto auto minmax(0, 1fr) auto;
+    grid-template-columns: auto auto auto minmax(0, 1fr) auto;
     gap: 6px;
   }
 
@@ -1328,6 +1392,13 @@ a {
   .composer-settings summary {
     height: 42px;
     padding: 0 8px;
+  }
+
+  .composer-chip {
+    height: 42px;
+    max-width: 116px;
+    padding: 0 6px;
+    font-size: 13px;
   }
 
   .composer-settings-panel {
