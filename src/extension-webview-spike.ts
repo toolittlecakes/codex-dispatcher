@@ -171,24 +171,29 @@ export class ExtensionWebviewSpike {
 html,
 body {
   width: 100%;
-  height: 100%;
+  height: var(--codex-dispatcher-viewport-height, 100vh) !important;
+  height: var(--codex-dispatcher-viewport-height, 100dvh) !important;
+  max-height: var(--codex-dispatcher-viewport-height, 100vh) !important;
+  max-height: var(--codex-dispatcher-viewport-height, 100dvh) !important;
   min-width: 0;
   min-height: 0;
   margin: 0;
   padding: 0;
-  overflow: hidden;
+  overflow: hidden !important;
   overscroll-behavior: none;
 }
 
 #root {
-  width: 100vw;
-  height: var(--codex-dispatcher-viewport-height, 100vh);
-  height: var(--codex-dispatcher-viewport-height, 100dvh);
+  width: 100vw !important;
+  height: var(--codex-dispatcher-viewport-height, 100vh) !important;
+  height: var(--codex-dispatcher-viewport-height, 100dvh) !important;
+  max-height: var(--codex-dispatcher-viewport-height, 100vh) !important;
+  max-height: var(--codex-dispatcher-viewport-height, 100dvh) !important;
   min-width: 0;
   min-height: 0;
-  overflow: hidden;
-  position: fixed;
-  inset: 0;
+  overflow: hidden !important;
+  position: fixed !important;
+  inset: 0 auto auto 0 !important;
 }
 </style>`;
   }

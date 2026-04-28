@@ -62,7 +62,8 @@ describe("extension webview spike", () => {
       expect(response.headers.get("set-cookie")).toContain("HttpOnly");
       expect(html).toContain("history.replaceState");
       expect(html).toContain("#root");
-      expect(html).toContain("overflow: hidden");
+      expect(html).toContain("overflow: hidden !important");
+      expect(html).toContain("height: var(--codex-dispatcher-viewport-height, 100vh) !important");
       expect(html).toContain("--codex-dispatcher-viewport-height");
       expect(html).toContain("visualViewport");
       expect(html).toContain('const hostMessageUrl = "/extension-spike/host-message";');
