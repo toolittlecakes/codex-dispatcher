@@ -2312,7 +2312,16 @@ function renderComposerState() {
   dom.activeTurnPill.classList.toggle("hidden", !active && !externalActive);
   dom.activeTurnPill.textContent = active ? "Active turn" : canFollowExternal ? "Following" : "Live elsewhere";
   dom.sendButton.disabled = !editing && externalActive && !canFollowExternal;
-  dom.sendButton.textContent = editing ? "Save" : active || canFollowExternal ? "Steer" : externalActive ? "Live" : "Send";
+  const sendAction = editing
+    ? "Save edited turn"
+    : active || canFollowExternal
+      ? "Steer active turn"
+      : externalActive
+        ? "Live elsewhere"
+        : "Send";
+  dom.sendButton.textContent = editing ? "✓" : active || canFollowExternal ? "↗" : externalActive ? "…" : "↑";
+  dom.sendButton.title = sendAction;
+  dom.sendButton.setAttribute("aria-label", sendAction);
   dom.attachButton.disabled = editing;
   dom.queueButton.classList.toggle("hidden", editing || (!active && !canFollowExternal));
   dom.compactButton.disabled = !hasThread || active || externalActive;
