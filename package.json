@@ -3,9 +3,15 @@
   "version": "0.0.1",
   "private": true,
   "type": "module",
+  "bin": {
+    "codex-dispatcher": "./src/cli.ts"
+  },
   "scripts": {
+    "start": "bun run src/cli.ts",
+    "doctor": "bun run src/cli.ts doctor",
+    "build:binary": "bun build --compile --target=bun --outfile=dist/codex-dispatcher src/cli.ts",
     "dev": "bun run src/server.ts",
-    "dev:tunnel": "bun run src/cloudflare-tunnel.ts",
+    "dev:tunnel": "bun run src/cli.ts",
     "test": "bun test",
     "typecheck": "tsc --noEmit"
   },

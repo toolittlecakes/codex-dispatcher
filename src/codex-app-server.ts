@@ -150,6 +150,10 @@ export class CodexAppServer {
     });
   }
 
+  notify(method: string, params: JsonValue = {}): void {
+    this.write({ method, params });
+  }
+
   respondToServerRequest(id: string, result: JsonValue): void {
     const request = this.serverRequests.get(id);
     if (!request) {
@@ -167,10 +171,6 @@ export class CodexAppServer {
     }
 
     this.child.kill("SIGTERM");
-  }
-
-  private notify(method: string, params: JsonValue): void {
-    this.write({ method, params });
   }
 
   private write(message: RpcMessage): void {

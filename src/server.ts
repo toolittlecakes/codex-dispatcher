@@ -11,6 +11,7 @@ import {
   dispatcherIpcHostId,
   updateCollaborationModeSettings,
 } from "./dispatcher-owner";
+import { ExtensionWebviewSpike } from "./extension-webview-spike";
 
 type ClientMessage = {
   type?: string;
@@ -48,9 +49,15 @@ let dispatcherToken = process.env.DISPATCHER_TOKEN ?? randomBytes(18).toString("
 let tokenCreatedAt = Date.now();
 const defaultCwd = process.env.CODEX_DISPATCHER_CWD ?? process.cwd();
 const dispatcherRemoteUrl = normalizeBaseUrl(process.env.DISPATCHER_REMOTE_URL);
+const primaryClientPath = "/extension-spike/";
 const publicRoot = resolve(import.meta.dir, "../public");
 const appServer = new CodexAppServer();
 const ipcBridge = new CodexIpcBridge();
+const extensionWebviewSpike = new ExtensionWebviewSpike({
+  appServer,
+  defaultCwd,
+  getToken: () => dispatcherToken,
+});
 const clients = new Set<Bun.ServerWebSocket<WsData>>();
 const streamOwners = new Map<string, string>();
 const mirroredConversations = new Map<string, JsonObject>();
@@ -89,6 +96,8 @@ const dispatcherOwnerRequestMethods = new Set([
 ]);
 
 appServer.onEvent((event) => {
+  extensionWebviewSpike.handleAppServerEvent(event);
+
   if (event.type === "notification") {
     broadcast({ type: "codexNotification", notification: event.notification });
     const threadId = notificationThreadId(event.notification);
@@ -197,6 +206,10 @@ try {
       return new Response("WebSocket upgrade failed", { status: 400 });
     }
 
+    if (extensionWebviewSpike.canHandle(url.pathname)) {
+      return extensionWebviewSpike.fetch(request, url);
+    }
+
     return serveStatic(url.pathname);
   },
   websocket: {
@@ -231,9 +244,9 @@ try {
 }
 
 console.log(`Codex dispatcher listening on ${server.url.toString()}`);
-console.log(`Open locally: http://localhost:${port}/?token=${dispatcherToken}`);
+console.log(`Open locally: ${clientUrl(`http://localhost:${port}`)}`);
 for (const address of lanAddresses()) {
-  console.log(`Open from phone: http://${address}:${port}/?token=${dispatcherToken}`);
+  console.log(`Open from phone: ${clientUrl(`http://${address}:${port}`)}`);
 }
 
 process.once("SIGINT", () => {
@@ -1103,6 +1116,12 @@ function normalizeBaseUrl(value: string | undefined): string | null {
   } catch {
     return null;
   }
+}
+
+function clientUrl(baseUrl: string): string {
+  const url = new URL(primaryClientPath, baseUrl);
+  url.searchParams.set("token", dispatcherToken);
+  return url.toString();
 }
 
 function lanAddresses(): string[] {
