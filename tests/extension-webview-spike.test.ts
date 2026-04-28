@@ -61,6 +61,8 @@ describe("extension webview spike", () => {
       expect(response.headers.get("set-cookie")).toContain("codex_dispatcher_session=secret");
       expect(response.headers.get("set-cookie")).toContain("HttpOnly");
       expect(html).toContain("history.replaceState");
+      expect(html).toContain("#root");
+      expect(html).toContain("overflow: hidden");
       expect(html).toContain('const hostMessageUrl = "/extension-spike/host-message";');
       expect(html).not.toContain("host-message?token=");
 

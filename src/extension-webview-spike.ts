@@ -138,7 +138,7 @@ export class ExtensionWebviewSpike {
     let html = await Bun.file(indexPath).text();
     html = html.replace("<!-- PROD_BASE_TAG_HERE -->", `<base href="${routePrefix}/">`);
     html = html.replace("<!-- PROD_CSP_TAG_HERE -->", "");
-    html = html.replace("<head>", `<head>\n${this.buildShim(url.searchParams.get("token") ?? "")}`);
+    html = html.replace("<head>", `<head>\n${this.buildViewportStyle()}\n${this.buildShim(url.searchParams.get("token") ?? "")}`);
 
     const headers = new Headers({ "content-type": "text/html; charset=utf-8" });
     if (url.searchParams.get("token") === this.getToken()) {
@@ -164,6 +164,31 @@ export class ExtensionWebviewSpike {
         "content-type": contentType(assetPath),
       },
     });
+  }
+
+  private buildViewportStyle(): string {
+    return `<style>
+html,
+body {
+  width: 100%;
+  height: 100%;
+  min-width: 0;
+  min-height: 0;
+  margin: 0;
+  padding: 0;
+  overflow: hidden;
+  overscroll-behavior: none;
+}
+
+#root {
+  width: 100vw;
+  height: 100vh;
+  height: 100dvh;
+  min-width: 0;
+  min-height: 0;
+  overflow: hidden;
+}
+</style>`;
   }
 
   private async handleHostMessage(request: Request): Promise<Response> {
