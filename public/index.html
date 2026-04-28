@@ -15,22 +15,23 @@
       <aside class="thread-pane" id="threadPane">
         <header class="pane-header">
           <div class="brand-row">
-            <div class="brand-mark">C</div>
-            <div>
-              <div class="eyebrow">Remote</div>
-              <h1>Codex</h1>
-            </div>
+            <h1>Codex</h1>
           </div>
           <button class="icon-button" id="refreshButton" type="button" title="Refresh threads" aria-label="Refresh threads">↻</button>
         </header>
 
         <div class="sidebar-controls">
-          <label class="field search-field">
-            <span>Search</span>
-            <input id="searchInput" autocomplete="off" placeholder="Filter threads" />
+          <button class="sidebar-nav-button" id="newThreadButton" type="button"><span aria-hidden="true">✎</span>New chat</button>
+          <label class="sidebar-search">
+            <span aria-hidden="true">⌕</span>
+            <input id="searchInput" autocomplete="off" placeholder="Search" />
           </label>
-
-          <button class="primary-button" id="newThreadButton" type="button">＋ New thread</button>
+          <button class="sidebar-nav-button ghost-nav" type="button"><span aria-hidden="true">⌘</span>Plugins</button>
+          <button class="sidebar-nav-button ghost-nav" type="button"><span aria-hidden="true">◷</span>Automations</button>
+          <div class="projects-label">
+            <span>Projects</span>
+            <span class="projects-actions" aria-hidden="true">↗ ≡ ＋</span>
+          </div>
         </div>
 
         <div class="thread-list" id="threadList"></div>
@@ -115,7 +116,6 @@
                     <span>CWD</span>
                     <input id="cwdInput" autocomplete="off" aria-label="Working directory" />
                   </label>
-                  <span class="session-mode" id="sessionModePill">App server</span>
                   <span class="active-turn hidden" id="activeTurnPill">Active turn</span>
                 </div>
               </div>
@@ -124,6 +124,9 @@
             <button class="ghost-button hidden" id="queueButton" type="button" title="Queue follow-up">Queue</button>
             <button class="danger-button hidden" id="stopButton" type="button" title="Stop" aria-label="Stop">■</button>
             <button class="send-button" id="sendButton" type="submit" title="Send" aria-label="Send">↑</button>
+          </div>
+          <div class="composer-footer">
+            <span class="session-mode" id="sessionModePill">App server</span>
           </div>
         </form>
       </main>

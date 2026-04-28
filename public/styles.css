@@ -20,7 +20,7 @@
   --shadow: 0 18px 54px rgba(0, 0, 0, 0.09);
   --content-width: 980px;
   --composer-width: 1000px;
-  --composer-reserved-height: 168px;
+  --composer-reserved-height: 190px;
 }
 
 * {
@@ -37,7 +37,7 @@ body {
 
 body {
   margin: 0;
-  background: var(--bg);
+  background: #fff;
   color: var(--text);
   font-family:
     ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
@@ -109,7 +109,7 @@ a {
 
 .app-shell {
   display: grid;
-  grid-template-columns: 300px minmax(0, 1fr);
+  grid-template-columns: 240px minmax(0, 1fr);
   width: 100vw;
   height: 100dvh;
   min-height: 0;
@@ -130,7 +130,7 @@ a {
   align-items: center;
   justify-content: space-between;
   gap: 12px;
-  padding: 18px 14px 14px;
+  padding: 22px 18px 22px;
 }
 
 .brand-row {
@@ -149,8 +149,8 @@ a {
 
 .sidebar-controls {
   display: grid;
-  gap: 10px;
-  padding: 0 14px 14px;
+  gap: 8px;
+  padding: 0 12px 18px;
 }
 
 .field {
@@ -172,19 +172,68 @@ a {
   text-transform: none;
 }
 
-.sidebar-controls .search-field span {
-  position: absolute;
-  width: 1px;
-  height: 1px;
-  overflow: hidden;
-  clip: rect(0 0 0 0);
+.sidebar-nav-button,
+.sidebar-search {
+  display: grid;
+  grid-template-columns: 24px minmax(0, 1fr);
+  align-items: center;
+  min-height: 32px;
+  border-radius: 8px;
+  background: transparent;
+  color: #3f3f3f;
+  font-size: 14px;
+  font-weight: 400;
+  text-align: left;
 }
 
-.search-field input {
-  height: 38px;
-  border-color: #d4d4d4;
-  border-radius: 8px;
-  background: #fafafa;
+.sidebar-nav-button {
+  justify-content: stretch;
+  width: 100%;
+  padding: 0 8px;
+}
+
+.sidebar-nav-button span,
+.sidebar-search > span {
+  color: #5f5f5f;
+  font-size: 18px;
+  line-height: 1;
+}
+
+.sidebar-nav-button:hover,
+.sidebar-search:focus-within {
+  background: #e8e8e8;
+}
+
+.sidebar-search {
+  padding: 0 8px;
+}
+
+.sidebar-search input {
+  height: 30px;
+  border: 0;
+  background: transparent;
+  color: #3f3f3f;
+  padding: 0;
+}
+
+.sidebar-search input:focus {
+  box-shadow: none;
+}
+
+.projects-label {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  margin-top: 28px;
+  color: #9a9a9a;
+  font-size: 13px;
+  font-weight: 400;
+}
+
+.projects-actions {
+  color: #8a8a8a;
+  font-size: 12px;
+  letter-spacing: 0.12em;
 }
 
 .icon-button,
@@ -265,7 +314,7 @@ a {
   display: grid;
   align-content: start;
   min-height: 0;
-  gap: 10px;
+  gap: 18px;
   overflow: auto;
   overflow-x: hidden;
   padding: 0 8px 16px;
@@ -281,26 +330,31 @@ a {
 }
 
 .project-heading {
-  display: grid;
-  gap: 2px;
-  padding: 6px 8px 3px;
+  display: flex;
+  align-items: center;
+  gap: 7px;
+  min-height: 28px;
+  padding: 0 10px;
+}
+
+.project-heading::before {
+  color: #707070;
+  content: "▱";
+  font-size: 17px;
+  line-height: 1;
 }
 
 .project-heading strong {
   overflow: hidden;
-  color: #777;
-  font-size: 13px;
-  font-weight: 600;
+  color: #666;
+  font-size: 14px;
+  font-weight: 400;
   text-overflow: ellipsis;
   white-space: nowrap;
 }
 
 .project-heading span {
-  overflow: hidden;
-  color: #a0a0a0;
-  font-size: 11px;
-  text-overflow: ellipsis;
-  white-space: nowrap;
+  display: none;
 }
 
 .thread-tree {
@@ -311,7 +365,7 @@ a {
 .thread-node-row {
   --thread-depth: 0;
   display: grid;
-  grid-template-columns: 22px minmax(0, 1fr);
+  grid-template-columns: 24px minmax(0, 1fr);
   align-items: stretch;
   padding-left: calc(var(--thread-depth) * 14px);
 }
@@ -338,7 +392,7 @@ a {
   position: relative;
   display: grid;
   width: 100%;
-  gap: 3px;
+  gap: 2px;
   border: 0;
   border-radius: 8px;
   background: transparent;
@@ -352,7 +406,7 @@ a {
 }
 
 .thread-row.active {
-  background: #dedede;
+  background: #e7e7e7;
   color: #4a4a4a;
 }
 
@@ -378,7 +432,7 @@ a {
   overflow: hidden;
   color: inherit;
   font-size: 14px;
-  font-weight: 500;
+  font-weight: 400;
   text-overflow: ellipsis;
   white-space: nowrap;
 }
@@ -386,7 +440,7 @@ a {
 .thread-row span {
   overflow: hidden;
   color: #8a8a8a;
-  font-size: 13px;
+  font-size: 12px;
   text-overflow: ellipsis;
   white-space: nowrap;
 }
@@ -423,7 +477,7 @@ a {
   min-height: 0;
   overflow: hidden;
   grid-template-rows: auto auto auto minmax(0, 1fr) auto auto;
-  background: var(--bg);
+  background: #fff;
 }
 
 .chat-header {
@@ -431,10 +485,9 @@ a {
   align-items: center;
   gap: 12px;
   min-height: 56px;
-  border-bottom: 1px solid var(--line-soft);
-  background: rgba(244, 244, 244, 0.94);
-  padding: 10px 20px;
-  backdrop-filter: blur(12px);
+  border-bottom: 0;
+  background: #fff;
+  padding: 12px 22px 8px;
 }
 
 .thread-title-block {
@@ -449,7 +502,7 @@ a {
 }
 
 .status-cluster {
-  display: inline-flex;
+  display: none;
   flex: 0 0 auto;
   align-items: center;
   gap: 6px;
@@ -466,7 +519,7 @@ a {
 }
 
 .thread-meta {
-  display: flex;
+  display: none;
   flex-wrap: wrap;
   gap: 6px;
   min-height: 22px;
@@ -1163,6 +1216,14 @@ a {
   padding: 14px;
 }
 
+.composer-footer {
+  display: flex;
+  align-items: center;
+  min-height: 22px;
+  color: #777;
+  padding: 0 4px;
+}
+
 .attachment-strip,
 .queue-strip {
   display: flex;
@@ -1222,7 +1283,20 @@ a {
 }
 
 .session-mode {
+  display: inline-flex;
   align-self: center;
+  align-items: center;
+  gap: 7px;
+  padding: 0;
+  color: #777;
+  font-size: 14px;
+  font-weight: 400;
+}
+
+.session-mode::before {
+  content: "▱";
+  font-size: 16px;
+  line-height: 1;
 }
 
 .session-mode.ipc {
@@ -1313,11 +1387,34 @@ a {
   }
 
   .security-panel {
-    grid-template-columns: 1fr;
+    grid-template-columns: minmax(0, 1fr) auto;
+    gap: 6px;
+    padding: 7px 10px;
+  }
+
+  .security-title {
+    display: none;
+  }
+
+  .security-chips {
+    flex-wrap: nowrap;
+    overflow: hidden;
+  }
+
+  .security-chip {
+    flex: 0 1 auto;
+    max-width: 120px;
   }
 
   .security-actions {
-    justify-content: flex-start;
+    flex-wrap: nowrap;
+    justify-content: flex-end;
+  }
+
+  .security-actions .ghost-button {
+    min-height: 30px;
+    padding: 0 6px;
+    font-size: 12px;
   }
 
   .messages {

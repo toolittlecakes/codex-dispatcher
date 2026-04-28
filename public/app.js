@@ -1319,13 +1319,17 @@ function renderThreadRow(thread, depth = 0, options = {}) {
   const badge = document.createElement("span");
   const ownerClientId = threadOwner(displayThread.id);
   badge.className = `thread-badge ${ownerClientId || isRunningStatus(displayThread.status) ? "running" : ""}`;
-  badge.textContent = ownerClientId
+  const badgeText = ownerClientId
     ? "IPC"
     : isRunningStatus(displayThread.status)
       ? statusLabel(displayThread.status)
-      : sourceLabel(displayThread.source);
+      : "";
 
-  main.append(title, badge);
+  main.append(title);
+  if (badgeText) {
+    badge.textContent = badgeText;
+    main.append(badge);
+  }
 
   const meta = document.createElement("span");
   meta.textContent = displayThreadMeta(displayThread);
@@ -1366,13 +1370,13 @@ function displayThreadTitle(thread) {
 }
 
 function displayThreadMeta(thread) {
-  const time = formatTime(thread.updatedAt || thread.createdAt);
+  const time = formatRelativeTime(thread.updatedAt || thread.createdAt);
   if (isSubAgentThread(thread)) {
     const subAgent = subAgentInfo(thread);
     return [subAgent.role && subAgent.role !== displayThreadTitle(thread) ? subAgent.role : "sub-agent", time].filter(Boolean).join(" - ");
   }
 
-  return `${shortPath(thread.cwd) || sourceLabel(thread.source)} - ${time}`;
+  return time;
 }
 
 function subAgentInfo(thread) {
@@ -1570,21 +1574,23 @@ function renderMessageActions(item) {
   if (item.type === "agentMessage" && !item.showActions) {
     return null;
   }
+  if (item.type === "userMessage" && !item.editable) {
+    return null;
+  }
 
   const actions = document.createElement("div");
   actions.className = "message-actions";
 
-  actions.append(messageActionButton("copy", "Copy message", () => {
-    void copyText(itemText(item));
-  }));
-
-  if (state.selectedThreadId) {
+  if (item.type === "agentMessage") {
+    actions.append(messageActionButton("copy", "Copy message", () => {
+      void copyText(itemText(item));
+    }));
     actions.append(messageActionButton("fork", "Fork thread", () => {
       void forkThread();
     }));
   }
 
-  if (item.type === "userMessage" && item.editable) {
+  if (item.type === "userMessage") {
     actions.append(messageActionButton("edit", "Edit message", () => {
       startEditingLastUserTurn();
     }));
@@ -1760,12 +1766,16 @@ function renderCommandExecution(item) {
   const body = document.createElement("div");
   body.className = "message-body tool-body";
   body.append(renderToolSummary(`Ran ${shortCommand(item.command || "command")}`, item.status, item.cwd));
-  body.append(renderDetails("Command", item.command || ""));
   if (item.exitCode != null && item.exitCode !== 0) {
     body.append(renderKeyValueBody([["Exit code", String(item.exitCode)]]));
   }
-  if (item.aggregatedOutput) {
-    body.append(renderDetails("Output", item.aggregatedOutput));
+  const details = [
+    item.command ? `Command\n${item.command}` : "",
+    item.exitCode != null ? `Exit code\n${item.exitCode}` : "",
+    item.aggregatedOutput ? `Output\n${item.aggregatedOutput}` : "",
+  ].filter(Boolean).join("\n\n");
+  if (details) {
+    body.append(renderDetails("Details", details));
   }
   return body;
 }
@@ -1780,11 +1790,12 @@ function renderToolCall(item) {
 
   const args = item.arguments || item.invocation?.arguments || item.prompt || null;
   const result = item.result || item.contentItems || item.error || item.agentsStates || null;
-  if (args) {
-    body.append(renderDetails("Arguments", stringifyPretty(args)));
-  }
-  if (result) {
-    body.append(renderDetails("Result", stringifyPretty(result)));
+  const details = [
+    args ? `Arguments\n${stringifyPretty(args)}` : "",
+    result ? `Result\n${stringifyPretty(result)}` : "",
+  ].filter(Boolean).join("\n\n");
+  if (details) {
+    body.append(renderDetails("Details", details));
   }
   return body;
 }
@@ -2676,6 +2687,7 @@ function renderComposerState() {
   dom.sendButton.textContent = editing ? "✓" : active || canFollowExternal ? "↗" : externalActive ? "…" : "↑";
   dom.sendButton.title = sendAction;
   dom.sendButton.setAttribute("aria-label", sendAction);
+  dom.promptInput.placeholder = hasThread ? "Ask for follow-up changes" : "Ask Codex anything. @ to use plugins or mention files";
   dom.attachButton.disabled = editing;
   dom.queueButton.classList.toggle("hidden", editing || (!active && !canFollowExternal));
   dom.compactButton.disabled = !hasThread || active || externalActive;
@@ -2777,7 +2789,7 @@ function formatTokenCount(value) {
 function renderSessionMode() {
   const ownerClientId = selectedThreadOwner();
   dom.sessionModePill.classList.toggle("ipc", Boolean(ownerClientId));
-  dom.sessionModePill.textContent = ownerClientId ? "IPC follower" : "App server";
+  dom.sessionModePill.textContent = ownerClientId ? "Follow Codex" : "Work locally";
   dom.sessionModePill.title = ownerClientId ? `Owner ${ownerClientId}` : "Turns start in dispatcher app-server";
 }
 
@@ -3115,9 +3127,25 @@ function formatTime(value) {
   }).format(date);
 }
 
+function formatRelativeTime(value) {
+  if (!value) return "";
+  const timestamp = timestampValue(value);
+  if (!timestamp) return formatTime(value);
+  const diffMs = Date.now() - timestamp;
+  if (diffMs < 0) return formatTime(value);
+  const minutes = Math.round(diffMs / 60000);
+  if (minutes < 1) return "now";
+  if (minutes < 60) return `${minutes}m`;
+  const hours = Math.round(minutes / 60);
+  if (hours < 24) return `${hours}h`;
+  const days = Math.round(hours / 24);
+  if (days < 7) return `${days}d`;
+  return formatTime(value);
+}
+
 function timestampValue(value) {
   if (!value) return 0;
-  if (typeof value === "number") return value;
+  if (typeof value === "number") return value < 100000000000 ? value * 1000 : value;
   const timestamp = Date.parse(value);
   return Number.isFinite(timestamp) ? timestamp : 0;
 }
