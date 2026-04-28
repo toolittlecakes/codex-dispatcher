@@ -213,7 +213,7 @@ try {
         mirroredConversations: mirroredConversationsSnapshot(),
         pendingServerRequests: appServer.getPendingServerRequests(),
       });
-      broadcastSecurity(ws.data.connectionId);
+      broadcastSecurity();
     },
     close(ws) {
       clients.delete(ws);
@@ -865,11 +865,13 @@ function securitySnapshot(currentConnectionId?: string): JsonObject {
   };
 }
 
-function broadcastSecurity(currentConnectionId?: string): void {
-  broadcast({
-    type: "dispatcherSecurity",
-    security: securitySnapshot(currentConnectionId),
-  });
+function broadcastSecurity(): void {
+  for (const client of clients) {
+    send(client, {
+      type: "dispatcherSecurity",
+      security: securitySnapshot(client.data.connectionId),
+    });
+  }
 }
 
 function tokenFingerprint(token: string): string {
