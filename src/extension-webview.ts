@@ -1,4 +1,4 @@
-import { existsSync, readFileSync, readdirSync } from "node:fs";
+import { existsSync, mkdirSync, readFileSync, readdirSync, writeFileSync } from "node:fs";
 import { homedir, platform, release } from "node:os";
 import { basename, dirname, join, resolve, sep } from "node:path";
 import type { CodexAppServer, CodexAppServerEvent, JsonObject, JsonValue } from "./codex-app-server";
@@ -23,6 +23,7 @@ type ExtensionWebviewOptions = {
   appServer: CodexAppServer;
   defaultCwd: string;
   getToken: () => string;
+  statePath?: string;
   handleIpcRequest?: (method: string, params: JsonValue, targetClientId?: string) => Promise<JsonValue>;
   getThreadRole?: (conversationId: string) => string | Promise<string>;
   handleFollowerRequest?: (method: string, params: JsonValue) => Promise<JsonValue>;
@@ -42,6 +43,11 @@ type FetchResponseOptions = {
   status?: number;
 };
 
+type PersistentExtensionState = {
+  globalState: JsonObject;
+  persistedAtomState: JsonObject;
+};
+
 const routePrefix = "";
 const authCookieName = "codex_dispatcher_session";
 const encoder = new TextEncoder();
@@ -49,6 +55,7 @@ const maxDiagnosticMessages = 200;
 const globalState = new Map<string, JsonValue>();
 const persistedAtomState = new Map<string, JsonValue>();
 const sharedObjectState = new Map<string, JsonValue>();
+let activeExtensionStatePath = extensionStatePath();
 const followerRequestTypes: Record<string, { method: string; responseType: string }> = {
   "thread-follower-start-turn-request": {
     method: "thread-follower-start-turn",
@@ -132,6 +139,7 @@ export class ExtensionWebview {
     this.getThreadRole = options.getThreadRole;
     this.handleFollowerRequest = options.handleFollowerRequest;
     this.handleThreadStreamSnapshotRequest = options.handleThreadStreamSnapshotRequest;
+    loadPersistentExtensionState(options.statePath ?? extensionStatePath());
     this.webviewRoot = resolveExtensionWebviewRoot();
   }
 
@@ -388,6 +396,7 @@ select,
 
       case "persisted-atom-reset":
         persistedAtomState.clear();
+        writePersistentExtensionState();
         this.broadcast({ type: "persisted-atom-sync", state: {} });
         return [];
 
@@ -1048,6 +1057,7 @@ export async function handleVSCodeRequest(endpoint: string, body: JsonValue, def
     case "set-global-state":
       if (typeof params.key === "string") {
         globalState.set(params.key, params.value ?? null);
+        writePersistentExtensionState();
       }
       return { success: true };
     case "get-configuration":
@@ -1438,15 +1448,71 @@ function parseOptionalBody(body: JsonValue | undefined): JsonValue {
   return JSON.parse(body) as JsonValue;
 }
 
+export function extensionStatePath(): string {
+  return join(process.env.CODEX_DISPATCHER_HOME ?? join(homedir(), ".codex-dispatcher"), "extension-state.json");
+}
+
+function loadPersistentExtensionState(path: string): void {
+  activeExtensionStatePath = path;
+  globalState.clear();
+  persistedAtomState.clear();
+  if (!existsSync(path)) {
+    return;
+  }
+
+  const state = parsePersistentExtensionState(JSON.parse(readFileSync(path, "utf8")) as unknown);
+  for (const [key, value] of Object.entries(state.globalState)) {
+    globalState.set(key, value ?? null);
+  }
+  for (const [key, value] of Object.entries(state.persistedAtomState)) {
+    persistedAtomState.set(key, value ?? null);
+  }
+}
+
+function writePersistentExtensionState(path = activeExtensionStatePath): void {
+  const state: PersistentExtensionState = {
+    globalState: Object.fromEntries(globalState.entries()) as JsonObject,
+    persistedAtomState: Object.fromEntries(persistedAtomState.entries()) as JsonObject,
+  };
+  mkdirSync(dirname(path), { recursive: true });
+  writeFileSync(path, `${JSON.stringify(state, null, 2)}\n`, { mode: 0o600 });
+}
+
+function parsePersistentExtensionState(value: unknown): PersistentExtensionState {
+  if (!isRecord(value)) {
+    throw new Error("Invalid codex-dispatcher extension state: expected object.");
+  }
+  return {
+    globalState: optionalStateObject(value.globalState, "globalState"),
+    persistedAtomState: optionalStateObject(value.persistedAtomState, "persistedAtomState"),
+  };
+}
+
+function optionalStateObject(value: unknown, key: string): JsonObject {
+  if (value === undefined) {
+    return {};
+  }
+  if (!isRecord(value)) {
+    throw new Error(`Invalid codex-dispatcher extension state: ${key} must be an object.`);
+  }
+  return value as JsonObject;
+}
+
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return typeof value === "object" && value !== null && !Array.isArray(value);
+}
+
 function updatePersistedAtomState(message: JsonObject): void {
   if (typeof message.key !== "string") {
     throw new Error("Invalid persisted atom update");
   }
   if (message.deleted === true) {
     persistedAtomState.delete(message.key);
+    writePersistentExtensionState();
     return;
   }
   persistedAtomState.set(message.key, message.value ?? null);
+  writePersistentExtensionState();
 }
 
 function persistedStateObject(): JsonObject {

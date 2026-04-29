@@ -1,5 +1,5 @@
 import { describe, expect, test } from "bun:test";
-import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { mkdtempSync, readFileSync, rmSync, statSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import {
@@ -221,6 +221,127 @@ describe("extension webview", () => {
         "outbound:thread-role-response": 1,
         "outbound:thread-follower-start-turn-response": 1,
         "outbound:fetch-response": 1,
+      });
+    } finally {
+      if (previousRoot === undefined) {
+        delete process.env.CODEX_EXTENSION_WEBVIEW_ROOT;
+      } else {
+        process.env.CODEX_EXTENSION_WEBVIEW_ROOT = previousRoot;
+      }
+      rmSync(root, { recursive: true, force: true });
+    }
+  });
+
+  test("persists extension host state across webview host restarts", async () => {
+    const previousRoot = process.env.CODEX_EXTENSION_WEBVIEW_ROOT;
+    const root = mkdtempSync(join(tmpdir(), "codex-webview-state-"));
+    const statePath = join(root, "state", "extension-state.json");
+    process.env.CODEX_EXTENSION_WEBVIEW_ROOT = root;
+    writeFileSync(join(root, "index.html"), "<html><head></head><body></body></html>");
+
+    try {
+      const firstHost = new ExtensionWebview({
+        appServer: {} as never,
+        defaultCwd: "/repo",
+        getToken: () => "secret",
+        statePath,
+      });
+
+      const atomUpdate = await firstHost.fetch(
+        new Request("http://localhost/host-message", {
+          method: "POST",
+          headers: { cookie: "codex_dispatcher_session=secret" },
+          body: JSON.stringify({
+            type: "persisted-atom-update",
+            key: "onboarding.complete",
+            value: { done: true },
+          }),
+        }),
+        new URL("http://localhost/host-message"),
+      );
+      await expect(atomUpdate.json()).resolves.toEqual({ messages: [] });
+
+      const globalUpdate = await firstHost.fetch(
+        new Request("http://localhost/host-message", {
+          method: "POST",
+          headers: { cookie: "codex_dispatcher_session=secret" },
+          body: JSON.stringify({
+            type: "fetch",
+            requestId: "set-global",
+            url: "vscode://codex/set-global-state",
+            method: "POST",
+            body: JSON.stringify({ key: "welcome.dismissed", value: true }),
+          }),
+        }),
+        new URL("http://localhost/host-message"),
+      );
+      await expect(globalUpdate.json()).resolves.toEqual({
+        messages: [
+          {
+            type: "fetch-response",
+            responseType: "success",
+            requestId: "set-global",
+            status: 200,
+            headers: {},
+            bodyJsonString: "{\"success\":true}",
+          },
+        ],
+      });
+
+      expect(JSON.parse(readFileSync(statePath, "utf8"))).toEqual({
+        globalState: { "welcome.dismissed": true },
+        persistedAtomState: { "onboarding.complete": { done: true } },
+      });
+      expect(statSync(statePath).mode & 0o777).toBe(0o600);
+
+      const restartedHost = new ExtensionWebview({
+        appServer: {} as never,
+        defaultCwd: "/repo",
+        getToken: () => "secret",
+        statePath,
+      });
+
+      const readyResponse = await restartedHost.fetch(
+        new Request("http://localhost/host-message", {
+          method: "POST",
+          headers: { cookie: "codex_dispatcher_session=secret" },
+          body: JSON.stringify({ type: "ready" }),
+        }),
+        new URL("http://localhost/host-message"),
+      );
+      await expect(readyResponse.json()).resolves.toEqual({
+        messages: [
+          { type: "chat-font-settings", chatFontSize: null, chatCodeFontSize: null },
+          { type: "custom-prompts-updated", prompts: [] },
+          { type: "persisted-atom-sync", state: { "onboarding.complete": { done: true } } },
+        ],
+      });
+
+      const globalRead = await restartedHost.fetch(
+        new Request("http://localhost/host-message", {
+          method: "POST",
+          headers: { cookie: "codex_dispatcher_session=secret" },
+          body: JSON.stringify({
+            type: "fetch",
+            requestId: "get-global",
+            url: "vscode://codex/get-global-state",
+            method: "POST",
+            body: JSON.stringify({ key: "welcome.dismissed" }),
+          }),
+        }),
+        new URL("http://localhost/host-message"),
+      );
+      await expect(globalRead.json()).resolves.toEqual({
+        messages: [
+          {
+            type: "fetch-response",
+            responseType: "success",
+            requestId: "get-global",
+            status: 200,
+            headers: {},
+            bodyJsonString: "{\"value\":true}",
+          },
+        ],
       });
     } finally {
       if (previousRoot === undefined) {
