@@ -102,6 +102,7 @@ try {
       localBaseUrl: localTarget,
       localDispatcherToken: token,
       killExisting: options.killExisting,
+      onStatus: (message) => console.error(`[relay] ${message}`),
     });
     if (relayClient.killedSessionId) {
       console.log(`Killed previous dispatcher session: ${relayClient.killedSessionId}`);

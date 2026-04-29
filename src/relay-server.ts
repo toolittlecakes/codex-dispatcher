@@ -13,6 +13,7 @@ type DispatcherWsData = {
 
 type PendingRequest = {
   controller: ReadableStreamDefaultController<Uint8Array> | null;
+  closed: boolean;
   resolve: (response: Response) => void;
   reject: (error: Error) => void;
 };
@@ -25,6 +26,7 @@ type PendingOAuth = {
 
 const relayPort = Number(process.env.PORT ?? "8788");
 const relayHost = process.env.HOST ?? "0.0.0.0";
+const relayHttpIdleTimeoutSeconds = 60;
 const publicBaseUrl = requiredEnv("RELAY_PUBLIC_BASE_URL");
 const relayDataPath = requiredEnv("RELAY_DATA_PATH");
 const githubClientId = requiredEnv("GITHUB_CLIENT_ID");
@@ -38,6 +40,7 @@ const pendingRequestsById = new Map<string, PendingRequest>();
 const relayServer = Bun.serve<DispatcherWsData>({
   port: relayPort,
   hostname: relayHost,
+  idleTimeout: relayHttpIdleTimeoutSeconds,
   async fetch(request, server) {
     const url = new URL(request.url);
 
@@ -261,10 +264,11 @@ async function proxyThroughDispatcher(
   const responsePromise = new Promise<Response>((resolve, reject) => {
     const startTimeout = setTimeout(() => {
       pendingRequestsById.delete(requestId);
-      reject(new Error("Dispatcher response timed out."));
+      resolve(new Response("Dispatcher response timed out.", { status: 504 }));
     }, 30_000);
     pendingRequestsById.set(requestId, {
       controller: null,
+      closed: false,
       resolve: (response) => {
         clearTimeout(startTimeout);
         resolve(response);
@@ -300,6 +304,10 @@ function handleDispatcherFrame(raw: string): void {
         start(controller) {
           pending.controller = controller;
         },
+        cancel() {
+          pending.closed = true;
+          pendingRequestsById.delete(frame.requestId);
+        },
       }), {
         status: frame.status,
         headers: frame.headers,
@@ -308,19 +316,29 @@ function handleDispatcherFrame(raw: string): void {
     }
     case "http-response-chunk": {
       const pending = pendingRequestsById.get(frame.requestId);
-      if (!pending?.controller) {
+      if (!pending?.controller || pending.closed) {
         return;
       }
-      pending.controller.enqueue(Buffer.from(frame.bodyBase64, "base64"));
+      try {
+        pending.controller.enqueue(Buffer.from(frame.bodyBase64, "base64"));
+      } catch {
+        pending.closed = true;
+        pendingRequestsById.delete(frame.requestId);
+      }
       return;
     }
     case "http-response-end": {
       const pending = pendingRequestsById.get(frame.requestId);
-      if (!pending?.controller) {
+      if (!pending?.controller || pending.closed) {
         return;
       }
       pendingRequestsById.delete(frame.requestId);
-      pending.controller.close();
+      pending.closed = true;
+      try {
+        pending.controller.close();
+      } catch {
+        return;
+      }
       return;
     }
     case "http-response-error": {
@@ -329,9 +347,12 @@ function handleDispatcherFrame(raw: string): void {
         return;
       }
       pendingRequestsById.delete(frame.requestId);
+      pending.closed = true;
       pending.reject(new Error(frame.error));
       return;
     }
+    case "dispatcher-heartbeat":
+      return;
     default:
       return;
   }

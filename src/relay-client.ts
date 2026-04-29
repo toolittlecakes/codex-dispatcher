@@ -12,6 +12,7 @@ export type RelayClientOptions = {
   localBaseUrl: string;
   localDispatcherToken: string;
   killExisting: boolean;
+  onStatus?: (message: string) => void;
 };
 
 export type RelayClient = {
@@ -20,57 +21,128 @@ export type RelayClient = {
   close: () => void;
 };
 
+const heartbeatIntervalMs = 20_000;
+const reconnectBaseDelayMs = 1_000;
+const reconnectMaxDelayMs = 30_000;
+
 export function startRelayClient(options: RelayClientOptions): Promise<RelayClient> {
   return new Promise<RelayClient>((resolve, reject) => {
-    const ws = new WebSocket(dispatcherWebSocketUrl(options));
     let settled = false;
     let stableUrl = "";
     let killedSessionId: string | null = null;
+    let acceptedOnce = false;
+    let closed = false;
+    let reconnectAttempt = 0;
+    let reconnectTimer: ReturnType<typeof setTimeout> | null = null;
+    let heartbeatTimer: ReturnType<typeof setInterval> | null = null;
+    let ws: WebSocket | null = null;
 
-    ws.addEventListener("message", (event) => {
-      void handleRelayMessage(options, ws, event.data).then((controlFrame) => {
-        if (!controlFrame || settled) {
-          return;
-        }
-        if (controlFrame.type === "dispatcher-accepted") {
-          stableUrl = controlFrame.stableUrl;
-          killedSessionId = controlFrame.killedSessionId;
-          settled = true;
-          resolve({
-            stableUrl,
-            killedSessionId,
-            close: () => ws.close(),
-          });
-          return;
-        }
-        settled = true;
-        reject(new Error(`${controlFrame.code}: ${controlFrame.message}`));
-        ws.close();
-      }).catch((error) => {
+    const stopHeartbeat = () => {
+      if (heartbeatTimer) {
+        clearInterval(heartbeatTimer);
+        heartbeatTimer = null;
+      }
+    };
+
+    const startHeartbeat = (socket: WebSocket) => {
+      stopHeartbeat();
+      heartbeatTimer = setInterval(() => {
+        sendFrame(socket, { type: "dispatcher-heartbeat", sentAt: Date.now() });
+      }, heartbeatIntervalMs);
+    };
+
+    const scheduleReconnect = () => {
+      if (closed || reconnectTimer) {
+        return;
+      }
+      reconnectAttempt += 1;
+      const delay = Math.min(reconnectMaxDelayMs, reconnectBaseDelayMs * 2 ** Math.min(reconnectAttempt - 1, 5));
+      options.onStatus?.(`relay disconnected; reconnecting in ${delay}ms`);
+      reconnectTimer = setTimeout(() => {
+        reconnectTimer = null;
+        connect(true);
+      }, delay);
+    };
+
+    const connect = (killExisting: boolean) => {
+      stopHeartbeat();
+      const socket = new WebSocket(dispatcherWebSocketUrl({ ...options, killExisting }));
+      ws = socket;
+
+      socket.addEventListener("message", (event) => {
+        void handleRelayMessage(options, socket, event.data).then((controlFrame) => {
+          if (!controlFrame) {
+            return;
+          }
+          if (controlFrame.type === "dispatcher-accepted") {
+            stableUrl = controlFrame.stableUrl;
+            killedSessionId = controlFrame.killedSessionId;
+            acceptedOnce = true;
+            reconnectAttempt = 0;
+            startHeartbeat(socket);
+            options.onStatus?.(`relay connected: ${stableUrl}`);
+            if (!settled) {
+              settled = true;
+              resolve({
+                stableUrl,
+                killedSessionId,
+                close: () => {
+                  closed = true;
+                  if (reconnectTimer) {
+                    clearTimeout(reconnectTimer);
+                    reconnectTimer = null;
+                  }
+                  stopHeartbeat();
+                  ws?.close();
+                },
+              });
+            }
+            return;
+          }
+          if (!settled) {
+            settled = true;
+            reject(new Error(`${controlFrame.code}: ${controlFrame.message}`));
+          } else {
+            options.onStatus?.(`relay rejected reconnect: ${controlFrame.code}`);
+          }
+          socket.close();
+        }).catch((error) => {
+          if (!settled) {
+            settled = true;
+            reject(error);
+          }
+          options.onStatus?.(`relay message failed: ${error instanceof Error ? error.message : String(error)}`);
+          socket.close();
+        });
+      });
+
+      socket.addEventListener("error", () => {
         if (!settled) {
           settled = true;
-          reject(error);
+          reject(new Error(`Relay connection failed: ${options.relayUrl}`));
+          return;
         }
-        ws.close();
+        options.onStatus?.("relay websocket error");
       });
-    });
 
-    ws.addEventListener("error", () => {
-      if (!settled) {
-        settled = true;
-        reject(new Error(`Relay connection failed: ${options.relayUrl}`));
-      }
-    });
+      socket.addEventListener("close", () => {
+        const wasCurrentSocket = ws === socket;
+        if (wasCurrentSocket) {
+          ws = null;
+          stopHeartbeat();
+        }
+        if (!settled) {
+          settled = true;
+          reject(new Error("Relay connection closed before dispatcher was accepted."));
+          return;
+        }
+        if (wasCurrentSocket && acceptedOnce && !closed) {
+          scheduleReconnect();
+        }
+      });
+    };
 
-    ws.addEventListener("close", () => {
-      if (!settled) {
-        settled = true;
-        reject(new Error("Relay connection closed before dispatcher was accepted."));
-      }
-    });
-
-    void stableUrl;
-    void killedSessionId;
+    connect(options.killExisting);
   });
 }
 

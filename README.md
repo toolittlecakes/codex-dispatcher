@@ -1,6 +1,6 @@
 # codex-dispatcher
 
-Phone-friendly Codex UI served from the Codex VS Code extension webview. The dispatcher runs on the laptop, connects to the local `codex app-server`, and prints a URL that can be opened from a phone.
+Phone-friendly Codex UI served from the Codex VS Code extension webview. The dispatcher runs on the laptop, connects to the local `codex app-server`, and can expose a stable per-user phone/PWA URL through the owned relay.
 
 ## Quick start
 
@@ -46,7 +46,7 @@ codex-dispatcher doctor
 codex-dispatcher
 ```
 
-The launcher prints:
+By default, the launcher uses an experimental Cloudflare quick tunnel and prints:
 
 ```text
 Phone: https://<tunnel>.trycloudflare.com/?token=<token>
@@ -54,11 +54,24 @@ Phone: https://<tunnel>.trycloudflare.com/?token=<token>
 
 Open that URL on the phone. The first request uses the token to set an HttpOnly session cookie; the browser URL is then scrubbed.
 
+For the stable relay/PWA path, log in once and run with `--relay`:
+
+```bash
+CODEX_DISPATCHER_RELAY_URL=https://codex-dispatcher.app codex-dispatcher login
+codex-dispatcher --relay --kill-existing
+```
+
+The relay URL is stable:
+
+```text
+https://<slug>.codex-dispatcher.app/
+```
+
 ## Requirements
 
 - Codex CLI or Codex.app with `Contents/Resources/codex`
 - VS Code Codex extension webview assets
-- `cloudflared` for remote phone access
+- `cloudflared` only for experimental quick-tunnel access
 
 Bun is required only when running from source or building the binary. It is not required for the direct install path above.
 
@@ -127,4 +140,10 @@ Only one dispatcher can be active per GitHub user. To replace an existing active
 codex-dispatcher --relay --kill-existing
 ```
 
-The relay stores GitHub users, browser sessions, and CLI devices in `RELAY_DATA_PATH`. Active dispatcher sockets are not persisted; after a relay restart, run `codex-dispatcher --relay` again.
+The relay stores GitHub users, browser sessions, and CLI devices in `RELAY_DATA_PATH`. Active dispatcher sockets are not persisted. The CLI keeps one outbound relay WebSocket alive with heartbeat and reconnect, so a running dispatcher reconnects automatically after transient relay/network restarts.
+
+See also:
+
+- [`docs/relay-architecture.md`](docs/relay-architecture.md)
+- [`docs/remote-access.md`](docs/remote-access.md)
+- [`docs/decisions-2026-04-30.md`](docs/decisions-2026-04-30.md)

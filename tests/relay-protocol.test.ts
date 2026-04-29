@@ -48,6 +48,15 @@ describe("relay protocol", () => {
     expect(decodeRelayFrame(encodeRelayFrame(rejected))).toEqual(rejected);
   });
 
+  test("round trips dispatcher heartbeat frames", () => {
+    const heartbeat: RelayFrame = {
+      type: "dispatcher-heartbeat",
+      sentAt: 1777480000000,
+    };
+
+    expect(decodeRelayFrame(encodeRelayFrame(heartbeat))).toEqual(heartbeat);
+  });
+
   test("rejects malformed frames visibly", () => {
     expect(() => decodeRelayFrame("{}")).toThrow("missing type");
     expect(() => decodeRelayFrame('{"type":"http-response-start","requestId":"1","status":700,"headers":[]}')).toThrow(

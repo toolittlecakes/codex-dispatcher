@@ -31,6 +31,11 @@ export type RelayHttpResponseErrorFrame = {
   error: string;
 };
 
+export type RelayHeartbeatFrame = {
+  type: "dispatcher-heartbeat";
+  sentAt: number;
+};
+
 export type RelayControlFrame =
   | {
       type: "dispatcher-accepted";
@@ -49,6 +54,7 @@ export type RelayFrame =
   | RelayHttpResponseChunkFrame
   | RelayHttpResponseEndFrame
   | RelayHttpResponseErrorFrame
+  | RelayHeartbeatFrame
   | RelayControlFrame;
 
 export function encodeRelayFrame(frame: RelayFrame): string {
@@ -94,6 +100,11 @@ export function decodeRelayFrame(raw: string | Buffer): RelayFrame {
         requestId: requiredString(value.requestId, "requestId"),
         error: requiredString(value.error, "error"),
       };
+    case "dispatcher-heartbeat":
+      return {
+        type: "dispatcher-heartbeat",
+        sentAt: requiredTimestamp(value.sentAt, "sentAt"),
+      };
     case "dispatcher-accepted":
       return {
         type: "dispatcher-accepted",
@@ -126,6 +137,13 @@ function requiredString(value: unknown, key: string): string {
 function requiredStatus(value: unknown): number {
   if (typeof value !== "number" || !Number.isInteger(value) || value < 100 || value > 599) {
     throw new Error("Invalid relay frame: status must be an HTTP status code.");
+  }
+  return value;
+}
+
+function requiredTimestamp(value: unknown, key: string): number {
+  if (typeof value !== "number" || !Number.isFinite(value) || value < 0) {
+    throw new Error(`Invalid relay frame: ${key} must be a non-negative timestamp.`);
   }
   return value;
 }

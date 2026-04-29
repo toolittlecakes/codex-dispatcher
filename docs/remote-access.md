@@ -1,38 +1,64 @@
 # Remote Access
 
-## Current path: Cloudflare quick tunnel
+## Production path: owned relay
 
-From an installed package, run:
+The production remote-access path is the owned relay at `codex-dispatcher.app`.
+
+```bash
+CODEX_DISPATCHER_RELAY_URL=https://codex-dispatcher.app codex-dispatcher login
+codex-dispatcher --relay --kill-existing
+```
+
+The phone/PWA URL is stable per GitHub user:
+
+```text
+https://<slug>.codex-dispatcher.app/
+```
+
+The slug defaults to the GitHub login. It is a routing label, not the security boundary. The durable identity is the GitHub numeric user id returned by GitHub OAuth.
+
+The relay path is:
+
+1. The laptop runs `codex-dispatcher --relay`.
+2. The CLI opens one outbound WebSocket to the relay.
+3. The browser logs in to the relay through GitHub web OAuth.
+4. The relay matches the browser GitHub user to that user's active dispatcher.
+5. HTTP and event-stream traffic is proxied to the laptop dispatcher over the outbound WebSocket.
+
+The relay never stores conversation contents. It persists only GitHub users, browser sessions, and CLI device tokens.
+
+## Reliability behavior
+
+The CLI sends heartbeat frames every 20 seconds. If the relay WebSocket closes after it has been accepted, the CLI reconnects with exponential backoff up to 30 seconds.
+
+Reconnects after an accepted session use takeover semantics. That means the relay closes any stale active dispatcher session for the same user and accepts the reconnecting CLI. This avoids a dead socket blocking the user's stable URL.
+
+Relay HTTP timeout decisions:
+
+- HTTP idle timeout is 60 seconds.
+- Dispatcher proxy timeout is 30 seconds.
+- Late dispatcher response chunks for browser-canceled streams are ignored.
+
+These choices keep slow app-server requests as explicit relay failures instead of generic `502` crashes or Bun's default 10-second idle timeout.
+
+## Failure states
+
+- Browser is not logged in: redirect to GitHub OAuth.
+- User has no active dispatcher: show `Dispatcher is offline.`
+- Another dispatcher is already active: reject the new dispatcher unless takeover is explicit.
+- Relay request to local dispatcher exceeds timeout: return `504`.
+
+No fallback relay is selected silently. The active remote path must be visible in CLI logs and UI.
+
+## Experimental path: Cloudflare quick tunnel
+
+Cloudflare quick tunnels are still useful for local experiments because they do not require relay setup, but they create a new URL on every restart and are not the PWA path.
 
 ```bash
 codex-dispatcher
 ```
 
-For a local install from this checkout:
-
-```bash
-bun link
-codex-dispatcher
-```
-
-From this checkout, run:
-
-```bash
-bun run doctor
-bun run start
-```
-
-To build and run without requiring Bun at runtime:
-
-```bash
-bun run build:binary
-./dist/codex-dispatcher doctor
-./dist/codex-dispatcher
-```
-
-The launcher finds the installed Codex VS Code extension webview. If it is missing, it runs `code --install-extension openai.chatgpt` and then verifies that the webview assets exist. It starts `cloudflared tunnel --url http://localhost:<port>`, waits for the `trycloudflare.com` URL, then starts the dispatcher with that URL in its runtime status.
-
-The primary URL is the extension webview surface:
+The launcher starts `cloudflared tunnel --url http://localhost:<port>` and prints:
 
 ```text
 Phone: https://<tunnel>.trycloudflare.com/?token=<token>
@@ -40,25 +66,8 @@ Phone: https://<tunnel>.trycloudflare.com/?token=<token>
 
 The first request uses the URL token to set an HttpOnly `codex_dispatcher_session` cookie. After that, the extension host endpoints use the cookie and the browser URL is scrubbed with `history.replaceState`.
 
-The phone-Codex path uses the root route `/`.
-
 For local-only development:
 
 ```bash
 codex-dispatcher --no-tunnel
 ```
-
-The UI shows whether it is using a Cloudflare tunnel or only local/LAN access, the token fingerprint, and the number of active browser sessions.
-
-Access is gated by the dispatcher token in the URL. Use **Rotate token** in the UI if the link was exposed; rotation invalidates new connections with the old token, while already-open WebSocket sessions remain visible until they disconnect.
-
-## Later path: owned relay
-
-The relay should replace Cloudflare as a small authenticated rendezvous service:
-
-- laptop dispatcher keeps one outbound WebSocket to the relay;
-- phone connects to the relay with the same short-lived dispatcher token or a device-bound session token;
-- relay forwards encrypted dispatcher traffic and never stores conversation contents;
-- dispatcher UI keeps the same security surface: remote URL, token/session state, and active session visibility.
-
-Do not add fallback relays silently. The active remote path should be explicit in the UI and logs.

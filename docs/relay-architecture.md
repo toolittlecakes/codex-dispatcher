@@ -19,6 +19,7 @@ Cloudflare quick tunnels stay useful for local experiments, but they are not the
 7. The CLI opens one dispatcher session to the relay.
 8. Browser/PWA users log in with GitHub web OAuth on the relay.
 9. The relay routes browser traffic for that GitHub user to that user's active dispatcher.
+10. The CLI keeps the relay WebSocket alive with heartbeat frames and reconnects automatically after transient disconnects.
 
 ## Stable URL
 
@@ -84,6 +85,8 @@ When `--kill-existing` is set, the relay closes the previous dispatcher session 
 - Dispatcher already active: start fails unless the user confirms or passes `--kill-existing`.
 - Browser user is not logged in: relay redirects to GitHub OAuth.
 - Browser user has no active dispatcher: relay shows a visible "dispatcher offline" page.
+- Relay-to-dispatcher HTTP proxy exceeds the explicit timeout: relay returns `504`, not an unhandled server error.
+- Browser closes a streamed response while dispatcher chunks are still in flight: relay drops the late chunks instead of crashing.
 
 ## Environment
 
@@ -94,11 +97,19 @@ GITHUB_CLIENT_ID
 GITHUB_CLIENT_SECRET
 RELAY_PUBLIC_BASE_URL=https://codex-dispatcher.app
 RELAY_DATA_PATH=/var/lib/codex-dispatcher/relay-state.json
-RELAY_COOKIE_SECRET
 ```
 
 The relay stores users, browser sessions, and CLI devices in `RELAY_DATA_PATH`.
-Active dispatcher WebSocket sessions are intentionally not persisted; after a relay restart, users must reconnect their dispatcher.
+Active dispatcher WebSocket sessions are intentionally not persisted. A running CLI reconnects automatically after relay/network restarts; if the laptop process is not running, the browser sees the explicit dispatcher-offline state.
+
+Relay HTTP server timeout is deliberately longer than the proxy timeout:
+
+```text
+HTTP idle timeout: 60 seconds
+dispatcher proxy timeout: 30 seconds
+```
+
+This keeps slow app-server requests under dispatcher control and avoids Bun's default 10-second HTTP idle timeout turning valid but slow host messages into generic `502` responses.
 
 CLI:
 
