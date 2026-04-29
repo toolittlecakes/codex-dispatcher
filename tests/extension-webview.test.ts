@@ -117,6 +117,11 @@ describe("extension webview", () => {
         appServer: {} as never,
         defaultCwd: "/repo",
         getToken: () => "secret",
+        assertThreadFollowerOwner: async (conversationId) => {
+          if (conversationId !== "thread-1") {
+            throw new Error(`No IPC owner for thread ${conversationId}`);
+          }
+        },
         handleIpcRequest: async (method, params, targetClientId) => {
           ipcRequests.push({ method, params, targetClientId });
           return { mirrored: true };
@@ -152,6 +157,33 @@ describe("extension webview", () => {
         messages: [{ type: "thread-role-response", requestId: "role-1", role: "owner" }],
       });
 
+      const hostRoleResponse = await webview.fetch(
+        new Request("http://localhost/host-message", {
+          method: "POST",
+          headers: { cookie: "codex_dispatcher_session=secret" },
+          body: JSON.stringify({
+            type: "fetch",
+            requestId: "host-role-1",
+            url: "vscode://codex/thread-role-for-host",
+            method: "POST",
+            body: JSON.stringify({ hostId: "local", conversationId: "thread-1" }),
+          }),
+        }),
+        new URL("http://localhost/host-message"),
+      );
+      await expect(hostRoleResponse.json()).resolves.toEqual({
+        messages: [
+          {
+            type: "fetch-response",
+            responseType: "success",
+            requestId: "host-role-1",
+            status: 200,
+            headers: {},
+            bodyJsonString: "\"follower\"",
+          },
+        ],
+      });
+
       const followerResponse = await webview.fetch(
         new Request("http://localhost/host-message", {
           method: "POST",
@@ -170,6 +202,74 @@ describe("extension webview", () => {
       expect(followerRequests).toEqual([
         { method: "thread-follower-start-turn", params: { conversationId: "thread-1" } },
       ]);
+
+      const hostFollowerResponse = await webview.fetch(
+        new Request("http://localhost/host-message", {
+          method: "POST",
+          headers: { cookie: "codex_dispatcher_session=secret" },
+          body: JSON.stringify({
+            type: "fetch",
+            requestId: "host-follower-1",
+            url: "vscode://codex/thread-follower-start-turn-for-host",
+            method: "POST",
+            body: JSON.stringify({
+              hostId: "local",
+              conversationId: "thread-1",
+              turnStartParams: { input: [{ type: "text", text: "from phone" }] },
+            }),
+          }),
+        }),
+        new URL("http://localhost/host-message"),
+      );
+      await expect(hostFollowerResponse.json()).resolves.toEqual({
+        messages: [
+          {
+            type: "fetch-response",
+            responseType: "success",
+            requestId: "host-follower-1",
+            status: 200,
+            headers: {},
+            bodyJsonString: "{\"ok\":true}",
+          },
+        ],
+      });
+      expect(followerRequests).toEqual([
+        { method: "thread-follower-start-turn", params: { conversationId: "thread-1" } },
+        {
+          method: "thread-follower-start-turn",
+          params: {
+            conversationId: "thread-1",
+            turnStartParams: { input: [{ type: "text", text: "from phone" }] },
+          },
+        },
+      ]);
+
+      const hostAssertResponse = await webview.fetch(
+        new Request("http://localhost/host-message", {
+          method: "POST",
+          headers: { cookie: "codex_dispatcher_session=secret" },
+          body: JSON.stringify({
+            type: "fetch",
+            requestId: "host-assert-1",
+            url: "vscode://codex/assert-thread-follower-owner-for-host",
+            method: "POST",
+            body: JSON.stringify({ hostId: "local", conversationId: "thread-1" }),
+          }),
+        }),
+        new URL("http://localhost/host-message"),
+      );
+      await expect(hostAssertResponse.json()).resolves.toEqual({
+        messages: [
+          {
+            type: "fetch-response",
+            responseType: "success",
+            requestId: "host-assert-1",
+            status: 200,
+            headers: {},
+            bodyJsonString: "{\"ok\":true}",
+          },
+        ],
+      });
 
       const ipcResponse = await webview.fetch(
         new Request("http://localhost/host-message", {
@@ -220,7 +320,7 @@ describe("extension webview", () => {
         "outbound:ipc-broadcast": 1,
         "outbound:thread-role-response": 1,
         "outbound:thread-follower-start-turn-response": 1,
-        "outbound:fetch-response": 1,
+        "outbound:fetch-response": 4,
       });
     } finally {
       if (previousRoot === undefined) {

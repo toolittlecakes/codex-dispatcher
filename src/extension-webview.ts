@@ -24,6 +24,7 @@ type ExtensionWebviewOptions = {
   defaultCwd: string;
   getToken: () => string;
   statePath?: string;
+  assertThreadFollowerOwner?: (conversationId: string) => Promise<void> | void;
   handleIpcRequest?: (method: string, params: JsonValue, targetClientId?: string) => Promise<JsonValue>;
   getThreadRole?: (conversationId: string) => string | Promise<string>;
   handleFollowerRequest?: (method: string, params: JsonValue) => Promise<JsonValue>;
@@ -56,6 +57,21 @@ const globalState = new Map<string, JsonValue>();
 const persistedAtomState = new Map<string, JsonValue>();
 const sharedObjectState = new Map<string, JsonValue>();
 let activeExtensionStatePath = extensionStatePath();
+const hostFollowerEndpointMethods: Record<string, string> = {
+  "thread-follower-start-turn-for-host": "thread-follower-start-turn",
+  "thread-follower-steer-turn-for-host": "thread-follower-steer-turn",
+  "thread-follower-interrupt-turn-for-host": "thread-follower-interrupt-turn",
+  "thread-follower-compact-thread-for-host": "thread-follower-compact-thread",
+  "thread-follower-set-model-and-reasoning-for-host": "thread-follower-set-model-and-reasoning",
+  "thread-follower-set-collaboration-mode-for-host": "thread-follower-set-collaboration-mode",
+  "thread-follower-edit-last-user-turn-for-host": "thread-follower-edit-last-user-turn",
+  "thread-follower-command-approval-decision-for-host": "thread-follower-command-approval-decision",
+  "thread-follower-file-approval-decision-for-host": "thread-follower-file-approval-decision",
+  "thread-follower-permissions-request-approval-response-for-host": "thread-follower-permissions-request-approval-response",
+  "thread-follower-submit-user-input-for-host": "thread-follower-submit-user-input",
+  "thread-follower-submit-mcp-server-elicitation-response-for-host": "thread-follower-submit-mcp-server-elicitation-response",
+  "thread-follower-set-queued-follow-ups-state-for-host": "thread-follower-set-queued-follow-ups-state",
+};
 const followerRequestTypes: Record<string, { method: string; responseType: string }> = {
   "thread-follower-start-turn-request": {
     method: "thread-follower-start-turn",
@@ -115,6 +131,7 @@ export class ExtensionWebview {
   private readonly appServer: CodexAppServer;
   private readonly defaultCwd: string;
   private readonly getToken: () => string;
+  private readonly assertThreadFollowerOwner: ((conversationId: string) => Promise<void> | void) | undefined;
   private readonly handleIpcRequest:
     | ((method: string, params: JsonValue, targetClientId?: string) => Promise<JsonValue>)
     | undefined;
@@ -135,6 +152,7 @@ export class ExtensionWebview {
     this.appServer = options.appServer;
     this.defaultCwd = options.defaultCwd;
     this.getToken = options.getToken;
+    this.assertThreadFollowerOwner = options.assertThreadFollowerOwner;
     this.handleIpcRequest = options.handleIpcRequest;
     this.getThreadRole = options.getThreadRole;
     this.handleFollowerRequest = options.handleFollowerRequest;
@@ -518,6 +536,10 @@ select,
           const result = await this.handleVSCodeIpcRequest(body);
           return makeFetchResponse({ requestId, result });
         }
+        const hostResult = await this.handleVSCodeHostRequest(endpoint, body);
+        if (hostResult.handled) {
+          return makeFetchResponse({ requestId, result: hostResult.result });
+        }
         const result = await handleVSCodeRequest(endpoint, body, this.defaultCwd);
         return makeFetchResponse({ requestId, result });
       }
@@ -530,6 +552,39 @@ select,
         status: 501,
       });
     }
+  }
+
+  private async handleVSCodeHostRequest(
+    endpoint: string,
+    body: JsonValue,
+  ): Promise<{ handled: true; result: JsonValue } | { handled: false }> {
+    if (endpoint === "thread-role-for-host") {
+      const params = requireObject(body, "thread-role-for-host params");
+      const conversationId = requireString(params.conversationId, "conversationId");
+      return { handled: true, result: this.getThreadRole ? await this.getThreadRole(conversationId) : "follower" };
+    }
+
+    if (endpoint === "assert-thread-follower-owner-for-host") {
+      const params = requireObject(body, "assert-thread-follower-owner-for-host params");
+      const conversationId = requireString(params.conversationId, "conversationId");
+      if (this.assertThreadFollowerOwner) {
+        await this.assertThreadFollowerOwner(conversationId);
+      }
+      return { handled: true, result: { ok: true } };
+    }
+
+    const followerMethod = hostFollowerEndpointMethods[endpoint];
+    if (!followerMethod) {
+      return { handled: false };
+    }
+    if (!this.handleFollowerRequest) {
+      throw new Error("IPC follower bridge is unavailable");
+    }
+
+    return {
+      handled: true,
+      result: await this.handleFollowerRequest(followerMethod, stripHostId(requireObject(body, `${endpoint} params`))),
+    };
   }
 
   private async handleMcpRequest(message: HostMessage): Promise<JsonObject> {
@@ -1446,6 +1501,11 @@ function parseOptionalBody(body: JsonValue | undefined): JsonValue {
     return {};
   }
   return JSON.parse(body) as JsonValue;
+}
+
+function stripHostId(params: JsonObject): JsonObject {
+  const { hostId: _hostId, ...rest } = params;
+  return rest;
 }
 
 export function extensionStatePath(): string {

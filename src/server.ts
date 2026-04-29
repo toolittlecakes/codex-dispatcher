@@ -57,6 +57,7 @@ const extensionWebview = new ExtensionWebview({
   appServer,
   defaultCwd,
   getToken: () => dispatcherToken,
+  assertThreadFollowerOwner: (conversationId) => assertExtensionFollowerOwner(conversationId),
   handleIpcRequest: (method, params, targetClientId) => handleExtensionIpcRequest(method, params, targetClientId),
   getThreadRole: (conversationId) => extensionThreadRole(conversationId),
   handleFollowerRequest: (method, params) => handleExtensionFollowerRequest(method, params),
@@ -778,6 +779,12 @@ function broadcastDispatcherOwnedSnapshot(threadId: string): void {
 
 function extensionThreadRole(threadId: string): string {
   return dispatcherOwnedConversations.has(threadId) ? "owner" : "follower";
+}
+
+function assertExtensionFollowerOwner(threadId: string): void {
+  if (!streamOwners.has(threadId)) {
+    throw new Error(`No IPC owner for thread ${threadId}`);
+  }
 }
 
 async function handleExtensionIpcRequest(
