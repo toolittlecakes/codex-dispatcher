@@ -65,6 +65,8 @@ describe("extension webview spike", () => {
       expect(html).toContain("overflow: hidden !important");
       expect(html).toContain("height: var(--codex-dispatcher-viewport-height, 100vh) !important");
       expect(html).toContain("--codex-dispatcher-viewport-height");
+      expect(html).toContain("--codex-dispatcher-viewport-offset-top");
+      expect(html).toContain("offsetTop");
       expect(html).toContain("visualViewport");
       expect(html).toContain('const hostMessageUrl = "/extension-spike/host-message";');
       expect(html).not.toContain("host-message?token=");

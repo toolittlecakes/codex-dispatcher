@@ -184,7 +184,7 @@ body {
 }
 
 #root {
-  width: 100vw !important;
+  width: var(--codex-dispatcher-viewport-width, 100vw) !important;
   height: var(--codex-dispatcher-viewport-height, 100vh) !important;
   height: var(--codex-dispatcher-viewport-height, 100dvh) !important;
   max-height: var(--codex-dispatcher-viewport-height, 100vh) !important;
@@ -193,7 +193,10 @@ body {
   min-height: 0;
   overflow: hidden !important;
   position: fixed !important;
-  inset: 0 auto auto 0 !important;
+  top: var(--codex-dispatcher-viewport-offset-top, 0px) !important;
+  left: var(--codex-dispatcher-viewport-offset-left, 0px) !important;
+  right: auto !important;
+  bottom: auto !important;
 }
 </style>`;
   }
@@ -578,14 +581,21 @@ body {
     "--vscode-terminal-ansiBrightWhite": "#8c959f",
   };
   const root = document.documentElement;
-  const applyViewportHeight = () => {
-    const height = window.visualViewport?.height || window.innerHeight;
+  const applyViewportGeometry = () => {
+    const viewport = window.visualViewport;
+    const height = viewport?.height || window.innerHeight;
+    const width = viewport?.width || window.innerWidth;
+    const offsetTop = viewport?.offsetTop || 0;
+    const offsetLeft = viewport?.offsetLeft || 0;
     root.style.setProperty("--codex-dispatcher-viewport-height", Math.max(0, Math.floor(height)) + "px");
+    root.style.setProperty("--codex-dispatcher-viewport-width", Math.max(0, Math.floor(width)) + "px");
+    root.style.setProperty("--codex-dispatcher-viewport-offset-top", Math.floor(offsetTop) + "px");
+    root.style.setProperty("--codex-dispatcher-viewport-offset-left", Math.floor(offsetLeft) + "px");
   };
-  applyViewportHeight();
-  window.addEventListener("resize", applyViewportHeight, { passive: true });
-  window.visualViewport?.addEventListener("resize", applyViewportHeight, { passive: true });
-  window.visualViewport?.addEventListener("scroll", applyViewportHeight, { passive: true });
+  applyViewportGeometry();
+  window.addEventListener("resize", applyViewportGeometry, { passive: true });
+  window.visualViewport?.addEventListener("resize", applyViewportGeometry, { passive: true });
+  window.visualViewport?.addEventListener("scroll", applyViewportGeometry, { passive: true });
   if (token) {
     const cleanUrl = new URL(window.location.href);
     cleanUrl.searchParams.delete("token");
