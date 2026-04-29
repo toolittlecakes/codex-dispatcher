@@ -11,7 +11,7 @@ import {
   dispatcherIpcHostId,
   updateCollaborationModeSettings,
 } from "./dispatcher-owner";
-import { ExtensionWebviewSpike } from "./extension-webview-spike";
+import { ExtensionWebview } from "./extension-webview";
 
 type ClientMessage = {
   type?: string;
@@ -49,11 +49,11 @@ let dispatcherToken = process.env.DISPATCHER_TOKEN ?? randomBytes(18).toString("
 let tokenCreatedAt = Date.now();
 const defaultCwd = process.env.CODEX_DISPATCHER_CWD ?? process.cwd();
 const dispatcherRemoteUrl = normalizeBaseUrl(process.env.DISPATCHER_REMOTE_URL);
-const primaryClientPath = "/extension-spike/";
+const primaryClientPath = "/";
 const publicRoot = resolve(import.meta.dir, "../public");
 const appServer = new CodexAppServer();
 const ipcBridge = new CodexIpcBridge();
-const extensionWebviewSpike = new ExtensionWebviewSpike({
+const extensionWebview = new ExtensionWebview({
   appServer,
   defaultCwd,
   getToken: () => dispatcherToken,
@@ -96,7 +96,7 @@ const dispatcherOwnerRequestMethods = new Set([
 ]);
 
 appServer.onEvent((event) => {
-  extensionWebviewSpike.handleAppServerEvent(event);
+  extensionWebview.handleAppServerEvent(event);
 
   if (event.type === "notification") {
     broadcast({ type: "codexNotification", notification: event.notification });
@@ -206,8 +206,8 @@ try {
       return new Response("WebSocket upgrade failed", { status: 400 });
     }
 
-    if (extensionWebviewSpike.canHandle(url.pathname)) {
-      return extensionWebviewSpike.fetch(request, url);
+    if (extensionWebview.canHandle(url.pathname)) {
+      return extensionWebview.fetch(request, url);
     }
 
     return serveStatic(url.pathname);

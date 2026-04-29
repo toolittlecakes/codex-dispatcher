@@ -3,13 +3,13 @@ import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import {
-  ExtensionWebviewSpike,
+  ExtensionWebview,
   handleVSCodeRequest,
   makeFetchResponse,
   resolveWebviewAssetPath,
-} from "../src/extension-webview-spike";
+} from "../src/extension-webview";
 
-describe("extension webview spike", () => {
+describe("extension webview", () => {
   test("builds VS Code fetch success responses in the extension contract", () => {
     expect(makeFetchResponse({ requestId: "1", result: { ok: true } })).toEqual({
       type: "fetch-response",
@@ -22,8 +22,8 @@ describe("extension webview spike", () => {
   });
 
   test("rejects asset traversal outside the webview root", () => {
-    expect(resolveWebviewAssetPath("/tmp/webview", "/extension-spike/assets/index.js")).toBe("/tmp/webview/assets/index.js");
-    expect(resolveWebviewAssetPath("/tmp/webview", "/extension-spike/../secret.txt")).toBeNull();
+    expect(resolveWebviewAssetPath("/tmp/webview", "/assets/index.js")).toBe("/tmp/webview/assets/index.js");
+    expect(resolveWebviewAssetPath("/tmp/webview", "/../secret.txt")).toBeNull();
   });
 
   test("handles explicit vscode endpoints needed during bootstrap", async () => {
@@ -47,14 +47,14 @@ describe("extension webview spike", () => {
     );
 
     try {
-      const spike = new ExtensionWebviewSpike({
+      const webview = new ExtensionWebview({
         appServer: {} as never,
         defaultCwd: "/repo",
         getToken: () => "secret",
       });
-      const response = await spike.fetch(
-        new Request("http://localhost/extension-spike/?token=secret"),
-        new URL("http://localhost/extension-spike/?token=secret"),
+      const response = await webview.fetch(
+        new Request("http://localhost/?token=secret"),
+        new URL("http://localhost/?token=secret"),
       );
       const html = await response.text();
 
@@ -70,14 +70,14 @@ describe("extension webview spike", () => {
       expect(html).toContain("offsetTop");
       expect(html).toContain("lockPageScroll");
       expect(html).toContain("visualViewport");
-      expect(html).toContain('const hostMessageUrl = "/extension-spike/host-message";');
+      expect(html).toContain('const hostMessageUrl = "/host-message";');
       expect(html).not.toContain("host-message?token=");
 
-      const debug = await spike.fetch(
-        new Request("http://localhost/extension-spike/debug", {
+      const debug = await webview.fetch(
+        new Request("http://localhost/debug", {
           headers: { cookie: "codex_dispatcher_session=secret" },
         }),
-        new URL("http://localhost/extension-spike/debug"),
+        new URL("http://localhost/debug"),
       );
       expect(debug.status).toBe(200);
     } finally {

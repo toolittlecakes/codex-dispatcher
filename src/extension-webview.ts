@@ -15,7 +15,7 @@ type HostMessage = JsonObject & {
   workerId?: string;
 };
 
-type ExtensionWebviewSpikeOptions = {
+type ExtensionWebviewOptions = {
   appServer: CodexAppServer;
   defaultCwd: string;
   getToken: () => string;
@@ -34,7 +34,7 @@ type FetchResponseOptions = {
   status?: number;
 };
 
-const routePrefix = "/extension-spike";
+const routePrefix = "";
 const authCookieName = "codex_dispatcher_session";
 const encoder = new TextEncoder();
 const maxDiagnosticMessages = 200;
@@ -42,7 +42,7 @@ const globalState = new Map<string, JsonValue>();
 const persistedAtomState = new Map<string, JsonValue>();
 const sharedObjectState = new Map<string, JsonValue>();
 
-export class ExtensionWebviewSpike {
+export class ExtensionWebview {
   private readonly appServer: CodexAppServer;
   private readonly defaultCwd: string;
   private readonly getToken: () => string;
@@ -54,7 +54,7 @@ export class ExtensionWebviewSpike {
   private readonly experimentalEnablementSetResults = new Map<string, JsonValue>();
   private readonly webviewRoot: string | null;
 
-  constructor(options: ExtensionWebviewSpikeOptions) {
+  constructor(options: ExtensionWebviewOptions) {
     this.appServer = options.appServer;
     this.defaultCwd = options.defaultCwd;
     this.getToken = options.getToken;
@@ -62,7 +62,7 @@ export class ExtensionWebviewSpike {
   }
 
   canHandle(pathname: string): boolean {
-    return pathname === routePrefix || pathname.startsWith(`${routePrefix}/`);
+    return pathname.startsWith("/");
   }
 
   async fetch(request: Request, url: URL): Promise<Response> {
@@ -650,7 +650,7 @@ body {
 
   const hostMessageUrl = ${JSON.stringify(`${routePrefix}/host-message`)};
   const eventsUrl = ${JSON.stringify(`${routePrefix}/events`)};
-  const vscodeStateKey = "codex-extension-spike:vscode-state";
+  const vscodeStateKey = "codex-extension-webview:vscode-state";
   const maxMessages = 500;
   const remember = (target, message) => {
     target.push(message);
@@ -686,7 +686,7 @@ body {
         sourceType: typeof message?.type === "string" ? message.type : "unknown",
       };
       remember(window.__codexHostAdapterInboundMessages, adapterError);
-      console.error("[codex-extension-spike] host-message failed", error);
+      console.error("[codex-extension-webview] host-message failed", error);
     }
   };
 
@@ -1261,7 +1261,7 @@ function jsonResponse(value: JsonValue, status = 200): Response {
 }
 
 function authCookie(token: string): string {
-  return `${authCookieName}=${encodeURIComponent(token)}; HttpOnly; SameSite=Lax; Path=${routePrefix}`;
+  return `${authCookieName}=${encodeURIComponent(token)}; HttpOnly; SameSite=Lax; Path=${routePrefix || "/"}`;
 }
 
 function cookieValue(header: string | null, name: string): string | null {

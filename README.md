@@ -49,10 +49,10 @@ codex-dispatcher
 The launcher prints:
 
 ```text
-Phone: https://<tunnel>.trycloudflare.com/extension-spike/?token=<token>
+Phone: https://<tunnel>.trycloudflare.com/?token=<token>
 ```
 
-Open that URL on the phone. The first request uses the token to set an HttpOnly session cookie scoped to `/extension-spike`; the browser URL is then scrubbed.
+Open that URL on the phone. The first request uses the token to set an HttpOnly session cookie; the browser URL is then scrubbed.
 
 ## Requirements
 

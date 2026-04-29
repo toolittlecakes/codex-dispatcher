@@ -35,12 +35,12 @@ The launcher finds the installed Codex VS Code extension webview. If it is missi
 The primary URL is the extension webview surface:
 
 ```text
-Phone: https://<tunnel>.trycloudflare.com/extension-spike/?token=<token>
+Phone: https://<tunnel>.trycloudflare.com/?token=<token>
 ```
 
-The first request uses the URL token to set an HttpOnly `codex_dispatcher_session` cookie scoped to `/extension-spike`. After that, the extension host endpoints use the cookie and the browser URL is scrubbed with `history.replaceState`.
+The first request uses the URL token to set an HttpOnly `codex_dispatcher_session` cookie. After that, the extension host endpoints use the cookie and the browser URL is scrubbed with `history.replaceState`.
 
-The dispatcher also has the legacy local/PWA surface at `/`, but the phone-Codex path should use `/extension-spike/`.
+The phone-Codex path uses the root route `/`.
 
 For local-only development:
 

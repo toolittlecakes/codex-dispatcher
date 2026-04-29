@@ -8,7 +8,7 @@ describe("relay protocol", () => {
         type: "http-request",
         requestId: "req-1",
         method: "GET",
-        path: "/extension-spike/events",
+        path: "/events",
         headers: [["accept", "text/event-stream"]],
         bodyBase64: null,
       },

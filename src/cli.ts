@@ -7,7 +7,7 @@ import { createServer } from "node:net";
 import { resolve } from "node:path";
 import { resolveCodexCliPath } from "./codex-app-server";
 import { readDispatcherConfig, writeDispatcherConfig, type DispatcherConfig } from "./dispatcher-config";
-import { resolveExtensionWebviewRoot } from "./extension-webview-spike";
+import { resolveExtensionWebviewRoot } from "./extension-webview";
 import { buildGitHubDeviceCodeBody, buildGitHubDeviceTokenBody } from "./github-oauth";
 import { startRelayClient, type RelayClient } from "./relay-client";
 
@@ -43,7 +43,7 @@ type GitHubDeviceCode = {
 
 const defaultPort = 8792;
 const extensionId = "openai.chatgpt";
-const extensionRoute = "/extension-spike/";
+const extensionRoute = "/";
 const serverEntry = new URL("./server.ts", import.meta.url).pathname;
 const internalServerCommand = "__server";
 
