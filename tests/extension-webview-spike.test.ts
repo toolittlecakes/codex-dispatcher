@@ -61,12 +61,14 @@ describe("extension webview spike", () => {
       expect(response.headers.get("set-cookie")).toContain("codex_dispatcher_session=secret");
       expect(response.headers.get("set-cookie")).toContain("HttpOnly");
       expect(html).toContain("history.replaceState");
+      expect(html).toContain('name="viewport"');
       expect(html).toContain("#root");
       expect(html).toContain("overflow: hidden !important");
       expect(html).toContain("height: var(--codex-dispatcher-viewport-height, 100vh) !important");
       expect(html).toContain("--codex-dispatcher-viewport-height");
       expect(html).toContain("--codex-dispatcher-viewport-offset-top");
       expect(html).toContain("offsetTop");
+      expect(html).toContain("lockPageScroll");
       expect(html).toContain("visualViewport");
       expect(html).toContain('const hostMessageUrl = "/extension-spike/host-message";');
       expect(html).not.toContain("host-message?token=");

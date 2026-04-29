@@ -1,0 +1,12 @@
+codex-dispatcher.app {
+	encode zstd gzip
+	reverse_proxy 127.0.0.1:8788
+}
+
+*.codex-dispatcher.app {
+	encode zstd gzip
+	tls {
+		on_demand
+	}
+	reverse_proxy 127.0.0.1:8788
+}

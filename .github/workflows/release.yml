@@ -1,0 +1,50 @@
+name: Release
+
+on:
+  push:
+    branches:
+      - main
+
+permissions:
+  contents: write
+
+jobs:
+  darwin-arm64:
+    name: macOS arm64 binary
+    runs-on: macos-latest
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v5
+        with:
+          fetch-depth: 0
+
+      - name: Set up Bun
+        uses: oven-sh/setup-bun@v2
+
+      - name: Install dependencies
+        run: bun install --frozen-lockfile
+
+      - name: Test
+        run: bun test
+
+      - name: Typecheck
+        run: bun run typecheck
+
+      - name: Build binary
+        run: bun build --compile --target=bun --outfile=dist/codex-dispatcher-darwin-arm64 src/cli.ts
+
+      - name: Publish rolling release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RELEASE_TAG: nightly
+          ASSET_PATH: dist/codex-dispatcher-darwin-arm64
+        run: |
+          git tag -f "$RELEASE_TAG" "$GITHUB_SHA"
+          git push origin "refs/tags/$RELEASE_TAG" --force
+
+          if gh release view "$RELEASE_TAG" >/dev/null 2>&1; then
+            gh release upload "$RELEASE_TAG" "$ASSET_PATH" --clobber
+            gh release edit "$RELEASE_TAG" --title "codex-dispatcher nightly" --notes "Latest main build from $GITHUB_SHA" --latest
+          else
+            gh release create "$RELEASE_TAG" "$ASSET_PATH" --title "codex-dispatcher nightly" --notes "Latest main build from $GITHUB_SHA" --latest
+          fi

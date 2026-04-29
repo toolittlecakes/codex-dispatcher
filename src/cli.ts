@@ -6,16 +6,22 @@ import { existsSync } from "node:fs";
 import { createServer } from "node:net";
 import { resolve } from "node:path";
 import { resolveCodexCliPath } from "./codex-app-server";
+import { readDispatcherConfig, writeDispatcherConfig, type DispatcherConfig } from "./dispatcher-config";
 import { resolveExtensionWebviewRoot } from "./extension-webview-spike";
+import { buildGitHubDeviceCodeBody, buildGitHubDeviceTokenBody } from "./github-oauth";
+import { startRelayClient, type RelayClient } from "./relay-client";
 
-type CliCommand = "serve" | "doctor";
+type CliCommand = "serve" | "doctor" | "login";
 
 type CliOptions = {
   command: CliCommand;
   cwd: string;
   host: string;
   installExtension: boolean;
+  killExisting: boolean;
   port: number | null;
+  relay: boolean;
+  relayUrl: string | null;
   showHelp: boolean;
   tunnel: "cloudflare" | null;
 };
@@ -23,6 +29,16 @@ type CliOptions = {
 type CommandCheck = {
   ok: boolean;
   detail: string;
+};
+
+type RelayConfig = NonNullable<DispatcherConfig["relay"]>;
+
+type GitHubDeviceCode = {
+  deviceCode: string;
+  userCode: string;
+  verificationUri: string;
+  expiresAt: number;
+  intervalSeconds: number;
 };
 
 const defaultPort = 8792;
@@ -34,6 +50,7 @@ const internalServerCommand = "__server";
 let shuttingDown = false;
 let dispatcher: ChildProcess | null = null;
 let tunnel: ChildProcess | null = null;
+let relayClient: RelayClient | null = null;
 
 try {
   if (process.argv[2] === internalServerCommand) {
@@ -52,14 +69,21 @@ try {
     process.exit(ok ? 0 : 1);
   }
 
+  if (options.command === "login") {
+    await runRelayLogin(options);
+    process.exit(0);
+  }
+
   const webviewRoot = await ensureCodexExtensionWebviewRoot(options.installExtension);
   const port = options.port ?? await findOpenPort(defaultPort);
   const token = randomBytes(18).toString("base64url");
   const localTarget = `http://localhost:${port}`;
+  const relayConfig = options.relay ? requireRelayConfig(options) : null;
+  const stableRemoteUrl = relayConfig ? stableRelayUrl(relayConfig) : null;
 
   console.log(`Codex extension webview: ${webviewRoot}`);
 
-  const tunnelStart = options.tunnel === "cloudflare"
+  const tunnelStart = options.tunnel === "cloudflare" && !options.relay
     ? await startCloudflareTunnel(localTarget)
     : null;
   tunnel = tunnelStart?.child ?? null;
@@ -67,13 +91,28 @@ try {
     cwd: options.cwd,
     host: options.host,
     port,
-    remoteUrl: tunnelStart?.url ?? null,
+    remoteUrl: stableRemoteUrl ?? tunnelStart?.url ?? null,
     token,
   });
 
+  if (relayConfig) {
+    relayClient = await startRelayClient({
+      relayUrl: options.relayUrl ?? relayConfig.url,
+      relayToken: relayConfig.token,
+      localBaseUrl: localTarget,
+      localDispatcherToken: token,
+      killExisting: options.killExisting,
+    });
+    if (relayClient.killedSessionId) {
+      console.log(`Killed previous dispatcher session: ${relayClient.killedSessionId}`);
+    }
+  }
+
   console.log("");
   console.log(`Local:  ${extensionUrl(localTarget, token)}`);
-  if (tunnelStart) {
+  if (relayClient) {
+    console.log(`Phone:  ${relayClient.stableUrl}`);
+  } else if (tunnelStart) {
     console.log(`Phone:  ${extensionUrl(tunnelStart.url, token)}`);
   } else {
     console.log("Phone:  tunnel disabled; use the Local URL from this machine only");
@@ -95,7 +134,10 @@ function parseArgs(args: string[]): CliOptions {
     cwd: process.cwd(),
     host: "0.0.0.0",
     installExtension: true,
+    killExisting: false,
     port: null,
+    relay: false,
+    relayUrl: null,
     showHelp: false,
     tunnel: "cloudflare",
   };
@@ -105,7 +147,7 @@ function parseArgs(args: string[]): CliOptions {
     if (arg === undefined) {
       continue;
     }
-    if (arg === "serve" || arg === "doctor") {
+    if (arg === "serve" || arg === "doctor" || arg === "login") {
       options.command = arg;
       continue;
     }
@@ -119,6 +161,24 @@ function parseArgs(args: string[]): CliOptions {
     }
     if (arg === "--no-install-extension") {
       options.installExtension = false;
+      continue;
+    }
+    if (arg === "--relay") {
+      options.relay = true;
+      options.tunnel = null;
+      continue;
+    }
+    if (arg === "--kill-existing") {
+      options.killExisting = true;
+      continue;
+    }
+    if (arg === "--relay-url") {
+      options.relayUrl = normalizeRelayUrl(requireNextArg(args, index, "--relay-url"));
+      index += 1;
+      continue;
+    }
+    if (arg.startsWith("--relay-url=")) {
+      options.relayUrl = normalizeRelayUrl(arg.slice("--relay-url=".length));
       continue;
     }
     if (arg === "--tunnel") {
@@ -179,17 +239,169 @@ Runs the Codex VS Code extension webview against the local codex app-server and 
 
 Usage:
   codex-dispatcher [serve] [options]
+  codex-dispatcher login [options]
   codex-dispatcher doctor [options]
 
 Options:
   --port <port>              Port to bind. Defaults to the first free port from ${defaultPort}.
   --host <host>              Host to bind. Defaults to 0.0.0.0.
   --cwd <path>               Project cwd passed to Codex. Defaults to the current directory.
+  --relay                    Connect through the configured codex-dispatcher relay.
+  --relay-url <url>          Relay base URL. Defaults to CODEX_DISPATCHER_RELAY_URL or saved config.
+  --kill-existing            Replace the active relay dispatcher for this GitHub user.
   --tunnel cloudflare        Start a Cloudflare quick tunnel. This is the default.
   --no-tunnel                Only print the local URL.
   --no-install-extension     Fail if the Codex VS Code extension webview is not installed.
   -h, --help                 Show this help.
 `);
+}
+
+async function runRelayLogin(options: CliOptions): Promise<void> {
+  const relayUrl = normalizeRelayUrl(options.relayUrl ?? process.env.CODEX_DISPATCHER_RELAY_URL ?? "https://codex-dispatcher.app");
+  const clientId = await fetchRelayGitHubClientId(relayUrl);
+  const deviceCode = await requestGitHubDeviceCode(clientId);
+  console.log("Open GitHub device login:");
+  console.log(deviceCode.verificationUri);
+  console.log("");
+  console.log(`Enter code: ${deviceCode.userCode}`);
+  console.log("");
+  const githubToken = await pollGitHubDeviceToken(clientId, deviceCode);
+  const relayConfig = await registerCliWithRelay(relayUrl, githubToken);
+  writeDispatcherConfig({ relay: relayConfig });
+  console.log(`Logged in as @${relayConfig.githubLogin}`);
+  console.log(`Stable URL: ${stableRelayUrl(relayConfig)}`);
+}
+
+async function fetchRelayGitHubClientId(relayUrl: string): Promise<string> {
+  const response = await fetch(new URL("/api/oauth/github/client", relayUrl));
+  if (!response.ok) {
+    throw new Error(`Relay GitHub client request failed: ${response.status}`);
+  }
+  const body = await response.json() as unknown;
+  if (!isRecord(body) || typeof body.clientId !== "string" || body.clientId.length === 0) {
+    throw new Error("Relay did not return a GitHub client id.");
+  }
+  return body.clientId;
+}
+
+async function requestGitHubDeviceCode(clientId: string): Promise<GitHubDeviceCode> {
+  const response = await fetch("https://github.com/login/device/code", {
+    method: "POST",
+    headers: {
+      accept: "application/json",
+      "content-type": "application/x-www-form-urlencoded",
+    },
+    body: buildGitHubDeviceCodeBody(clientId),
+  });
+  if (!response.ok) {
+    throw new Error(`GitHub device login failed: ${response.status}`);
+  }
+  const body = await response.json() as unknown;
+  if (
+    !isRecord(body) ||
+    typeof body.device_code !== "string" ||
+    typeof body.user_code !== "string" ||
+    typeof body.verification_uri !== "string" ||
+    typeof body.expires_in !== "number"
+  ) {
+    throw new Error("GitHub device login response was malformed.");
+  }
+  return {
+    deviceCode: body.device_code,
+    userCode: body.user_code,
+    verificationUri: body.verification_uri,
+    expiresAt: Date.now() + body.expires_in * 1000,
+    intervalSeconds: typeof body.interval === "number" ? body.interval : 5,
+  };
+}
+
+async function pollGitHubDeviceToken(clientId: string, deviceCode: GitHubDeviceCode): Promise<string> {
+  let intervalSeconds = deviceCode.intervalSeconds;
+  while (Date.now() < deviceCode.expiresAt) {
+    await sleep(intervalSeconds * 1000);
+    const response = await fetch("https://github.com/login/oauth/access_token", {
+      method: "POST",
+      headers: {
+        accept: "application/json",
+        "content-type": "application/x-www-form-urlencoded",
+      },
+      body: buildGitHubDeviceTokenBody(clientId, deviceCode.deviceCode),
+    });
+    if (!response.ok) {
+      throw new Error(`GitHub device token polling failed: ${response.status}`);
+    }
+    const body = await response.json() as unknown;
+    if (!isRecord(body)) {
+      throw new Error("GitHub device token response was malformed.");
+    }
+    if (typeof body.access_token === "string") {
+      return body.access_token;
+    }
+    if (body.error === "authorization_pending") {
+      continue;
+    }
+    if (body.error === "slow_down") {
+      intervalSeconds += 5;
+      continue;
+    }
+    throw new Error(`GitHub device login failed: ${String(body.error ?? "unknown_error")}`);
+  }
+  throw new Error("GitHub device login expired.");
+}
+
+async function registerCliWithRelay(relayUrl: string, githubToken: string): Promise<RelayConfig> {
+  const response = await fetch(new URL("/api/cli/login", relayUrl), {
+    method: "POST",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify({ githubToken }),
+  });
+  if (!response.ok) {
+    throw new Error(`Relay CLI login failed: ${response.status}`);
+  }
+  const body = await response.json() as unknown;
+  if (!isRecord(body) || !isRecord(body.relay)) {
+    throw new Error("Relay CLI login response was malformed.");
+  }
+  return parseRelayConfig(body.relay);
+}
+
+function requireRelayConfig(options: CliOptions): RelayConfig {
+  const relay = readDispatcherConfig().relay;
+  if (!relay) {
+    throw new Error("Relay login is required. Run `codex-dispatcher login` first.");
+  }
+  if (options.relayUrl) {
+    return { ...relay, url: options.relayUrl };
+  }
+  return relay;
+}
+
+function parseRelayConfig(value: Record<string, unknown>): RelayConfig {
+  return {
+    url: normalizeRelayUrl(requiredString(value.url, "relay.url")),
+    userId: requiredString(value.userId, "relay.userId"),
+    githubLogin: requiredString(value.githubLogin, "relay.githubLogin"),
+    slug: requiredString(value.slug, "relay.slug"),
+    deviceId: requiredString(value.deviceId, "relay.deviceId"),
+    token: requiredString(value.token, "relay.token"),
+  };
+}
+
+function stableRelayUrl(relay: RelayConfig): string {
+  const url = new URL(relay.url);
+  url.hostname = `${relay.slug}.${url.hostname}`;
+  url.pathname = "/";
+  url.search = "";
+  url.hash = "";
+  return url.toString();
+}
+
+function normalizeRelayUrl(value: string): string {
+  const url = new URL(value);
+  url.pathname = "/";
+  url.search = "";
+  url.hash = "";
+  return url.toString();
 }
 
 async function runDoctor(options: CliOptions): Promise<boolean> {
@@ -501,8 +713,24 @@ function firstOutputLine(output: string): string | null {
     .find((line) => line.length > 0) ?? null;
 }
 
+function requiredString(value: unknown, key: string): string {
+  if (typeof value !== "string" || value.length === 0) {
+    throw new Error(`${key} must be a non-empty string.`);
+  }
+  return value;
+}
+
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return typeof value === "object" && value !== null && !Array.isArray(value);
+}
+
+function sleep(ms: number): Promise<void> {
+  return new Promise((resolveSleep) => setTimeout(resolveSleep, ms));
+}
+
 function shutdown(code: number): never {
   shuttingDown = true;
+  relayClient?.close();
   tunnel?.kill("SIGTERM");
   dispatcher?.kill("SIGTERM");
   process.exit(code);

@@ -69,3 +69,62 @@ For local-only development:
 ```bash
 codex-dispatcher --no-tunnel
 ```
+
+## Relay mode
+
+Cloudflare quick tunnels are useful for experiments, but they create a new URL on every restart. Relay mode is the path for a stable PWA URL.
+
+Run a relay service:
+
+```bash
+GITHUB_CLIENT_ID=... \
+GITHUB_CLIENT_SECRET=... \
+RELAY_PUBLIC_BASE_URL=https://codex-dispatcher.app \
+RELAY_DATA_PATH=/var/lib/codex-dispatcher/relay-state.json \
+bun run dev:relay
+```
+
+For stable per-user URLs, point the root domain and wildcard subdomains at the relay host:
+
+```text
+A @ 23.94.86.204
+A * 23.94.86.204
+```
+
+The TLS proxy must enable on-demand certificates for `*.codex-dispatcher.app` and use the relay ask endpoint.
+The Caddy snippets are versioned in this repo under `deploy/caddy/`.
+
+Import the global options snippet from the host Caddyfile global block:
+
+```caddyfile
+{
+    email you@example.com
+    import /home/sne/projects/codex-dispatcher-relay/deploy/caddy/global-options.caddy
+}
+```
+
+Import the site blocks outside the global block:
+
+```caddyfile
+import /home/sne/projects/codex-dispatcher-relay/deploy/caddy/sites.caddy
+```
+
+Log in the CLI once:
+
+```bash
+CODEX_DISPATCHER_RELAY_URL=https://codex-dispatcher.app codex-dispatcher login
+```
+
+Start the dispatcher through the relay:
+
+```bash
+codex-dispatcher --relay
+```
+
+Only one dispatcher can be active per GitHub user. To replace an existing active dispatcher non-interactively:
+
+```bash
+codex-dispatcher --relay --kill-existing
+```
+
+The relay stores GitHub users, browser sessions, and CLI devices in `RELAY_DATA_PATH`. Active dispatcher sockets are not persisted; after a relay restart, run `codex-dispatcher --relay` again.

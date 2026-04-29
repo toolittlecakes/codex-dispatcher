@@ -138,6 +138,12 @@ export class ExtensionWebviewSpike {
     let html = await Bun.file(indexPath).text();
     html = html.replace("<!-- PROD_BASE_TAG_HERE -->", `<base href="${routePrefix}/">`);
     html = html.replace("<!-- PROD_CSP_TAG_HERE -->", "");
+    const defaultViewportMeta = '<meta name="viewport" content="width=device-width, initial-scale=1.0" />';
+    if (html.includes(defaultViewportMeta)) {
+      html = html.replace(defaultViewportMeta, this.buildViewportMeta());
+    } else {
+      html = html.replace("<head>", `<head>\n${this.buildViewportMeta()}`);
+    }
     html = html.replace("<head>", `<head>\n${this.buildViewportStyle()}\n${this.buildShim(url.searchParams.get("token") ?? "")}`);
 
     const headers = new Headers({ "content-type": "text/html; charset=utf-8" });
@@ -146,6 +152,10 @@ export class ExtensionWebviewSpike {
     }
 
     return new Response(html, { headers });
+  }
+
+  private buildViewportMeta(): string {
+    return `<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover, interactive-widget=resizes-visual">`;
   }
 
   private async serveAsset(pathname: string): Promise<Response> {
@@ -170,7 +180,8 @@ export class ExtensionWebviewSpike {
     return `<style>
 html,
 body {
-  width: 100%;
+  width: var(--codex-dispatcher-viewport-width, 100vw) !important;
+  max-width: var(--codex-dispatcher-viewport-width, 100vw) !important;
   height: var(--codex-dispatcher-viewport-height, 100vh) !important;
   height: var(--codex-dispatcher-viewport-height, 100dvh) !important;
   max-height: var(--codex-dispatcher-viewport-height, 100vh) !important;
@@ -181,6 +192,17 @@ body {
   padding: 0;
   overflow: hidden !important;
   overscroll-behavior: none;
+  scrollbar-width: none;
+}
+
+html::-webkit-scrollbar,
+body::-webkit-scrollbar {
+  display: none;
+}
+
+body {
+  position: fixed !important;
+  inset: 0 auto auto 0 !important;
 }
 
 #root {
@@ -193,10 +215,15 @@ body {
   min-height: 0;
   overflow: hidden !important;
   position: fixed !important;
-  top: var(--codex-dispatcher-viewport-offset-top, 0px) !important;
-  left: var(--codex-dispatcher-viewport-offset-left, 0px) !important;
+  top: 0 !important;
+  left: 0 !important;
   right: auto !important;
   bottom: auto !important;
+  transform: translate3d(
+    var(--codex-dispatcher-viewport-offset-left, 0px),
+    var(--codex-dispatcher-viewport-offset-top, 0px),
+    0
+  ) !important;
 }
 </style>`;
   }
@@ -581,6 +608,11 @@ body {
     "--vscode-terminal-ansiBrightWhite": "#8c959f",
   };
   const root = document.documentElement;
+  const lockPageScroll = () => {
+    if (window.scrollX !== 0 || window.scrollY !== 0) {
+      window.scrollTo(0, 0);
+    }
+  };
   const applyViewportGeometry = () => {
     const viewport = window.visualViewport;
     const height = viewport?.height || window.innerHeight;
@@ -591,11 +623,14 @@ body {
     root.style.setProperty("--codex-dispatcher-viewport-width", Math.max(0, Math.floor(width)) + "px");
     root.style.setProperty("--codex-dispatcher-viewport-offset-top", Math.floor(offsetTop) + "px");
     root.style.setProperty("--codex-dispatcher-viewport-offset-left", Math.floor(offsetLeft) + "px");
+    lockPageScroll();
   };
   applyViewportGeometry();
   window.addEventListener("resize", applyViewportGeometry, { passive: true });
+  window.addEventListener("scroll", lockPageScroll, { passive: true });
   window.visualViewport?.addEventListener("resize", applyViewportGeometry, { passive: true });
   window.visualViewport?.addEventListener("scroll", applyViewportGeometry, { passive: true });
+  document.addEventListener("focusin", () => requestAnimationFrame(applyViewportGeometry), true);
   if (token) {
     const cleanUrl = new URL(window.location.href);
     cleanUrl.searchParams.delete("token");

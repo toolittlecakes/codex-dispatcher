@@ -11,6 +11,7 @@
     "doctor": "bun run src/cli.ts doctor",
     "build:binary": "bun build --compile --target=bun --outfile=dist/codex-dispatcher src/cli.ts",
     "dev": "bun run src/server.ts",
+    "dev:relay": "bun run src/relay-server.ts",
     "dev:tunnel": "bun run src/cli.ts",
     "test": "bun test",
     "typecheck": "tsc --noEmit"
