@@ -64,7 +64,7 @@ describe("extension webview", () => {
       expect(html).toContain('name="viewport"');
       expect(html).toContain("maximum-scale=1");
       expect(html).toContain("user-scalable=no");
-      expect(html).toContain("interactive-widget=overlays-content");
+      expect(html).toContain("interactive-widget=resizes-visual");
       expect(html).toContain("#root");
       expect(html).toContain("overflow: hidden !important");
       expect(html).toContain("-webkit-text-size-adjust: 100% !important");
@@ -79,6 +79,8 @@ describe("extension webview", () => {
       expect(html).toContain("stableViewportHeight");
       expect(html).toContain("keyboardLikelyOpen");
       expect(html).toContain("enforceNoZoom");
+      expect(html).toContain("scheduleViewportGeometry");
+      expect(html).toContain("Math.floor(viewport.height)");
       expect(html).toContain("offsetTop");
       expect(html).toContain("lockPageScroll");
       expect(html).toContain("visualViewport");

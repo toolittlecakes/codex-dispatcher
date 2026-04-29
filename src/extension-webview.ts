@@ -239,7 +239,7 @@ export class ExtensionWebview {
   }
 
   private buildViewportMeta(): string {
-    return `<meta name="viewport" content="width=device-width, initial-scale=1, minimum-scale=1, maximum-scale=1, user-scalable=no, viewport-fit=cover, interactive-widget=overlays-content">`;
+    return `<meta name="viewport" content="width=device-width, initial-scale=1, minimum-scale=1, maximum-scale=1, user-scalable=no, viewport-fit=cover, interactive-widget=resizes-visual">`;
   }
 
   private async serveAsset(pathname: string): Promise<Response> {
@@ -842,15 +842,22 @@ select,
       window.scrollTo(0, 0);
     }
   };
+  const scheduleViewportGeometry = () => {
+    requestAnimationFrame(applyViewportGeometry);
+    setTimeout(applyViewportGeometry, 250);
+  };
   const applyViewportGeometry = () => {
     const viewport = window.visualViewport;
     const layoutHeight = Math.max(0, Math.floor(readLayoutHeight()));
     const layoutWidth = Math.max(0, Math.floor(readLayoutWidth()));
-    if (!keyboardLikelyOpen()) {
+    const keyboardOpen = keyboardLikelyOpen();
+    if (!keyboardOpen) {
       stableViewportHeight = layoutHeight;
       stableViewportWidth = layoutWidth;
     }
-    const height = stableViewportHeight || layoutHeight;
+    const height = keyboardOpen && viewport
+      ? Math.max(0, Math.floor(viewport.height))
+      : stableViewportHeight || layoutHeight;
     const width = stableViewportWidth || layoutWidth;
     const offsetTop = viewport?.offsetTop || 0;
     const offsetLeft = viewport?.offsetLeft || 0;
@@ -866,8 +873,8 @@ select,
   window.addEventListener("scroll", lockPageScroll, { passive: true });
   window.visualViewport?.addEventListener("resize", applyViewportGeometry, { passive: true });
   window.visualViewport?.addEventListener("scroll", applyViewportGeometry, { passive: true });
-  document.addEventListener("focusin", () => requestAnimationFrame(applyViewportGeometry), true);
-  document.addEventListener("focusout", () => requestAnimationFrame(applyViewportGeometry), true);
+  document.addEventListener("focusin", scheduleViewportGeometry, true);
+  document.addEventListener("focusout", scheduleViewportGeometry, true);
   if (token) {
     const cleanUrl = new URL(window.location.href);
     cleanUrl.searchParams.delete("token");
