@@ -2,6 +2,7 @@ import { existsSync, readFileSync, readdirSync } from "node:fs";
 import { homedir, platform, release } from "node:os";
 import { basename, dirname, join, resolve, sep } from "node:path";
 import type { CodexAppServer, CodexAppServerEvent, JsonObject, JsonValue } from "./codex-app-server";
+import type { IpcBroadcastMessage } from "./codex-ipc";
 
 type HostMessage = JsonObject & {
   type?: string;
@@ -13,12 +14,19 @@ type HostMessage = JsonObject & {
   body?: string;
   method?: string;
   workerId?: string;
+  hostId?: string;
+  conversationId?: string;
+  params?: JsonValue;
 };
 
 type ExtensionWebviewOptions = {
   appServer: CodexAppServer;
   defaultCwd: string;
   getToken: () => string;
+  handleIpcRequest?: (method: string, params: JsonValue, targetClientId?: string) => Promise<JsonValue>;
+  getThreadRole?: (conversationId: string) => string | Promise<string>;
+  handleFollowerRequest?: (method: string, params: JsonValue) => Promise<JsonValue>;
+  handleThreadStreamSnapshotRequest?: (hostId: string, conversationId: string) => Promise<void> | void;
 };
 
 type SseClient = {
@@ -41,11 +49,73 @@ const maxDiagnosticMessages = 200;
 const globalState = new Map<string, JsonValue>();
 const persistedAtomState = new Map<string, JsonValue>();
 const sharedObjectState = new Map<string, JsonValue>();
+const followerRequestTypes: Record<string, { method: string; responseType: string }> = {
+  "thread-follower-start-turn-request": {
+    method: "thread-follower-start-turn",
+    responseType: "thread-follower-start-turn-response",
+  },
+  "thread-follower-compact-thread-request": {
+    method: "thread-follower-compact-thread",
+    responseType: "thread-follower-compact-thread-response",
+  },
+  "thread-follower-steer-turn-request": {
+    method: "thread-follower-steer-turn",
+    responseType: "thread-follower-steer-turn-response",
+  },
+  "thread-follower-interrupt-turn-request": {
+    method: "thread-follower-interrupt-turn",
+    responseType: "thread-follower-interrupt-turn-response",
+  },
+  "thread-follower-set-model-and-reasoning-request": {
+    method: "thread-follower-set-model-and-reasoning",
+    responseType: "thread-follower-set-model-and-reasoning-response",
+  },
+  "thread-follower-set-collaboration-mode-request": {
+    method: "thread-follower-set-collaboration-mode",
+    responseType: "thread-follower-set-collaboration-mode-response",
+  },
+  "thread-follower-edit-last-user-turn-request": {
+    method: "thread-follower-edit-last-user-turn",
+    responseType: "thread-follower-edit-last-user-turn-response",
+  },
+  "thread-follower-command-approval-decision-request": {
+    method: "thread-follower-command-approval-decision",
+    responseType: "thread-follower-command-approval-decision-response",
+  },
+  "thread-follower-file-approval-decision-request": {
+    method: "thread-follower-file-approval-decision",
+    responseType: "thread-follower-file-approval-decision-response",
+  },
+  "thread-follower-permissions-request-approval-response-request": {
+    method: "thread-follower-permissions-request-approval-response",
+    responseType: "thread-follower-permissions-request-approval-response-response",
+  },
+  "thread-follower-submit-user-input-request": {
+    method: "thread-follower-submit-user-input",
+    responseType: "thread-follower-submit-user-input-response",
+  },
+  "thread-follower-submit-mcp-server-elicitation-response-request": {
+    method: "thread-follower-submit-mcp-server-elicitation-response",
+    responseType: "thread-follower-submit-mcp-server-elicitation-response-response",
+  },
+  "thread-follower-set-queued-follow-ups-state-request": {
+    method: "thread-follower-set-queued-follow-ups-state",
+    responseType: "thread-follower-set-queued-follow-ups-state-response",
+  },
+};
 
 export class ExtensionWebview {
   private readonly appServer: CodexAppServer;
   private readonly defaultCwd: string;
   private readonly getToken: () => string;
+  private readonly handleIpcRequest:
+    | ((method: string, params: JsonValue, targetClientId?: string) => Promise<JsonValue>)
+    | undefined;
+  private readonly getThreadRole: ((conversationId: string) => string | Promise<string>) | undefined;
+  private readonly handleFollowerRequest: ((method: string, params: JsonValue) => Promise<JsonValue>) | undefined;
+  private readonly handleThreadStreamSnapshotRequest:
+    | ((hostId: string, conversationId: string) => Promise<void> | void)
+    | undefined;
   private readonly clients = new Map<string, SseClient>();
   private readonly startedAt = new Date().toISOString();
   private readonly messageCounts = new Map<string, number>();
@@ -58,6 +128,10 @@ export class ExtensionWebview {
     this.appServer = options.appServer;
     this.defaultCwd = options.defaultCwd;
     this.getToken = options.getToken;
+    this.handleIpcRequest = options.handleIpcRequest;
+    this.getThreadRole = options.getThreadRole;
+    this.handleFollowerRequest = options.handleFollowerRequest;
+    this.handleThreadStreamSnapshotRequest = options.handleThreadStreamSnapshotRequest;
     this.webviewRoot = resolveExtensionWebviewRoot();
   }
 
@@ -91,6 +165,16 @@ export class ExtensionWebview {
     }
 
     return this.serveAsset(url.pathname);
+  }
+
+  handleIpcBroadcast(broadcastMessage: IpcBroadcastMessage): void {
+    this.broadcast({
+      type: "ipc-broadcast",
+      method: broadcastMessage.method,
+      sourceClientId: broadcastMessage.sourceClientId,
+      version: broadcastMessage.version,
+      params: broadcastMessage.params,
+    });
   }
 
   handleAppServerEvent(event: CodexAppServerEvent): void {
@@ -178,6 +262,13 @@ export class ExtensionWebview {
 
   private buildViewportStyle(): string {
     return `<style>
+html {
+  -webkit-text-size-adjust: 100% !important;
+  text-size-adjust: 100% !important;
+  font-size: 16px !important;
+  --codex-window-zoom: 1 !important;
+}
+
 html,
 body {
   width: var(--codex-dispatcher-viewport-width, 100vw) !important;
@@ -193,6 +284,11 @@ body {
   overflow: hidden !important;
   overscroll-behavior: none;
   scrollbar-width: none;
+}
+
+body,
+#root {
+  zoom: 1 !important;
 }
 
 html::-webkit-scrollbar,
@@ -323,8 +419,70 @@ body {
         return [];
 
       default:
+        if (message.type && message.type in followerRequestTypes) {
+          return [await this.handleThreadFollowerRequest(message)];
+        }
+        if (message.type === "thread-role-request") {
+          return [await this.handleThreadRoleRequest(message)];
+        }
+        if (message.type === "thread-stream-snapshot-request") {
+          await this.handleThreadStreamSnapshotMessage(message);
+          return [];
+        }
+        if (message.type === "thread-stream-resume-request") {
+          return [];
+        }
         return [];
     }
+  }
+
+  private async handleThreadFollowerRequest(message: HostMessage): Promise<JsonObject> {
+    const requestType = message.type ?? "";
+    const request = followerRequestTypes[requestType];
+    const requestId = typeof message.requestId === "string" ? message.requestId : "";
+    if (!request) {
+      return { type: "thread-follower-request-response", requestId, error: `Unsupported follower request: ${requestType}` };
+    }
+
+    try {
+      if (!this.handleFollowerRequest) {
+        throw new Error("IPC follower bridge is unavailable");
+      }
+      const result = await this.handleFollowerRequest(request.method, message.params ?? {});
+      return { type: request.responseType, requestId, result };
+    } catch (error) {
+      return {
+        type: request.responseType,
+        requestId,
+        error: error instanceof Error ? error.message : String(error),
+      };
+    }
+  }
+
+  private async handleThreadRoleRequest(message: HostMessage): Promise<JsonObject> {
+    const requestId = typeof message.requestId === "string" ? message.requestId : "";
+    const conversationId = typeof message.conversationId === "string" ? message.conversationId : "";
+    try {
+      const role = this.getThreadRole ? await this.getThreadRole(conversationId) : "follower";
+      return { type: "thread-role-response", requestId, role };
+    } catch (error) {
+      return {
+        type: "thread-role-response",
+        requestId,
+        role: "follower",
+        error: error instanceof Error ? error.message : String(error),
+      };
+    }
+  }
+
+  private async handleThreadStreamSnapshotMessage(message: HostMessage): Promise<void> {
+    if (!this.handleThreadStreamSnapshotRequest) {
+      return;
+    }
+    if (typeof message.hostId !== "string" || typeof message.conversationId !== "string") {
+      return;
+    }
+    await this.handleThreadStreamSnapshotRequest(message.hostId, message.conversationId);
   }
 
   private async handleFetchMessage(message: HostMessage): Promise<JsonObject> {
@@ -333,6 +491,10 @@ body {
       if (typeof message.url === "string" && message.url.startsWith("vscode://codex/")) {
         const endpoint = parseVSCodeCodexEndpoint(message.url);
         const body = parseOptionalBody(message.body);
+        if (endpoint === "ipc-request") {
+          const result = await this.handleVSCodeIpcRequest(body);
+          return makeFetchResponse({ requestId, result });
+        }
         const result = await handleVSCodeRequest(endpoint, body, this.defaultCwd);
         return makeFetchResponse({ requestId, result });
       }
@@ -398,6 +560,17 @@ body {
     };
     this.experimentalEnablementSetResults.set(key, result);
     return result;
+  }
+
+  private async handleVSCodeIpcRequest(body: JsonValue): Promise<JsonValue> {
+    if (!this.handleIpcRequest) {
+      throw new Error("IPC request bridge is unavailable");
+    }
+
+    const params = requireObject(body, "ipc-request params");
+    const method = requireString(params.method, "method");
+    const targetClientId = typeof params.targetClientId === "string" ? params.targetClientId : undefined;
+    return this.handleIpcRequest(method, params.params ?? {}, targetClientId);
   }
 
   private handleMcpNotification(message: HostMessage): void {
@@ -1249,6 +1422,21 @@ function compareExtensionRoots(left: string, right: string): number {
 function asObject(value: JsonValue | undefined): JsonObject | null {
   if (typeof value !== "object" || value === null || Array.isArray(value)) {
     return null;
+  }
+  return value;
+}
+
+function requireObject(value: JsonValue | undefined, name: string): JsonObject {
+  const object = asObject(value);
+  if (!object) {
+    throw new Error(`Invalid ${name}: expected object`);
+  }
+  return object;
+}
+
+function requireString(value: JsonValue | undefined, name: string): string {
+  if (typeof value !== "string" || value.length === 0) {
+    throw new Error(`Invalid ${name}: expected non-empty string`);
   }
   return value;
 }

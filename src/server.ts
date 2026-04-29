@@ -57,6 +57,11 @@ const extensionWebview = new ExtensionWebview({
   appServer,
   defaultCwd,
   getToken: () => dispatcherToken,
+  handleIpcRequest: (method, params, targetClientId) => handleExtensionIpcRequest(method, params, targetClientId),
+  getThreadRole: (conversationId) => extensionThreadRole(conversationId),
+  handleFollowerRequest: (method, params) => handleExtensionFollowerRequest(method, params),
+  handleThreadStreamSnapshotRequest: (hostId, conversationId) =>
+    handleExtensionThreadStreamSnapshotRequest(hostId, conversationId),
 });
 const clients = new Set<Bun.ServerWebSocket<WsData>>();
 const streamOwners = new Map<string, string>();
@@ -131,6 +136,7 @@ appServer.onEvent((event) => {
 
 ipcBridge.onEvent((event) => {
   if (event.type === "broadcast") {
+    extensionWebview.handleIpcBroadcast(event.broadcast);
     const ownersChanged = applyIpcBroadcastEffects(event.broadcast);
     broadcast({
       type: "codexIpcBroadcast",
@@ -770,6 +776,64 @@ function broadcastDispatcherOwnedSnapshot(threadId: string): void {
   ipcBridge.broadcast("thread-stream-state-changed", buildDispatcherSnapshotParams(threadId, conversation));
 }
 
+function extensionThreadRole(threadId: string): string {
+  return dispatcherOwnedConversations.has(threadId) ? "owner" : "follower";
+}
+
+async function handleExtensionIpcRequest(
+  method: string,
+  params: JsonValue,
+  targetClientId: string | undefined,
+): Promise<JsonValue> {
+  if (dispatcherOwnerRequestMethods.has(method) && canHandleDispatcherOwnerRequest(method, params)) {
+    return handleDispatcherOwnerRequest(method, params);
+  }
+
+  const response = await ipcBridge.request(method, params, targetClientId ? { targetClientId } : {});
+  if (response.resultType === "error") {
+    throw new Error(response.error ?? `${method} failed`);
+  }
+
+  return response.result ?? { ok: true };
+}
+
+async function handleExtensionFollowerRequest(method: string, params: JsonValue): Promise<JsonValue> {
+  const threadId = requestThreadId({ params });
+  const ownerClientId = threadId ? streamOwners.get(threadId) : null;
+  if (!ownerClientId) {
+    throw new Error(`No IPC owner for thread ${threadId ?? "unknown"}`);
+  }
+
+  const response = await ipcBridge.request(method, params, { targetClientId: ownerClientId });
+  if (response.resultType === "error") {
+    throw new Error(response.error ?? `${method} failed`);
+  }
+
+  return response.result ?? { ok: true };
+}
+
+function handleExtensionThreadStreamSnapshotRequest(hostId: string, threadId: string): void {
+  const conversation = mirroredConversations.get(threadId);
+  const ownerClientId = streamOwners.get(threadId);
+  if (!conversation || !ownerClientId) {
+    return;
+  }
+
+  extensionWebview.handleIpcBroadcast({
+    type: "broadcast",
+    method: "thread-stream-state-changed",
+    sourceClientId: ownerClientId,
+    params: {
+      conversationId: threadId,
+      hostId,
+      change: {
+        type: "snapshot",
+        conversationState: conversation,
+      },
+    },
+  });
+}
+
 function updateDispatcherOwnedConversation(threadId: string, update: (conversation: JsonObject) => void): void {
   const current = dispatcherOwnedConversations.get(threadId) ?? minimalDispatcherConversation(threadId);
   const next = cloneJsonObject(current);
@@ -826,7 +890,10 @@ function notificationThreadId(notification: JsonObject): string | null {
 
 function requestThreadId(request: { params: JsonValue }): string | null {
   const params = asJsonObject(request.params);
-  return typeof params?.threadId === "string" ? params.threadId : null;
+  if (typeof params?.threadId === "string") {
+    return params.threadId;
+  }
+  return typeof params?.conversationId === "string" ? params.conversationId : null;
 }
 
 function findInProgressTurnId(conversation: JsonObject | undefined): string | null {
