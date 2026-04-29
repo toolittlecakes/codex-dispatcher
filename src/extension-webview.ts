@@ -23,6 +23,7 @@ type ExtensionWebviewOptions = {
   appServer: CodexAppServer;
   defaultCwd: string;
   getToken: () => string;
+  getEventReplayMessages?: () => JsonObject[];
   statePath?: string;
   assertThreadFollowerOwner?: (conversationId: string) => Promise<void> | void;
   handleIpcRequest?: (method: string, params: JsonValue, targetClientId?: string) => Promise<JsonValue>;
@@ -131,6 +132,7 @@ export class ExtensionWebview {
   private readonly appServer: CodexAppServer;
   private readonly defaultCwd: string;
   private readonly getToken: () => string;
+  private readonly getEventReplayMessages: (() => JsonObject[]) | undefined;
   private readonly assertThreadFollowerOwner: ((conversationId: string) => Promise<void> | void) | undefined;
   private readonly handleIpcRequest:
     | ((method: string, params: JsonValue, targetClientId?: string) => Promise<JsonValue>)
@@ -152,6 +154,7 @@ export class ExtensionWebview {
     this.appServer = options.appServer;
     this.defaultCwd = options.defaultCwd;
     this.getToken = options.getToken;
+    this.getEventReplayMessages = options.getEventReplayMessages;
     this.assertThreadFollowerOwner = options.assertThreadFollowerOwner;
     this.handleIpcRequest = options.handleIpcRequest;
     this.getThreadRole = options.getThreadRole;
@@ -731,6 +734,9 @@ select,
         }, 5_000);
         this.clients.set(clientId, { id: clientId, controller, heartbeat });
         controller.enqueue(encoder.encode(": connected\n\n"));
+        for (const message of this.getEventReplayMessages?.() ?? []) {
+          controller.enqueue(encodeSseMessage(message));
+        }
       },
       cancel: () => {
         if (clientId) {
@@ -753,7 +759,7 @@ select,
 
   private broadcast(message: JsonObject): void {
     this.recordMessage("outbound", message);
-    const payload = encoder.encode(`data: ${JSON.stringify(message)}\n\n`);
+    const payload = encodeSseMessage(message);
     for (const client of this.clients.values()) {
       try {
         client.controller.enqueue(payload);
@@ -1643,6 +1649,10 @@ function jsonResponse(value: JsonValue, status = 200): Response {
     status,
     headers: { "content-type": "application/json; charset=utf-8" },
   });
+}
+
+function encodeSseMessage(message: JsonObject): Uint8Array {
+  return encoder.encode(`data: ${JSON.stringify(message)}\n\n`);
 }
 
 function authCookie(token: string): string {

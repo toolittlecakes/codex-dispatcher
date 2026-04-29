@@ -14,6 +14,9 @@ type DispatcherWsData = {
 type PendingRequest = {
   controller: ReadableStreamDefaultController<Uint8Array> | null;
   closed: boolean;
+  dispatcherSessionId: string;
+  cancelDispatcherRequest: () => void;
+  timeout: ReturnType<typeof setTimeout>;
   resolve: (response: Response) => void;
   reject: (error: Error) => void;
 };
@@ -86,6 +89,7 @@ const relayServer = Bun.serve<DispatcherWsData>({
       }
       dispatcherSocketsBySessionId.delete(session.id);
       state.disconnectDispatcher(session.userId, session.id);
+      closePendingRequestsForDispatcher(session.id);
     },
     message(_ws, raw) {
       handleDispatcherFrame(raw.toString());
@@ -263,12 +267,20 @@ async function proxyThroughDispatcher(
 
   const responsePromise = new Promise<Response>((resolve, reject) => {
     const startTimeout = setTimeout(() => {
+      const pending = pendingRequestsById.get(requestId);
+      if (pending) {
+        pending.closed = true;
+        pending.cancelDispatcherRequest();
+      }
       pendingRequestsById.delete(requestId);
       resolve(new Response("Dispatcher response timed out.", { status: 504 }));
     }, 30_000);
     pendingRequestsById.set(requestId, {
       controller: null,
       closed: false,
+      dispatcherSessionId: ws.data.session?.id ?? "",
+      cancelDispatcherRequest: () => sendFrame(ws, { type: "http-request-cancel", requestId }),
+      timeout: startTimeout,
       resolve: (response) => {
         clearTimeout(startTimeout);
         resolve(response);
@@ -279,6 +291,7 @@ async function proxyThroughDispatcher(
       },
     });
   });
+  request.signal.addEventListener("abort", () => cancelPendingRequest(requestId), { once: true });
 
   ws.send(encodeRelayFrame({
     type: "http-request",
@@ -290,6 +303,17 @@ async function proxyThroughDispatcher(
   }));
 
   return responsePromise;
+}
+
+function cancelPendingRequest(requestId: string): void {
+  const pending = pendingRequestsById.get(requestId);
+  if (!pending || pending.closed) {
+    return;
+  }
+  pending.closed = true;
+  clearTimeout(pending.timeout);
+  pending.cancelDispatcherRequest();
+  pendingRequestsById.delete(requestId);
 }
 
 function handleDispatcherFrame(raw: string): void {
@@ -305,7 +329,11 @@ function handleDispatcherFrame(raw: string): void {
           pending.controller = controller;
         },
         cancel() {
+          if (pending.closed) {
+            return;
+          }
           pending.closed = true;
+          pending.cancelDispatcherRequest();
           pendingRequestsById.delete(frame.requestId);
         },
       }), {
@@ -323,6 +351,7 @@ function handleDispatcherFrame(raw: string): void {
         pending.controller.enqueue(Buffer.from(frame.bodyBase64, "base64"));
       } catch {
         pending.closed = true;
+        pending.cancelDispatcherRequest();
         pendingRequestsById.delete(frame.requestId);
       }
       return;
@@ -356,6 +385,30 @@ function handleDispatcherFrame(raw: string): void {
     default:
       return;
   }
+}
+
+function closePendingRequestsForDispatcher(sessionId: string): void {
+  for (const [requestId, pending] of pendingRequestsById.entries()) {
+    if (pending.dispatcherSessionId !== sessionId) {
+      continue;
+    }
+    pending.closed = true;
+    clearTimeout(pending.timeout);
+    pendingRequestsById.delete(requestId);
+    if (pending.controller) {
+      try {
+        pending.controller.error(new Error("Dispatcher connection closed."));
+      } catch {
+        // The browser side may already have closed the stream.
+      }
+      continue;
+    }
+    pending.reject(new Error("Dispatcher connection closed."));
+  }
+}
+
+function sendFrame(ws: Bun.ServerWebSocket<DispatcherWsData>, frame: RelayFrame): void {
+  ws.send(encodeRelayFrame(frame));
 }
 
 async function fetchGitHubUser(token: string): Promise<GitHubIdentity> {

@@ -57,6 +57,7 @@ const extensionWebview = new ExtensionWebview({
   appServer,
   defaultCwd,
   getToken: () => dispatcherToken,
+  getEventReplayMessages: () => buildExtensionEventReplayMessages(),
   assertThreadFollowerOwner: (conversationId) => assertExtensionFollowerOwner(conversationId),
   handleIpcRequest: (method, params, targetClientId) => handleExtensionIpcRequest(method, params, targetClientId),
   getThreadRole: (conversationId) => extensionThreadRole(conversationId),
@@ -775,6 +776,62 @@ function broadcastDispatcherOwnedSnapshot(threadId: string): void {
   }
 
   ipcBridge.broadcast("thread-stream-state-changed", buildDispatcherSnapshotParams(threadId, conversation));
+}
+
+function buildExtensionEventReplayMessages(): JsonObject[] {
+  const messages: JsonObject[] = [];
+  for (const [threadId, conversation] of mirroredConversations.entries()) {
+    const ownerClientId = streamOwners.get(threadId);
+    if (!ownerClientId) {
+      continue;
+    }
+    messages.push(buildThreadStreamSnapshotMessage(threadId, ownerClientId, conversation));
+  }
+
+  const dispatcherClientId = ipcBridge.getSnapshot().clientId;
+  if (!dispatcherClientId) {
+    return messages;
+  }
+
+  for (const [threadId, conversation] of dispatcherOwnedConversations.entries()) {
+    messages.push({
+      type: "ipc-broadcast",
+      method: "thread-stream-state-changed",
+      sourceClientId: dispatcherClientId,
+      version: 6,
+      params: buildDispatcherSnapshotParams(threadId, conversation),
+    });
+  }
+
+  return messages;
+}
+
+function buildThreadStreamSnapshotMessage(
+  threadId: string,
+  sourceClientId: string,
+  conversation: JsonObject,
+): JsonObject {
+  const hostId = typeof conversation.hostId === "string" ? conversation.hostId : dispatcherIpcHostId;
+  const conversationState = {
+    ...cloneJsonObject(conversation),
+    id: threadId,
+    hostId,
+  };
+
+  return {
+    type: "ipc-broadcast",
+    method: "thread-stream-state-changed",
+    sourceClientId,
+    version: 6,
+    params: {
+      conversationId: threadId,
+      hostId,
+      change: {
+        type: "snapshot",
+        conversationState,
+      },
+    },
+  };
 }
 
 function extensionThreadRole(threadId: string): string {

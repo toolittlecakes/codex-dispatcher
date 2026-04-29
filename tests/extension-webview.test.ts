@@ -332,6 +332,65 @@ describe("extension webview", () => {
     }
   });
 
+  test("replays current thread stream snapshots to new event clients", async () => {
+    const previousRoot = process.env.CODEX_EXTENSION_WEBVIEW_ROOT;
+    const root = mkdtempSync(join(tmpdir(), "codex-webview-events-"));
+    process.env.CODEX_EXTENSION_WEBVIEW_ROOT = root;
+    writeFileSync(join(root, "index.html"), "<html><head></head><body></body></html>");
+
+    try {
+      const replayMessage = {
+        type: "ipc-broadcast",
+        method: "thread-stream-state-changed",
+        sourceClientId: "vscode-client",
+        version: 6,
+        params: {
+          conversationId: "thread-1",
+          hostId: "vscode",
+          change: {
+            type: "snapshot",
+            conversationState: { id: "thread-1", hostId: "vscode", turns: [] },
+          },
+        },
+      };
+      const webview = new ExtensionWebview({
+        appServer: {} as never,
+        defaultCwd: "/repo",
+        getToken: () => "secret",
+        getEventReplayMessages: () => [replayMessage],
+      });
+
+      const response = await webview.fetch(
+        new Request("http://localhost/events", {
+          headers: { cookie: "codex_dispatcher_session=secret" },
+        }),
+        new URL("http://localhost/events"),
+      );
+      expect(response.status).toBe(200);
+
+      const reader = response.body?.getReader();
+      expect(reader).toBeDefined();
+      let text = "";
+      for (let index = 0; index < 3 && !text.includes("thread-stream-state-changed"); index += 1) {
+        const chunk = await reader?.read();
+        if (chunk?.value) {
+          text += new TextDecoder().decode(chunk.value);
+        }
+      }
+      await reader?.cancel();
+
+      expect(text).toContain(": connected");
+      expect(text).toContain(`data: ${JSON.stringify(replayMessage)}`);
+    } finally {
+      if (previousRoot === undefined) {
+        delete process.env.CODEX_EXTENSION_WEBVIEW_ROOT;
+      } else {
+        process.env.CODEX_EXTENSION_WEBVIEW_ROOT = previousRoot;
+      }
+      rmSync(root, { recursive: true, force: true });
+    }
+  });
+
   test("persists extension host state across webview host restarts", async () => {
     const previousRoot = process.env.CODEX_EXTENSION_WEBVIEW_ROOT;
     const root = mkdtempSync(join(tmpdir(), "codex-webview-state-"));

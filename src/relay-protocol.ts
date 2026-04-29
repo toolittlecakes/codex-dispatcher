@@ -31,6 +31,11 @@ export type RelayHttpResponseErrorFrame = {
   error: string;
 };
 
+export type RelayHttpRequestCancelFrame = {
+  type: "http-request-cancel";
+  requestId: string;
+};
+
 export type RelayHeartbeatFrame = {
   type: "dispatcher-heartbeat";
   sentAt: number;
@@ -54,6 +59,7 @@ export type RelayFrame =
   | RelayHttpResponseChunkFrame
   | RelayHttpResponseEndFrame
   | RelayHttpResponseErrorFrame
+  | RelayHttpRequestCancelFrame
   | RelayHeartbeatFrame
   | RelayControlFrame;
 
@@ -99,6 +105,11 @@ export function decodeRelayFrame(raw: string | Buffer): RelayFrame {
         type: "http-response-error",
         requestId: requiredString(value.requestId, "requestId"),
         error: requiredString(value.error, "error"),
+      };
+    case "http-request-cancel":
+      return {
+        type: "http-request-cancel",
+        requestId: requiredString(value.requestId, "requestId"),
       };
     case "dispatcher-heartbeat":
       return {

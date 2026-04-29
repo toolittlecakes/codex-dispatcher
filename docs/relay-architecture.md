@@ -87,6 +87,8 @@ When `--kill-existing` is set, the relay closes the previous dispatcher session 
 - Browser user has no active dispatcher: relay shows a visible "dispatcher offline" page.
 - Relay-to-dispatcher HTTP proxy exceeds the explicit timeout: relay returns `504`, not an unhandled server error.
 - Browser closes a streamed response while dispatcher chunks are still in flight: relay drops the late chunks instead of crashing.
+- Browser/relay closes a proxied request: relay sends `http-request-cancel` so the CLI aborts the local dispatcher fetch.
+- Browser reconnects to `/events`: dispatcher replays current `thread-stream-state-changed` snapshots for mirrored threads before waiting for new live patches.
 
 ## Environment
 
@@ -110,6 +112,10 @@ dispatcher proxy timeout: 30 seconds
 ```
 
 This keeps slow app-server requests under dispatcher control and avoids Bun's default 10-second HTTP idle timeout turning valid but slow host messages into generic `502` responses.
+
+Long-lived streams, especially `/events`, must support cancellation in both directions. Otherwise browser reconnects can leave stale local EventSource streams behind and cause live thread updates to drift.
+
+Thread stream updates also need replay on reconnect. Native Codex sends patch events relative to the latest conversation state; if a mobile browser misses a patch while the relay reconnects, the next live patch may no longer be enough to reconstruct the current UI. The dispatcher keeps the current mirrored conversation state and sends it as a snapshot to each new event client.
 
 CLI:
 

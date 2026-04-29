@@ -38,6 +38,8 @@ Relay HTTP timeout decisions:
 - HTTP idle timeout is 60 seconds.
 - Dispatcher proxy timeout is 30 seconds.
 - Late dispatcher response chunks for browser-canceled streams are ignored.
+- Browser-canceled proxied requests are forwarded to the CLI as `http-request-cancel`, so local `/events` streams are aborted instead of leaking.
+- Reconnected `/events` clients receive current mirrored thread snapshots before live patches resume.
 
 These choices keep slow app-server requests as explicit relay failures instead of generic `502` crashes or Bun's default 10-second idle timeout.
 

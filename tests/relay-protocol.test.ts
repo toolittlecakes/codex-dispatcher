@@ -27,6 +27,10 @@ describe("relay protocol", () => {
         type: "http-response-end",
         requestId: "req-1",
       },
+      {
+        type: "http-request-cancel",
+        requestId: "req-1",
+      },
     ];
 
     expect(frames.map((frame) => decodeRelayFrame(encodeRelayFrame(frame)))).toEqual(frames);

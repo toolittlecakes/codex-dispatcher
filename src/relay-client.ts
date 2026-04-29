@@ -3,6 +3,7 @@ import {
   encodeRelayFrame,
   type RelayControlFrame,
   type RelayFrame,
+  type RelayHttpRequestCancelFrame,
   type RelayHttpRequestFrame,
 } from "./relay-protocol";
 
@@ -36,6 +37,7 @@ export function startRelayClient(options: RelayClientOptions): Promise<RelayClie
     let reconnectTimer: ReturnType<typeof setTimeout> | null = null;
     let heartbeatTimer: ReturnType<typeof setInterval> | null = null;
     let ws: WebSocket | null = null;
+    const activeRequests = new Map<string, AbortController>();
 
     const stopHeartbeat = () => {
       if (heartbeatTimer) {
@@ -64,13 +66,20 @@ export function startRelayClient(options: RelayClientOptions): Promise<RelayClie
       }, delay);
     };
 
+    const abortActiveRequests = () => {
+      for (const controller of activeRequests.values()) {
+        controller.abort();
+      }
+      activeRequests.clear();
+    };
+
     const connect = (killExisting: boolean) => {
       stopHeartbeat();
       const socket = new WebSocket(dispatcherWebSocketUrl({ ...options, killExisting }));
       ws = socket;
 
       socket.addEventListener("message", (event) => {
-        void handleRelayMessage(options, socket, event.data).then((controlFrame) => {
+        void handleRelayMessage(options, socket, event.data, activeRequests).then((controlFrame) => {
           if (!controlFrame) {
             return;
           }
@@ -93,6 +102,7 @@ export function startRelayClient(options: RelayClientOptions): Promise<RelayClie
                     reconnectTimer = null;
                   }
                   stopHeartbeat();
+                  abortActiveRequests();
                   ws?.close();
                 },
               });
@@ -130,6 +140,7 @@ export function startRelayClient(options: RelayClientOptions): Promise<RelayClie
         if (wasCurrentSocket) {
           ws = null;
           stopHeartbeat();
+          abortActiveRequests();
         }
         if (!settled) {
           settled = true;
@@ -160,6 +171,7 @@ async function handleRelayMessage(
   options: RelayClientOptions,
   ws: WebSocket,
   raw: string | Buffer,
+  activeRequests?: Map<string, AbortController>,
 ): Promise<RelayControlFrame | null> {
   const frame = decodeRelayFrame(raw);
   switch (frame.type) {
@@ -167,20 +179,34 @@ async function handleRelayMessage(
     case "dispatcher-rejected":
       return frame;
     case "http-request":
-      void forwardHttpRequest(options, ws, frame);
+      if (!activeRequests) {
+        throw new Error("Relay request map is unavailable.");
+      }
+      void forwardHttpRequest(options, ws, frame, activeRequests);
+      return null;
+    case "http-request-cancel":
+      handleHttpRequestCancel(frame, activeRequests);
       return null;
     default:
       return null;
   }
 }
 
-async function forwardHttpRequest(options: RelayClientOptions, ws: WebSocket, frame: RelayHttpRequestFrame): Promise<void> {
+async function forwardHttpRequest(
+  options: RelayClientOptions,
+  ws: WebSocket,
+  frame: RelayHttpRequestFrame,
+  activeRequests: Map<string, AbortController>,
+): Promise<void> {
+  const controller = new AbortController();
+  activeRequests.set(frame.requestId, controller);
   try {
     const headers = new Headers(frame.headers);
     headers.set("x-dispatcher-token", options.localDispatcherToken);
     const requestInit: RequestInit = {
       method: frame.method,
       headers,
+      signal: controller.signal,
     };
     if (frame.bodyBase64) {
       requestInit.body = Buffer.from(frame.bodyBase64, "base64");
@@ -213,12 +239,29 @@ async function forwardHttpRequest(options: RelayClientOptions, ws: WebSocket, fr
       requestId: frame.requestId,
     });
   } catch (error) {
+    if (controller.signal.aborted) {
+      return;
+    }
     sendFrame(ws, {
       type: "http-response-error",
       requestId: frame.requestId,
       error: error instanceof Error ? error.message : String(error),
     });
+  } finally {
+    activeRequests.delete(frame.requestId);
   }
+}
+
+function handleHttpRequestCancel(
+  frame: RelayHttpRequestCancelFrame,
+  activeRequests: Map<string, AbortController> | undefined,
+): void {
+  const controller = activeRequests?.get(frame.requestId);
+  if (!controller) {
+    return;
+  }
+  controller.abort();
+  activeRequests?.delete(frame.requestId);
 }
 
 function localRequestUrl(localBaseUrl: string, path: string): string {

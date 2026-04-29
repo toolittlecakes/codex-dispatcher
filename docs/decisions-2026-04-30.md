@@ -93,6 +93,8 @@ The relay connection is expected to survive common network and service restarts:
 - Relay HTTP idle timeout is 60 seconds.
 - Dispatcher proxy timeout is 30 seconds and returns `504`.
 - Late chunks from canceled browser streams are ignored.
+- Browser-canceled proxied requests are propagated to the CLI and abort the matching local fetch.
+- New `/events` clients receive replayed `thread-stream-state-changed` snapshots for current mirrored threads, so reconnecting browsers do not stay behind after missing live patches.
 
 The explicit failure state remains visible: if the laptop dispatcher process is not running, the relay returns `Dispatcher is offline.`
 

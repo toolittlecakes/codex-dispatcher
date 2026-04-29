@@ -1,5 +1,6 @@
 import { afterEach, describe, expect, test } from "bun:test";
 import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { connect } from "node:net";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { decodeRelayFrame, encodeRelayFrame, type RelayFrame } from "../src/relay-protocol";
@@ -44,6 +45,17 @@ describe("relay server", () => {
       expect(accepted.type).toBe("dispatcher-accepted");
 
       let requestId = "";
+      const cancelFramePromise = new Promise<void>((resolve, reject) => {
+        const timeout = setTimeout(() => reject(new Error("relay did not cancel browser request")), 5_000);
+        ws.addEventListener("message", (event) => {
+          const frame = decodeRelayFrame(String(event.data));
+          if (frame.type !== "http-request-cancel" || frame.requestId !== requestId) {
+            return;
+          }
+          clearTimeout(timeout);
+          resolve();
+        });
+      });
       const requestFramePromise = new Promise<void>((resolve, reject) => {
         const timeout = setTimeout(() => reject(new Error("relay did not proxy browser request")), 5_000);
         ws.addEventListener("message", (event) => {
@@ -68,19 +80,10 @@ describe("relay server", () => {
         });
       });
 
-      const response = await fetch(new URL("/stream", relayUrl), {
-        headers: {
-          cookie: `codex_dispatcher_session=${browserSessionToken}`,
-          host: `toolittlecakes.${baseHostname}`,
-        },
-      });
-      expect(response.status).toBe(200);
+      const browserClosed = closeRawHttpStreamAfterFirstChunk(new URL(relayUrl), "/stream");
       await requestFramePromise;
-
-      const reader = response.body?.getReader();
-      expect(reader).toBeDefined();
-      await reader?.read();
-      await reader?.cancel();
+      await browserClosed;
+      await cancelFramePromise;
 
       ws.send(encodeRelayFrame({
         type: "http-response-chunk",
@@ -126,6 +129,50 @@ function relayStateSnapshot(): unknown {
       lastLoginAt: 1,
     }],
   };
+}
+
+async function closeRawHttpStreamAfterFirstChunk(relayUrl: URL, path: string): Promise<void> {
+  await new Promise<void>((resolve, reject) => {
+    const port = Number(relayUrl.port);
+    const socket = connect(port, relayUrl.hostname);
+    let settled = false;
+    let received = "";
+    const timeout = setTimeout(() => {
+      finish(new Error("relay did not stream the first chunk"));
+    }, 5_000);
+
+    const finish = (error?: Error) => {
+      if (settled) {
+        return;
+      }
+      settled = true;
+      clearTimeout(timeout);
+      socket.destroy();
+      if (error) {
+        reject(error);
+        return;
+      }
+      resolve();
+    };
+
+    socket.on("connect", () => {
+      socket.write([
+        `GET ${path} HTTP/1.1`,
+        `Host: toolittlecakes.${baseHostname}`,
+        `Cookie: codex_dispatcher_session=${browserSessionToken}`,
+        "Connection: close",
+        "",
+        "",
+      ].join("\r\n"));
+    });
+    socket.on("data", (chunk) => {
+      received += chunk.toString("utf8");
+      if (received.includes("first")) {
+        finish();
+      }
+    });
+    socket.on("error", (error) => finish(error));
+  });
 }
 
 async function waitForRelayUrl(relay: Bun.Subprocess<"pipe", "pipe", "inherit">): Promise<string> {
