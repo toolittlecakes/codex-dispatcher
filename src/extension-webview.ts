@@ -239,7 +239,7 @@ export class ExtensionWebview {
   }
 
   private buildViewportMeta(): string {
-    return `<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover, interactive-widget=resizes-visual">`;
+    return `<meta name="viewport" content="width=device-width, initial-scale=1, minimum-scale=1, maximum-scale=1, user-scalable=no, viewport-fit=cover, interactive-widget=overlays-content">`;
   }
 
   private async serveAsset(pathname: string): Promise<Response> {
@@ -269,6 +269,14 @@ html {
   --codex-window-zoom: 1 !important;
 }
 
+*,
+*::before,
+*::after {
+  -webkit-text-size-adjust: 100% !important;
+  text-size-adjust: 100% !important;
+  zoom: 1 !important;
+}
+
 html,
 body {
   width: var(--codex-dispatcher-viewport-width, 100vw) !important;
@@ -284,11 +292,7 @@ body {
   overflow: hidden !important;
   overscroll-behavior: none;
   scrollbar-width: none;
-}
-
-body,
-#root {
-  zoom: 1 !important;
+  touch-action: manipulation;
 }
 
 html::-webkit-scrollbar,
@@ -320,6 +324,16 @@ body {
     var(--codex-dispatcher-viewport-offset-top, 0px),
     0
   ) !important;
+}
+
+input,
+textarea,
+select,
+[contenteditable="true"],
+.ProseMirror,
+.cm-editor,
+.cm-content {
+  font-size: max(16px, 1rem) !important;
 }
 </style>`;
   }
@@ -781,6 +795,48 @@ body {
     "--vscode-terminal-ansiBrightWhite": "#8c959f",
   };
   const root = document.documentElement;
+  const readLayoutWidth = () => document.documentElement.clientWidth || window.innerWidth;
+  const readLayoutHeight = () => document.documentElement.clientHeight || window.innerHeight;
+  let stableViewportWidth = Math.max(0, Math.floor(readLayoutWidth()));
+  let stableViewportHeight = Math.max(0, Math.floor(readLayoutHeight()));
+  const isEditableElement = (element) => {
+    if (!(element instanceof Element)) return false;
+    const tagName = element.tagName.toLowerCase();
+    return (
+      tagName === "input" ||
+      tagName === "textarea" ||
+      tagName === "select" ||
+      element.isContentEditable === true ||
+      element.closest('[contenteditable="true"], .ProseMirror, .cm-editor, .cm-content') !== null
+    );
+  };
+  const keyboardLikelyOpen = () => {
+    const viewport = window.visualViewport;
+    return (
+      Boolean(viewport) &&
+      isEditableElement(document.activeElement) &&
+      stableViewportHeight > 0 &&
+      viewport.height < stableViewportHeight - 80
+    );
+  };
+  const enforceNoZoom = () => {
+    root.style.setProperty("--codex-window-zoom", "1", "important");
+    root.style.zoom = "1";
+    root.style.webkitTextSizeAdjust = "100%";
+    root.style.textSizeAdjust = "100%";
+    const body = document.body;
+    if (body) {
+      body.style.zoom = "1";
+      body.style.webkitTextSizeAdjust = "100%";
+      body.style.textSizeAdjust = "100%";
+    }
+    const appRoot = document.getElementById("root");
+    if (appRoot) {
+      appRoot.style.zoom = "1";
+      appRoot.style.webkitTextSizeAdjust = "100%";
+      appRoot.style.textSizeAdjust = "100%";
+    }
+  };
   const lockPageScroll = () => {
     if (window.scrollX !== 0 || window.scrollY !== 0) {
       window.scrollTo(0, 0);
@@ -788,14 +844,21 @@ body {
   };
   const applyViewportGeometry = () => {
     const viewport = window.visualViewport;
-    const height = viewport?.height || window.innerHeight;
-    const width = viewport?.width || window.innerWidth;
+    const layoutHeight = Math.max(0, Math.floor(readLayoutHeight()));
+    const layoutWidth = Math.max(0, Math.floor(readLayoutWidth()));
+    if (!keyboardLikelyOpen()) {
+      stableViewportHeight = layoutHeight;
+      stableViewportWidth = layoutWidth;
+    }
+    const height = stableViewportHeight || layoutHeight;
+    const width = stableViewportWidth || layoutWidth;
     const offsetTop = viewport?.offsetTop || 0;
     const offsetLeft = viewport?.offsetLeft || 0;
     root.style.setProperty("--codex-dispatcher-viewport-height", Math.max(0, Math.floor(height)) + "px");
     root.style.setProperty("--codex-dispatcher-viewport-width", Math.max(0, Math.floor(width)) + "px");
     root.style.setProperty("--codex-dispatcher-viewport-offset-top", Math.floor(offsetTop) + "px");
     root.style.setProperty("--codex-dispatcher-viewport-offset-left", Math.floor(offsetLeft) + "px");
+    enforceNoZoom();
     lockPageScroll();
   };
   applyViewportGeometry();
@@ -804,6 +867,7 @@ body {
   window.visualViewport?.addEventListener("resize", applyViewportGeometry, { passive: true });
   window.visualViewport?.addEventListener("scroll", applyViewportGeometry, { passive: true });
   document.addEventListener("focusin", () => requestAnimationFrame(applyViewportGeometry), true);
+  document.addEventListener("focusout", () => requestAnimationFrame(applyViewportGeometry), true);
   if (token) {
     const cleanUrl = new URL(window.location.href);
     cleanUrl.searchParams.delete("token");
