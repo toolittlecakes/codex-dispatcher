@@ -5,7 +5,7 @@
 The production remote-access path is the owned relay at `codex-dispatcher.app`.
 
 ```bash
-CODEX_DISPATCHER_RELAY_URL=https://codex-dispatcher.app codex-dispatcher login
+codex-dispatcher login
 codex-dispatcher --relay --kill-existing
 ```
 
@@ -52,24 +52,39 @@ These choices keep slow app-server requests as explicit relay failures instead o
 
 No fallback relay is selected silently. The active remote path must be visible in CLI logs and UI.
 
+## Default path: local/LAN
+
+By default, the dispatcher does not start a tunnel:
+
+```bash
+codex-dispatcher
+```
+
+It prints local and LAN URLs:
+
+```text
+Local: http://localhost:<port>/?token=<token>
+Open from phone: http://<lan-ip>:<port>/?token=<token>
+```
+
+Open the LAN URL from a phone on the same network. The first request uses the URL token to set an HttpOnly `codex_dispatcher_session` cookie. After that, the extension host endpoints use the cookie and the browser URL is scrubbed with `history.replaceState`.
+
+The explicit local-only flag is still accepted:
+
+```bash
+codex-dispatcher --no-tunnel
+```
+
 ## Experimental path: Cloudflare quick tunnel
 
 Cloudflare quick tunnels are still useful for local experiments because they do not require relay setup, but they create a new URL on every restart and are not the PWA path.
 
 ```bash
-codex-dispatcher
+codex-dispatcher --tunnel cloudflare
 ```
 
 The launcher starts `cloudflared tunnel --url http://localhost:<port>` and prints:
 
 ```text
 Phone: https://<tunnel>.trycloudflare.com/?token=<token>
-```
-
-The first request uses the URL token to set an HttpOnly `codex_dispatcher_session` cookie. After that, the extension host endpoints use the cookie and the browser URL is scrubbed with `history.replaceState`.
-
-For local-only development:
-
-```bash
-codex-dispatcher --no-tunnel
 ```

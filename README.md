@@ -46,18 +46,19 @@ codex-dispatcher doctor
 codex-dispatcher
 ```
 
-By default, the launcher uses an experimental Cloudflare quick tunnel and prints:
+By default, the launcher uses local/LAN access only and prints:
 
 ```text
-Phone: https://<tunnel>.trycloudflare.com/?token=<token>
+Local: http://localhost:<port>/?token=<token>
+Open from phone: http://<lan-ip>:<port>/?token=<token>
 ```
 
-Open that URL on the phone. The first request uses the token to set an HttpOnly session cookie; the browser URL is then scrubbed.
+Open the LAN URL on a phone connected to the same network. The first request uses the token to set an HttpOnly session cookie; the browser URL is then scrubbed.
 
 For the stable relay/PWA path, log in once and run with `--relay`:
 
 ```bash
-CODEX_DISPATCHER_RELAY_URL=https://codex-dispatcher.app codex-dispatcher login
+codex-dispatcher login
 codex-dispatcher --relay --kill-existing
 ```
 
@@ -77,7 +78,7 @@ Bun is required only when running from source or building the binary. It is not 
 
 If the VS Code Codex extension is missing, `codex-dispatcher` tries to install `openai.chatgpt` through the `code` CLI. If `code` is unavailable, set `CODEX_EXTENSION_WEBVIEW_ROOT` to the extension `webview` directory.
 
-For local-only development:
+Local-only access is the default. To be explicit:
 
 ```bash
 codex-dispatcher --no-tunnel
@@ -85,7 +86,7 @@ codex-dispatcher --no-tunnel
 
 ## Relay mode
 
-Cloudflare quick tunnels are useful for experiments, but they create a new URL on every restart. Relay mode is the path for a stable PWA URL.
+Cloudflare quick tunnels are available only when explicitly requested with `--tunnel cloudflare`, and they create a new URL on every restart. Relay mode is the path for a stable PWA URL.
 
 Run a relay service:
 
@@ -125,7 +126,7 @@ import /home/sne/projects/codex-dispatcher-relay/deploy/caddy/sites.caddy
 Log in the CLI once:
 
 ```bash
-CODEX_DISPATCHER_RELAY_URL=https://codex-dispatcher.app codex-dispatcher login
+codex-dispatcher login
 ```
 
 Start the dispatcher through the relay:

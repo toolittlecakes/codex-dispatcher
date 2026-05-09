@@ -15,7 +15,7 @@ Cloudflare quick tunnels stay useful for local experiments, but they are not the
    - relay token,
    - stable URL.
 5. The CLI stores relay state in `~/.codex-dispatcher/config.json`.
-6. The user runs `codex-dispatcher`.
+6. The user runs `codex-dispatcher --relay`.
 7. The CLI opens one dispatcher session to the relay.
 8. Browser/PWA users log in with GitHub web OAuth on the relay.
 9. The relay routes browser traffic for that GitHub user to that user's active dispatcher.
@@ -73,14 +73,14 @@ Kill it and continue? [y/N]
 Non-interactive CLI behavior:
 
 ```bash
-codex-dispatcher --kill-existing
+codex-dispatcher --relay --kill-existing
 ```
 
 When `--kill-existing` is set, the relay closes the previous dispatcher session and accepts the new one.
 
 ## Explicit failure outcomes
 
-- No relay config: `codex-dispatcher` tells the user to run `codex-dispatcher login`.
+- No relay config: `codex-dispatcher --relay` tells the user to run `codex-dispatcher login`.
 - Relay rejects GitHub token: login fails visibly; no config is written.
 - Dispatcher already active: start fails unless the user confirms or passes `--kill-existing`.
 - Browser user is not logged in: relay redirects to GitHub OAuth.
@@ -117,7 +117,7 @@ Long-lived streams, especially `/events`, must support cancellation in both dire
 
 Thread stream updates also need replay on reconnect. Native Codex sends patch events relative to the latest conversation state; if a mobile browser misses a patch while the relay reconnects, the next live patch may no longer be enough to reconstruct the current UI. The dispatcher keeps the current mirrored conversation state and sends it as a snapshot to each new event client.
 
-CLI:
+CLI override for a custom relay:
 
 ```text
 CODEX_DISPATCHER_RELAY_URL=https://codex-dispatcher.app

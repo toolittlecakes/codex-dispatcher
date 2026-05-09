@@ -116,7 +116,7 @@ try {
   } else if (tunnelStart) {
     console.log(`Phone:  ${extensionUrl(tunnelStart.url, token)}`);
   } else {
-    console.log("Phone:  tunnel disabled; use the Local URL from this machine only");
+    console.log("Phone:  use the LAN URL printed by dispatcher from a device on the same network");
   }
   console.log("");
 } catch (error) {
@@ -140,7 +140,7 @@ function parseArgs(args: string[]): CliOptions {
     relay: false,
     relayUrl: null,
     showHelp: false,
-    tunnel: "cloudflare",
+    tunnel: null,
   };
 
   for (let index = 0; index < args.length; index += 1) {
@@ -250,8 +250,8 @@ Options:
   --relay                    Connect through the configured codex-dispatcher relay.
   --relay-url <url>          Relay base URL. Defaults to CODEX_DISPATCHER_RELAY_URL or saved config.
   --kill-existing            Replace the active relay dispatcher for this GitHub user.
-  --tunnel cloudflare        Start a Cloudflare quick tunnel. This is the default.
-  --no-tunnel                Only print the local URL.
+  --tunnel cloudflare        Start a Cloudflare quick tunnel.
+  --no-tunnel                Use local/LAN access only. This is the default.
   --no-install-extension     Fail if the Codex VS Code extension webview is not installed.
   -h, --help                 Show this help.
 `);
