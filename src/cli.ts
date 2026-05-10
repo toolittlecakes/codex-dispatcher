@@ -352,6 +352,9 @@ async function fetchLatestRelease(assetName: string): Promise<LatestRelease> {
   if (!isRecord(body) || typeof body.tag_name !== "string") {
     throw new Error("GitHub release response was malformed.");
   }
+  if (!isSemverTag(body.tag_name)) {
+    throw new Error(`Latest release is not semver: ${body.tag_name}`);
+  }
 
   const assets = Array.isArray(body.assets) ? body.assets : [];
   const asset = assets.find((entry) =>
@@ -396,6 +399,10 @@ async function installUpdate(executablePath: string, release: LatestRelease): Pr
 
 function normalizeVersion(version: string): string {
   return version.trim().replace(/^v/i, "");
+}
+
+function isSemverTag(version: string): boolean {
+  return /^v?\d+\.\d+\.\d+$/.test(version.trim());
 }
 
 function compareVersions(left: string, right: string): number {
