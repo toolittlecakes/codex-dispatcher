@@ -2,8 +2,8 @@ name: Release
 
 on:
   push:
-    branches:
-      - main
+    tags:
+      - "v*.*.*"
 
 permissions:
   contents: write
@@ -17,6 +17,13 @@ jobs:
         uses: actions/checkout@v5
         with:
           fetch-depth: 0
+
+      - name: Validate release tag
+        run: |
+          if ! printf '%s' "${GITHUB_REF_NAME}" | grep -Eq '^v[0-9]+\.[0-9]+\.[0-9]+$'; then
+            echo "Release tags must use vX.Y.Z semver format." >&2
+            exit 1
+          fi
 
       - name: Set up Bun
         uses: oven-sh/setup-bun@v2
@@ -33,18 +40,15 @@ jobs:
       - name: Build binary
         run: bun build --compile --target=bun --outfile=dist/codex-dispatcher-darwin-arm64 src/cli.ts
 
-      - name: Publish rolling release
+      - name: Publish release
         env:
           GH_TOKEN: ${{ github.token }}
-          RELEASE_TAG: nightly
+          RELEASE_TAG: ${{ github.ref_name }}
           ASSET_PATH: dist/codex-dispatcher-darwin-arm64
         run: |
-          git tag -f "$RELEASE_TAG" "$GITHUB_SHA"
-          git push origin "refs/tags/$RELEASE_TAG" --force
-
           if gh release view "$RELEASE_TAG" >/dev/null 2>&1; then
             gh release upload "$RELEASE_TAG" "$ASSET_PATH" --clobber
-            gh release edit "$RELEASE_TAG" --title "codex-dispatcher nightly" --notes "Latest main build from $GITHUB_SHA" --latest
+            gh release edit "$RELEASE_TAG" --title "codex-dispatcher $RELEASE_TAG" --notes "Release $RELEASE_TAG" --latest
           else
-            gh release create "$RELEASE_TAG" "$ASSET_PATH" --title "codex-dispatcher nightly" --notes "Latest main build from $GITHUB_SHA" --latest
+            gh release create "$RELEASE_TAG" "$ASSET_PATH" --title "codex-dispatcher $RELEASE_TAG" --notes "Release $RELEASE_TAG" --latest
           fi
