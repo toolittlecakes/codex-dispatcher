@@ -2,8 +2,8 @@ name: Release
 
 on:
   push:
-    tags:
-      - "v*.*.*"
+    branches:
+      - main
 
 permissions:
   contents: write
@@ -18,37 +18,52 @@ jobs:
         with:
           fetch-depth: 0
 
-      - name: Validate release tag
-        run: |
-          if ! printf '%s' "${GITHUB_REF_NAME}" | grep -Eq '^v[0-9]+\.[0-9]+\.[0-9]+$'; then
-            echo "Release tags must use vX.Y.Z semver format." >&2
-            exit 1
-          fi
-
       - name: Set up Bun
         uses: oven-sh/setup-bun@v2
 
+      - name: Resolve release version
+        id: version
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          VERSION="$(bun -e 'console.log(require("./package.json").version)')"
+          if ! printf '%s' "$VERSION" | grep -Eq '^[0-9]+\.[0-9]+\.[0-9]+$'; then
+            echo "package.json version must use X.Y.Z semver format." >&2
+            exit 1
+          fi
+          RELEASE_TAG="v$VERSION"
+          echo "release_tag=$RELEASE_TAG" >> "$GITHUB_OUTPUT"
+
+          if gh release view "$RELEASE_TAG" >/dev/null 2>&1; then
+            echo "should_release=false" >> "$GITHUB_OUTPUT"
+            echo "Release $RELEASE_TAG already exists; skipping."
+          else
+            echo "should_release=true" >> "$GITHUB_OUTPUT"
+          fi
+
       - name: Install dependencies
+        if: steps.version.outputs.should_release == 'true'
         run: bun install --frozen-lockfile
 
       - name: Test
+        if: steps.version.outputs.should_release == 'true'
         run: bun test
 
       - name: Typecheck
+        if: steps.version.outputs.should_release == 'true'
         run: bun run typecheck
 
       - name: Build binary
+        if: steps.version.outputs.should_release == 'true'
         run: bun build --compile --target=bun --outfile=dist/codex-dispatcher-darwin-arm64 src/cli.ts
 
       - name: Publish release
+        if: steps.version.outputs.should_release == 'true'
         env:
           GH_TOKEN: ${{ github.token }}
-          RELEASE_TAG: ${{ github.ref_name }}
+          RELEASE_TAG: ${{ steps.version.outputs.release_tag }}
           ASSET_PATH: dist/codex-dispatcher-darwin-arm64
         run: |
-          if gh release view "$RELEASE_TAG" >/dev/null 2>&1; then
-            gh release upload "$RELEASE_TAG" "$ASSET_PATH" --clobber
-            gh release edit "$RELEASE_TAG" --title "codex-dispatcher $RELEASE_TAG" --notes "Release $RELEASE_TAG" --latest
-          else
-            gh release create "$RELEASE_TAG" "$ASSET_PATH" --title "codex-dispatcher $RELEASE_TAG" --notes "Release $RELEASE_TAG" --latest
-          fi
+          git tag "$RELEASE_TAG" "$GITHUB_SHA"
+          git push origin "refs/tags/$RELEASE_TAG"
+          gh release create "$RELEASE_TAG" "$ASSET_PATH" --title "codex-dispatcher $RELEASE_TAG" --notes "Release $RELEASE_TAG" --latest
