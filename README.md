@@ -46,6 +46,10 @@ codex-dispatcher doctor
 codex-dispatcher
 ```
 
+Installed standalone binaries check GitHub Releases for updates on startup and print a
+notice when a newer version is available. Run `codex-dispatcher update` to install it,
+or pass `--skip-updates` to disable the startup check.
+
 By default, the launcher uses local/LAN access only and prints:
 
 ```text
