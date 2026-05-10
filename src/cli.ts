@@ -2,16 +2,17 @@
 
 import { randomBytes } from "node:crypto";
 import { spawn, type ChildProcess } from "node:child_process";
-import { existsSync } from "node:fs";
+import { chmodSync, existsSync, renameSync, unlinkSync, writeFileSync } from "node:fs";
 import { createServer } from "node:net";
-import { resolve } from "node:path";
+import { dirname, join, resolve } from "node:path";
+import packageJson from "../package.json" with { type: "json" };
 import { resolveCodexCliPath } from "./codex-app-server";
 import { readDispatcherConfig, writeDispatcherConfig, type DispatcherConfig } from "./dispatcher-config";
 import { resolveExtensionWebviewRoot } from "./extension-webview";
 import { buildGitHubDeviceCodeBody, buildGitHubDeviceTokenBody } from "./github-oauth";
 import { startRelayClient, type RelayClient } from "./relay-client";
 
-type CliCommand = "serve" | "doctor" | "login";
+type CliCommand = "serve" | "doctor" | "login" | "update";
 
 type CliOptions = {
   command: CliCommand;
@@ -24,6 +25,7 @@ type CliOptions = {
   relayUrl: string | null;
   showHelp: boolean;
   tunnel: "cloudflare" | null;
+  skipUpdates: boolean;
 };
 
 type CommandCheck = {
@@ -46,6 +48,8 @@ const extensionId = "openai.chatgpt";
 const extensionRoute = "/";
 const serverEntry = new URL("./server.ts", import.meta.url).pathname;
 const internalServerCommand = "__server";
+const releaseRepo = "toolittlecakes/codex-dispatcher";
+const currentVersion = packageJson.version;
 
 let shuttingDown = false;
 let dispatcher: ChildProcess | null = null;
@@ -73,6 +77,13 @@ try {
     await runRelayLogin(options);
     process.exit(0);
   }
+
+  if (options.command === "update") {
+    await runUpdateCommand();
+    process.exit(0);
+  }
+
+  await notifyIfUpdateAvailable(options);
 
   const webviewRoot = await ensureCodexExtensionWebviewRoot(options.installExtension);
   const port = options.port ?? await findOpenPort(defaultPort);
@@ -140,6 +151,7 @@ function parseArgs(args: string[]): CliOptions {
     relay: false,
     relayUrl: null,
     showHelp: false,
+    skipUpdates: false,
     tunnel: null,
   };
 
@@ -148,7 +160,7 @@ function parseArgs(args: string[]): CliOptions {
     if (arg === undefined) {
       continue;
     }
-    if (arg === "serve" || arg === "doctor" || arg === "login") {
+    if (arg === "serve" || arg === "doctor" || arg === "login" || arg === "update") {
       options.command = arg;
       continue;
     }
@@ -172,6 +184,13 @@ function parseArgs(args: string[]): CliOptions {
     if (arg === "--kill-existing") {
       options.killExisting = true;
       continue;
+    }
+    if (arg === "--skip-updates") {
+      options.skipUpdates = true;
+      continue;
+    }
+    if (arg === "--auto-updates") {
+      throw new Error("--auto-updates was removed. Use `codex-dispatcher update` instead.");
     }
     if (arg === "--relay-url") {
       options.relayUrl = normalizeRelayUrl(requireNextArg(args, index, "--relay-url"));
@@ -241,6 +260,7 @@ Runs the Codex VS Code extension webview against the local codex app-server and 
 Usage:
   codex-dispatcher [serve] [options]
   codex-dispatcher login [options]
+  codex-dispatcher update
   codex-dispatcher doctor [options]
 
 Options:
@@ -250,11 +270,145 @@ Options:
   --relay                    Connect through the configured codex-dispatcher relay.
   --relay-url <url>          Relay base URL. Defaults to CODEX_DISPATCHER_RELAY_URL or saved config.
   --kill-existing            Replace the active relay dispatcher for this GitHub user.
+  --skip-updates             Do not check GitHub Releases for a newer binary during serve.
   --tunnel cloudflare        Start a Cloudflare quick tunnel.
   --no-tunnel                Use local/LAN access only. This is the default.
   --no-install-extension     Fail if the Codex VS Code extension webview is not installed.
   -h, --help                 Show this help.
 `);
+}
+
+type LatestRelease = {
+  version: string;
+  assetUrl: string;
+  pageUrl: string;
+};
+
+async function notifyIfUpdateAvailable(options: CliOptions): Promise<void> {
+  if (options.skipUpdates) {
+    return;
+  }
+
+  const assetName = releaseAssetName();
+  if (!selfUpdateExecutablePath() || !assetName) {
+    return;
+  }
+
+  const latest = await fetchLatestRelease(assetName).catch((error) => {
+    console.error(`Update check failed: ${error instanceof Error ? error.message : String(error)}`);
+    return null;
+  });
+  if (!latest || compareVersions(latest.version, currentVersion) <= 0) {
+    return;
+  }
+
+  console.error(`Update available: ${currentVersion} -> ${latest.version}. Run \`codex-dispatcher update\` to install it.`);
+}
+
+async function runUpdateCommand(): Promise<void> {
+  const executablePath = selfUpdateExecutablePath();
+  const assetName = releaseAssetName();
+  if (!executablePath || !assetName) {
+    throw new Error("Updates are available only for installed standalone binaries.");
+  }
+
+  const latest = await fetchLatestRelease(assetName);
+  if (compareVersions(latest.version, currentVersion) <= 0) {
+    console.log(`codex-dispatcher is up to date (${currentVersion}).`);
+    return;
+  }
+
+  await installUpdate(executablePath, latest);
+  console.log(`Updated codex-dispatcher ${currentVersion} -> ${latest.version}.`);
+}
+
+function selfUpdateExecutablePath(): string | null {
+  if (existsSync(serverEntry)) {
+    return null;
+  }
+  return process.execPath;
+}
+
+function releaseAssetName(): string | null {
+  if (process.platform === "darwin" && process.arch === "arm64") {
+    return "codex-dispatcher-darwin-arm64";
+  }
+  return null;
+}
+
+async function fetchLatestRelease(assetName: string): Promise<LatestRelease> {
+  const response = await fetch(`https://api.github.com/repos/${releaseRepo}/releases/latest`, {
+    headers: {
+      accept: "application/vnd.github+json",
+      "user-agent": `codex-dispatcher/${currentVersion}`,
+    },
+    signal: AbortSignal.timeout(5_000),
+  });
+  if (!response.ok) {
+    throw new Error(`GitHub returned ${response.status}`);
+  }
+
+  const body = await response.json() as unknown;
+  if (!isRecord(body) || typeof body.tag_name !== "string") {
+    throw new Error("GitHub release response was malformed.");
+  }
+
+  const assets = Array.isArray(body.assets) ? body.assets : [];
+  const asset = assets.find((entry) =>
+    isRecord(entry) &&
+    entry.name === assetName &&
+    typeof entry.browser_download_url === "string"
+  );
+  if (!isRecord(asset) || typeof asset.browser_download_url !== "string") {
+    throw new Error(`Release ${body.tag_name} does not include ${assetName}.`);
+  }
+
+  return {
+    version: normalizeVersion(body.tag_name),
+    assetUrl: asset.browser_download_url,
+    pageUrl: typeof body.html_url === "string" ? body.html_url : `https://github.com/${releaseRepo}/releases/latest`,
+  };
+}
+
+async function installUpdate(executablePath: string, release: LatestRelease): Promise<void> {
+  console.error(`Installing codex-dispatcher ${release.version} from ${release.pageUrl}`);
+  const response = await fetch(release.assetUrl, {
+    signal: AbortSignal.timeout(60_000),
+  });
+  if (!response.ok) {
+    throw new Error(`Update download failed: ${response.status}`);
+  }
+
+  const tmpPath = join(dirname(executablePath), `.codex-dispatcher-update-${process.pid}`);
+  try {
+    writeFileSync(tmpPath, Buffer.from(await response.arrayBuffer()), { mode: 0o755 });
+    chmodSync(tmpPath, 0o755);
+    renameSync(tmpPath, executablePath);
+  } catch (error) {
+    try {
+      unlinkSync(tmpPath);
+    } catch {
+      // Best effort cleanup for partial downloads.
+    }
+    throw error;
+  }
+}
+
+function normalizeVersion(version: string): string {
+  return version.trim().replace(/^v/i, "");
+}
+
+function compareVersions(left: string, right: string): number {
+  const leftParts = normalizeVersion(left).split("-")[0]?.split(".").map(Number) ?? [];
+  const rightParts = normalizeVersion(right).split("-")[0]?.split(".").map(Number) ?? [];
+  for (let index = 0; index < 3; index += 1) {
+    const leftPart = Number.isFinite(leftParts[index]) ? leftParts[index]! : 0;
+    const rightPart = Number.isFinite(rightParts[index]) ? rightParts[index]! : 0;
+    if (leftPart !== rightPart) {
+      return leftPart > rightPart ? 1 : -1;
+    }
+  }
+  return 0;
 }
 
 async function runRelayLogin(options: CliOptions): Promise<void> {
