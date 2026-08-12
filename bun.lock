@@ -4,6 +4,9 @@
   "workspaces": {
     "": {
       "name": "codex-dispatcher",
+      "dependencies": {
+        "capnweb": "0.11.0",
+      },
       "devDependencies": {
         "@types/bun": "^1.3.1",
         "typescript": "^5.9.3",
@@ -16,6 +19,8 @@
     "@types/node": ["@types/node@25.6.0", "", { "dependencies": { "undici-types": "~7.19.0" } }, "sha512-+qIYRKdNYJwY3vRCZMdJbPLJAtGjQBudzZzdzwQYkEPQd+PJGixUL5QfvCLDaULoLv+RhT3LDkwEfKaAkgSmNQ=="],
 
     "bun-types": ["bun-types@1.3.13", "", { "dependencies": { "@types/node": "*" } }, "sha512-QXKeHLlOLqQX9LgYaHJfzdBaV21T63HhFJnvuRCcjZiaUDpbs5ED1MgxbMra71CsryN/1dAoXuJJJwIv/2drVA=="],
+
+    "capnweb": ["capnweb@0.11.0", "", {}, "sha512-+H1L51K9v3150Lub5+sQTS17+IiqlNLKU0eVIudDn77ksgkmthsR+xdj65eTrue0PtlhVpz9FoDlmmDbeRShEw=="],
 
     "typescript": ["typescript@5.9.3", "", { "bin": { "tsc": "bin/tsc", "tsserver": "bin/tsserver" } }, "sha512-jl1vZzPDinLr9eUt3J/t7V6FgNEw9QjvBPdysz9KfQDD41fQrC2Y4vKQdiaUpFT4bXlb1RHhLpp8wtm6M5TgSw=="],
 

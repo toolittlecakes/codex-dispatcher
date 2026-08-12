@@ -267,7 +267,7 @@ export class CodexIpcBridge {
       type: "broadcast",
       method,
       sourceClientId: this.clientId,
-      version: methodVersion(method),
+      version: ipcMethodVersion(method),
       params,
     };
     if (options.targetClientIds) {
@@ -367,7 +367,7 @@ export class CodexIpcBridge {
       type: "request",
       requestId: randomUUID(),
       sourceClientId: this.clientId,
-      version: methodVersion(method),
+      version: ipcMethodVersion(method),
       method,
       params,
     };
@@ -882,7 +882,7 @@ class IpcRouter {
       type: "broadcast",
       method: "client-status-changed",
       sourceClientId: client.id,
-      version: methodVersion("client-status-changed"),
+      version: ipcMethodVersion("client-status-changed"),
       params: {
         clientId: client.id,
         clientType: client.type,
@@ -928,7 +928,7 @@ class IpcRouter {
   }
 }
 
-function methodVersion(method: string): number {
+export function ipcMethodVersion(method: string): number {
   return methodVersions[method] ?? 0;
 }
 

@@ -21,6 +21,7 @@ import {
 } from "./pwa";
 import { ExtensionState, extensionStatePath } from "./extension-state";
 import { cookieValues, isRecord, jsonResponse } from "./shared";
+import { WebviewRpcSession, parseRpcConnect, parseRpcMessage, type WebviewIpcCoordination } from "./webview-rpc";
 
 type HostMessage = JsonObject & {
   type?: string;
@@ -47,7 +48,7 @@ type ExtensionWebviewOptions = {
   handleIpcRequest?: (method: string, params: JsonValue, targetClientId?: string) => Promise<JsonValue>;
   getThreadRole?: (conversationId: string) => string | Promise<string>;
   handleFollowerRequest?: (method: string, params: JsonValue) => Promise<JsonValue>;
-  handleThreadStreamSnapshotRequest?: (hostId: string, conversationId: string) => Promise<void> | void;
+  ipcCoordination?: WebviewIpcCoordination;
   onThreadActivity?: (method: string, conversationId: string, thread?: JsonObject) => void;
 };
 
@@ -101,60 +102,6 @@ const hostFollowerEndpointMethods: Record<string, string> = {
   "thread-follower-submit-mcp-server-elicitation-response-for-host": "thread-follower-submit-mcp-server-elicitation-response",
   "thread-follower-set-queued-follow-ups-state-for-host": "thread-follower-set-queued-follow-ups-state",
 };
-const followerRequestTypes: Record<string, { method: string; responseType: string }> = {
-  "thread-follower-start-turn-request": {
-    method: "thread-follower-start-turn",
-    responseType: "thread-follower-start-turn-response",
-  },
-  "thread-follower-compact-thread-request": {
-    method: "thread-follower-compact-thread",
-    responseType: "thread-follower-compact-thread-response",
-  },
-  "thread-follower-steer-turn-request": {
-    method: "thread-follower-steer-turn",
-    responseType: "thread-follower-steer-turn-response",
-  },
-  "thread-follower-interrupt-turn-request": {
-    method: "thread-follower-interrupt-turn",
-    responseType: "thread-follower-interrupt-turn-response",
-  },
-  "thread-follower-set-model-and-reasoning-request": {
-    method: "thread-follower-set-model-and-reasoning",
-    responseType: "thread-follower-set-model-and-reasoning-response",
-  },
-  "thread-follower-set-collaboration-mode-request": {
-    method: "thread-follower-set-collaboration-mode",
-    responseType: "thread-follower-set-collaboration-mode-response",
-  },
-  "thread-follower-edit-last-user-turn-request": {
-    method: "thread-follower-edit-last-user-turn",
-    responseType: "thread-follower-edit-last-user-turn-response",
-  },
-  "thread-follower-command-approval-decision-request": {
-    method: "thread-follower-command-approval-decision",
-    responseType: "thread-follower-command-approval-decision-response",
-  },
-  "thread-follower-file-approval-decision-request": {
-    method: "thread-follower-file-approval-decision",
-    responseType: "thread-follower-file-approval-decision-response",
-  },
-  "thread-follower-permissions-request-approval-response-request": {
-    method: "thread-follower-permissions-request-approval-response",
-    responseType: "thread-follower-permissions-request-approval-response-response",
-  },
-  "thread-follower-submit-user-input-request": {
-    method: "thread-follower-submit-user-input",
-    responseType: "thread-follower-submit-user-input-response",
-  },
-  "thread-follower-submit-mcp-server-elicitation-response-request": {
-    method: "thread-follower-submit-mcp-server-elicitation-response",
-    responseType: "thread-follower-submit-mcp-server-elicitation-response-response",
-  },
-  "thread-follower-set-queued-follow-ups-state-request": {
-    method: "thread-follower-set-queued-follow-ups-state",
-    responseType: "thread-follower-set-queued-follow-ups-state-response",
-  },
-};
 
 export class ExtensionWebview {
   private readonly appServer: CodexAppServer;
@@ -167,11 +114,11 @@ export class ExtensionWebview {
     | undefined;
   private readonly getThreadRole: ((conversationId: string) => string | Promise<string>) | undefined;
   private readonly handleFollowerRequest: ((method: string, params: JsonValue) => Promise<JsonValue>) | undefined;
-  private readonly handleThreadStreamSnapshotRequest:
-    | ((hostId: string, conversationId: string) => Promise<void> | void)
-    | undefined;
+  private readonly ipcCoordination: WebviewIpcCoordination | undefined;
   private readonly onThreadActivity: ((method: string, conversationId: string, thread?: JsonObject) => void) | undefined;
   private readonly clients = new Map<string, StreamClient>();
+  // One RPC session per webview, exactly as VS Code keys them by webview.
+  private readonly rpcSessions = new Map<string, WebviewRpcSession>();
   // VS Code hosts exactly one webview, and the extension is written for that:
   // an approval it answers twice is an error, and per-tab host replies drift
   // apart. The tab that opened a stream last is the one webview we admit.
@@ -193,7 +140,7 @@ export class ExtensionWebview {
     this.handleIpcRequest = options.handleIpcRequest;
     this.getThreadRole = options.getThreadRole;
     this.handleFollowerRequest = options.handleFollowerRequest;
-    this.handleThreadStreamSnapshotRequest = options.handleThreadStreamSnapshotRequest;
+    this.ipcCoordination = options.ipcCoordination;
     this.onThreadActivity = options.onThreadActivity;
     this.state = new ExtensionState(options.statePath ?? extensionStatePath());
     this.webviewRoot = resolveExtensionWebviewRoot();
@@ -246,13 +193,16 @@ export class ExtensionWebview {
   }
 
   handleIpcBroadcast(broadcastMessage: IpcBroadcastMessage): void {
-    this.broadcast({
-      type: "ipc-broadcast",
-      method: broadcastMessage.method,
-      sourceClientId: broadcastMessage.sourceClientId,
-      version: broadcastMessage.version,
-      params: broadcastMessage.params,
-    });
+    this.recordMessage("outbound", { type: "ipc-broadcast", method: broadcastMessage.method });
+    this.pruneDetachedClients();
+    for (const [clientId, session] of this.rpcSessions) {
+      if (!this.clients.has(clientId)) {
+        session.dispose();
+        this.rpcSessions.delete(clientId);
+        continue;
+      }
+      session.deliverBroadcast(broadcastMessage);
+    }
   }
 
   handleAppServerEvent(event: CodexAppServerEvent): void {
@@ -441,6 +391,9 @@ select,
 
   private async dispatchHostMessage(client: StreamClient, message: HostMessage): Promise<void> {
     try {
+      if (this.routeRpcMessage(client, message)) {
+        return;
+      }
       for (const outbound of await this.routeHostMessage(message)) {
         this.recordMessage("outbound", outbound);
         this.send(client, outbound);
@@ -454,6 +407,46 @@ select,
       this.remember(this.hostErrors, hostError);
       this.send(client, hostError);
     }
+  }
+
+  // Not part of the message table below: an RPC frame belongs to one webview's
+  // session, and the table answers without knowing which webview asked.
+  private routeRpcMessage(client: StreamClient, message: HostMessage): boolean {
+    const sessionId = parseRpcConnect(message);
+    if (sessionId !== null) {
+      if (!this.ipcCoordination) {
+        throw new Error("IPC coordination is unavailable");
+      }
+      // A reconnecting webview opens a new session and abandons the old one;
+      // keeping both would double every broadcast into the same tab.
+      this.rpcSessions.get(client.id)?.dispose();
+      this.rpcSessions.set(
+        client.id,
+        new WebviewRpcSession(
+          sessionId,
+          this.ipcCoordination,
+          (outbound) => {
+            this.send(client, outbound);
+          },
+          (error) => {
+            this.remember(this.hostErrors, { type: "webview-rpc-error", error: error.message });
+          },
+        ),
+      );
+      return true;
+    }
+
+    const frame = parseRpcMessage(message);
+    if (!frame) {
+      return false;
+    }
+
+    const session = this.rpcSessions.get(client.id);
+    if (!session || session.sessionId !== frame.sessionId) {
+      throw new Error(`No webview RPC session ${frame.sessionId}`);
+    }
+    session.accept(frame.message);
+    return true;
   }
 
   private async routeHostMessage(message: HostMessage): Promise<JsonObject[]> {
@@ -476,11 +469,6 @@ select,
           value: message.deleted ? null : message.value ?? null,
           deleted: message.deleted === true,
         });
-        return [];
-
-      case "persisted-atom-reset":
-        this.state.resetAtoms();
-        this.broadcast({ type: "persisted-atom-sync", state: {} });
         return [];
 
       case "fetch":
@@ -525,70 +513,8 @@ select,
         return [];
 
       default:
-        if (message.type && message.type in followerRequestTypes) {
-          return [await this.handleThreadFollowerRequest(message)];
-        }
-        if (message.type === "thread-role-request") {
-          return [await this.handleThreadRoleRequest(message)];
-        }
-        if (message.type === "thread-stream-snapshot-request") {
-          await this.handleThreadStreamSnapshotMessage(message);
-          return [];
-        }
-        if (message.type === "thread-stream-resume-request") {
-          return [];
-        }
         return [];
     }
-  }
-
-  private async handleThreadFollowerRequest(message: HostMessage): Promise<JsonObject> {
-    const requestType = message.type ?? "";
-    const request = followerRequestTypes[requestType];
-    const requestId = typeof message.requestId === "string" ? message.requestId : "";
-    if (!request) {
-      return { type: "thread-follower-request-response", requestId, error: `Unsupported follower request: ${requestType}` };
-    }
-
-    try {
-      if (!this.handleFollowerRequest) {
-        throw new Error("IPC follower bridge is unavailable");
-      }
-      const result = await this.handleFollowerRequest(request.method, message.params ?? {});
-      return { type: request.responseType, requestId, result };
-    } catch (error) {
-      return {
-        type: request.responseType,
-        requestId,
-        error: error instanceof Error ? error.message : String(error),
-      };
-    }
-  }
-
-  private async handleThreadRoleRequest(message: HostMessage): Promise<JsonObject> {
-    const requestId = typeof message.requestId === "string" ? message.requestId : "";
-    const conversationId = typeof message.conversationId === "string" ? message.conversationId : "";
-    try {
-      const role = this.getThreadRole ? await this.getThreadRole(conversationId) : "follower";
-      return { type: "thread-role-response", requestId, role };
-    } catch (error) {
-      return {
-        type: "thread-role-response",
-        requestId,
-        role: "follower",
-        error: error instanceof Error ? error.message : String(error),
-      };
-    }
-  }
-
-  private async handleThreadStreamSnapshotMessage(message: HostMessage): Promise<void> {
-    if (!this.handleThreadStreamSnapshotRequest) {
-      return;
-    }
-    if (typeof message.hostId !== "string" || typeof message.conversationId !== "string") {
-      return;
-    }
-    await this.handleThreadStreamSnapshotRequest(message.hostId, message.conversationId);
   }
 
   private async handleFetchMessage(message: HostMessage): Promise<JsonObject> {

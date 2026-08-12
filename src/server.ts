@@ -15,6 +15,7 @@ import {
 import { ExtensionWebview } from "./extension-webview";
 import { applyJsonPatches, cloneJson } from "./json-patch";
 import { asJsonObject, isJsonObject } from "./shared";
+import type { IpcRequestOutcome } from "./webview-rpc";
 
 const port = Number(process.env.PORT ?? "8787");
 const host = process.env.HOST ?? "0.0.0.0";
@@ -32,8 +33,12 @@ const extensionWebview = new ExtensionWebview({
   handleIpcRequest: (method, params, targetClientId) => handleExtensionIpcRequest(method, params, targetClientId),
   getThreadRole: (conversationId) => extensionThreadRole(conversationId),
   handleFollowerRequest: (method, params) => handleExtensionFollowerRequest(method, params),
-  handleThreadStreamSnapshotRequest: (hostId, conversationId) =>
-    handleExtensionThreadStreamSnapshotRequest(hostId, conversationId),
+  ipcCoordination: {
+    broadcast: (method, params, targetClientIds) => broadcastForWebview(method, params, targetClientIds),
+    request: (method, params, targetClientId) => requestForWebview(method, params, targetClientId),
+    // No editor behind this host, so there is no IDE context to report.
+    ideContext: () => null,
+  },
   onThreadActivity: (method, conversationId, thread) => {
     if (!threadDrivingMethods.has(method) || !claimDispatcherOwnership(conversationId)) {
       return;
@@ -655,46 +660,13 @@ function buildExtensionEventReplayMessages(): JsonObject[] {
     });
   }
 
-  for (const [threadId, conversation] of mirroredConversations.entries()) {
-    const ownerClientId = streamOwners.get(threadId);
-    if (!ownerClientId) {
-      continue;
-    }
-    messages.push(buildThreadStreamSnapshotMessage(threadId, ownerClientId, conversation));
-  }
-
+  // Mirrored threads are deliberately absent too: IPC state reaches the webview
+  // over its RPC session, which a reload rebuilds from scratch — the webview
+  // re-announces what it follows and the owners answer with fresh snapshots.
   // Threads this dispatcher owns are deliberately absent: the webview drives
   // them through our app server and already has their state, and a replay per
   // owned thread grows with every thread the phone has ever run.
   return messages;
-}
-
-function buildThreadStreamSnapshotMessage(
-  threadId: string,
-  sourceClientId: string,
-  conversation: JsonObject,
-): JsonObject {
-  const hostId = typeof conversation.hostId === "string" ? conversation.hostId : dispatcherIpcHostId;
-  const conversationState = {
-    ...cloneJsonObject(conversation),
-    id: threadId,
-    hostId,
-  };
-
-  return {
-    type: "ipc-broadcast",
-    method: "thread-stream-state-changed",
-    sourceClientId,
-    version: 6,
-    params: {
-      conversationId: threadId,
-      hostId,
-      change: {
-        type: "snapshot",
-        conversationState,
-      },
-    },
-  };
 }
 
 function extensionThreadRole(threadId: string): string {
@@ -724,6 +696,35 @@ async function handleExtensionIpcRequest(
   return response.result ?? { ok: true };
 }
 
+// The webview's own IPC calls, arriving over its RPC session. Unlike the
+// `-for-host` endpoints these are not scoped to a thread we own: the webview is
+// speaking as a client of the bus, so its traffic goes straight onto the bus.
+function broadcastForWebview(method: string, params: JsonValue, targetClientIds: string[] | undefined): void {
+  if (targetClientIds?.length === 0) {
+    return;
+  }
+  if (!ipcBridge.broadcast(method, params, targetClientIds ? { targetClientIds } : {})) {
+    throw new Error(`codex-ipc is not connected; ${method} was not broadcast`);
+  }
+}
+
+async function requestForWebview(
+  method: string,
+  params: JsonValue,
+  targetClientId: string | undefined,
+): Promise<IpcRequestOutcome> {
+  const response = await ipcBridge.request(method, params, targetClientId ? { targetClientId } : {});
+  if (response.resultType === "error") {
+    return { resultType: "error", method, error: response.error ?? `${method} failed` };
+  }
+
+  const outcome: IpcRequestOutcome = { resultType: "success", method, result: response.result ?? null };
+  if (response.handledByClientId) {
+    outcome.handledByClientId = response.handledByClientId;
+  }
+  return outcome;
+}
+
 async function handleExtensionFollowerRequest(method: string, params: JsonValue): Promise<JsonValue> {
   const threadId = requestThreadId({ params });
   const ownerClientId = threadId ? streamOwners.get(threadId) : null;
@@ -737,28 +738,6 @@ async function handleExtensionFollowerRequest(method: string, params: JsonValue)
   }
 
   return response.result ?? { ok: true };
-}
-
-function handleExtensionThreadStreamSnapshotRequest(hostId: string, threadId: string): void {
-  const conversation = mirroredConversations.get(threadId);
-  const ownerClientId = streamOwners.get(threadId);
-  if (!conversation || !ownerClientId) {
-    return;
-  }
-
-  extensionWebview.handleIpcBroadcast({
-    type: "broadcast",
-    method: "thread-stream-state-changed",
-    sourceClientId: ownerClientId,
-    params: {
-      conversationId: threadId,
-      hostId,
-      change: {
-        type: "snapshot",
-        conversationState: conversation,
-      },
-    },
-  });
 }
 
 function updateDispatcherOwnedConversation(threadId: string, update: (conversation: JsonObject) => void): void {

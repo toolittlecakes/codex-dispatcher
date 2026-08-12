@@ -382,27 +382,6 @@ describe("extension webview", () => {
       });
 
       const stream = await openEventStream(webview, "tab-1");
-      webview.handleIpcBroadcast({
-        type: "broadcast",
-        method: "thread-stream-state-changed",
-        sourceClientId: "vscode-client",
-        version: 6,
-        params: { conversationId: "thread-1" },
-      });
-
-      const roleResponse = await webview.fetch(
-        new Request("http://localhost/host-message", {
-          method: "POST",
-          headers: { cookie: "codex_dispatcher_webview=secret", "x-dispatcher-client": "tab-1" },
-          body: JSON.stringify({ messages: [{
-            type: "thread-role-request",
-            requestId: "role-1",
-            conversationId: "owned-thread",
-          }] }),
-        }),
-        new URL("http://localhost/host-message"),
-      );
-      await expect(roleResponse.json()).resolves.toEqual({ accepted: true });
 
       const hostRoleResponse = await webview.fetch(
         new Request("http://localhost/host-message", {
@@ -419,23 +398,6 @@ describe("extension webview", () => {
         new URL("http://localhost/host-message"),
       );
       await expect(hostRoleResponse.json()).resolves.toEqual({ accepted: true });
-
-      const followerResponse = await webview.fetch(
-        new Request("http://localhost/host-message", {
-          method: "POST",
-          headers: { cookie: "codex_dispatcher_webview=secret", "x-dispatcher-client": "tab-1" },
-          body: JSON.stringify({ messages: [{
-            type: "thread-follower-start-turn-request",
-            requestId: "follower-1",
-            params: { conversationId: "thread-1" },
-          }] }),
-        }),
-        new URL("http://localhost/host-message"),
-      );
-      await expect(followerResponse.json()).resolves.toEqual({ accepted: true });
-      expect(followerRequests).toEqual([
-        { method: "thread-follower-start-turn", params: { conversationId: "thread-1" } },
-      ]);
 
       const hostFollowerResponse = await webview.fetch(
         new Request("http://localhost/host-message", {
@@ -457,7 +419,6 @@ describe("extension webview", () => {
       );
       await expect(hostFollowerResponse.json()).resolves.toEqual({ accepted: true });
       expect(followerRequests).toEqual([
-        { method: "thread-follower-start-turn", params: { conversationId: "thread-1" } },
         {
           method: "thread-follower-start-turn",
           params: {
@@ -510,21 +471,17 @@ describe("extension webview", () => {
         },
       ]);
 
-      // Broadcast and every reply arrive on one ordered channel, in causal order.
-      const delivered = await stream.waitFor(7);
+      // Every reply arrives on one ordered channel, in causal order.
+      const delivered = await stream.waitFor(4);
       await stream.cancel();
       expect(delivered.map((message) => message.type)).toEqual([
-        "ipc-broadcast",
-        "thread-role-response",
         "fetch-response",
-        "thread-follower-start-turn-response",
         "fetch-response",
         "fetch-response",
         "fetch-response",
       ]);
-      expect(delivered[1]).toEqual({ type: "thread-role-response", requestId: "role-1", role: "owner" });
-      expect(delivered[2]).toMatchObject({ requestId: "host-role-1", bodyJsonString: "\"follower\"" });
-      expect(delivered[6]).toMatchObject({ requestId: "ipc-1", bodyJsonString: "{\"mirrored\":true}" });
+      expect(delivered[0]).toMatchObject({ requestId: "host-role-1", bodyJsonString: "\"follower\"" });
+      expect(delivered[3]).toMatchObject({ requestId: "ipc-1", bodyJsonString: "{\"mirrored\":true}" });
 
       const debug = await webview.fetch(
         new Request("http://localhost/debug", {
@@ -534,9 +491,6 @@ describe("extension webview", () => {
       );
       const snapshot = await debug.json();
       expect(snapshot.messageCounts).toMatchObject({
-        "outbound:ipc-broadcast": 1,
-        "outbound:thread-role-response": 1,
-        "outbound:thread-follower-start-turn-response": 1,
         "outbound:fetch-response": 4,
       });
     } finally {
@@ -549,7 +503,7 @@ describe("extension webview", () => {
     }
   });
 
-  test("replays current thread stream snapshots to new event clients", async () => {
+  test("replays pending host state to new event clients", async () => {
     const previousRoot = process.env.CODEX_EXTENSION_WEBVIEW_ROOT;
     const root = mkdtempSync(join(tmpdir(), "codex-webview-events-"));
     process.env.CODEX_EXTENSION_WEBVIEW_ROOT = root;
@@ -557,18 +511,9 @@ describe("extension webview", () => {
 
     try {
       const replayMessage = {
-        type: "ipc-broadcast",
-        method: "thread-stream-state-changed",
-        sourceClientId: "vscode-client",
-        version: 6,
-        params: {
-          conversationId: "thread-1",
-          hostId: "vscode",
-          change: {
-            type: "snapshot",
-            conversationState: { id: "thread-1", hostId: "vscode", turns: [] },
-          },
-        },
+        type: "mcp-request",
+        hostId: "local",
+        request: { id: "req-1", method: "item/commandApproval", params: { threadId: "thread-1" } },
       };
       const webview = new ExtensionWebview({
         appServer: {} as never,
@@ -588,7 +533,7 @@ describe("extension webview", () => {
       const reader = response.body?.getReader();
       expect(reader).toBeDefined();
       let text = "";
-      for (let index = 0; index < 3 && !text.includes("thread-stream-state-changed"); index += 1) {
+      for (let index = 0; index < 3 && !text.includes("item/commandApproval"); index += 1) {
         const chunk = await reader?.read();
         if (chunk?.value) {
           text += new TextDecoder().decode(chunk.value);
@@ -660,11 +605,9 @@ describe("extension webview", () => {
       expect(epoch).toBeDefined();
 
       // Events broadcast while nothing is listening must survive for the reconnect.
-      webview.handleIpcBroadcast({
-        type: "broadcast",
-        method: "thread-stream-state-changed",
-        sourceClientId: "vscode-client",
-        params: { conversationId: "thread-1" },
+      webview.handleAppServerEvent({
+        type: "notification",
+        notification: { method: "codex/event/agent_message_delta", params: { delta: "from the app server" } },
       });
       webview.handleAppServerEvent({
         type: "notification",
@@ -674,7 +617,7 @@ describe("extension webview", () => {
       const resumed = await openStream(`${epoch}.0`);
       const resumedText = await readAvailable(resumed, 4);
       await resumed.cancel();
-      expect(resumedText).toContain("thread-stream-state-changed");
+      expect(resumedText).toContain("from the app server");
       expect(resumedText).toContain("missed while asleep");
       expect(resumedText).toContain(`id: ${epoch}.3`);
       // A resume replays the recorded stream; it must not regenerate state.
@@ -756,16 +699,14 @@ describe("extension webview", () => {
       // The dead socket is only noticed after the tab already reconnected.
       await stale.cancel();
 
-      webview.handleIpcBroadcast({
-        type: "broadcast",
-        method: "thread-stream-state-changed",
-        sourceClientId: "vscode-client",
-        params: { conversationId: "thread-1" },
+      webview.handleAppServerEvent({
+        type: "notification",
+        notification: { method: "codex/event/agent_message_delta", params: { delta: "from the app server" } },
       });
 
       const delivered = await reconnected.waitFor(1);
       await reconnected.cancel();
-      expect(delivered.map((message) => message.type)).toEqual(["ipc-broadcast"]);
+      expect(delivered.map((message) => message.type)).toEqual(["mcp-notification"]);
     } finally {
       if (previousRoot === undefined) {
         delete process.env.CODEX_EXTENSION_WEBVIEW_ROOT;
@@ -793,18 +734,16 @@ describe("extension webview", () => {
       const first = await openEventStream(webview, "tab-1");
       const second = await openEventStream(webview, "tab-2");
 
-      webview.handleIpcBroadcast({
-        type: "broadcast",
-        method: "thread-stream-state-changed",
-        sourceClientId: "vscode-client",
-        params: { conversationId: "thread-1" },
+      webview.handleAppServerEvent({
+        type: "notification",
+        notification: { method: "codex/event/agent_message_delta", params: { delta: "from the app server" } },
       });
 
       // The displaced tab hears that it lost the seat and nothing after it: an
       // approval delivered to both tabs is answered twice, and the second
       // answer is an error from the app server.
       expect((await first.waitFor(1)).map((message) => message.type)).toEqual(["dispatcher-webview-superseded"]);
-      expect((await second.waitFor(1)).map((message) => message.type)).toEqual(["ipc-broadcast"]);
+      expect((await second.waitFor(1)).map((message) => message.type)).toEqual(["mcp-notification"]);
 
       const late = await webview.fetch(
         new Request("http://localhost/host-message", {
@@ -847,11 +786,9 @@ describe("extension webview", () => {
       });
 
       const broadcast = (conversationId: string) => {
-        webview.handleIpcBroadcast({
-          type: "broadcast",
-          method: "thread-stream-state-changed",
-          sourceClientId: "vscode-client",
-          params: { conversationId },
+        webview.handleAppServerEvent({
+          type: "notification",
+          notification: { method: "codex/event/agent_message_delta", params: { conversationId } },
         });
       };
 
@@ -870,7 +807,7 @@ describe("extension webview", () => {
 
       // The reconnect only continues tab-1's old stream, so the session stays
       // with the tab the user actually opened last.
-      expect((await second.waitFor(1)).map((message) => message.type)).toEqual(["ipc-broadcast"]);
+      expect((await second.waitFor(1)).map((message) => message.type)).toEqual(["mcp-notification"]);
       expect((await reconnected.waitFor(1)).map((message) => message.type)).toEqual([
         "dispatcher-webview-superseded",
       ]);
