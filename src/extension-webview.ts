@@ -38,10 +38,16 @@ type ExtensionWebviewOptions = {
   handleThreadStreamSnapshotRequest?: (hostId: string, conversationId: string) => Promise<void> | void;
 };
 
-type SseClient = {
+// One ordered delivery channel per webview instance. VS Code hands the webview a
+// single FIFO postMessage pipe; responses and broadcasts arriving over separate
+// transports could otherwise be observed out of causal order.
+type StreamClient = {
   id: string;
-  controller: ReadableStreamDefaultController<Uint8Array>;
-  heartbeat: ReturnType<typeof setInterval>;
+  controller: ReadableStreamDefaultController<Uint8Array> | null;
+  heartbeat: ReturnType<typeof setInterval> | null;
+  seq: number;
+  buffer: { id: number; payload: JsonObject }[];
+  detachedAt: number | null;
 };
 
 type FetchResponseOptions = {
@@ -67,6 +73,7 @@ const maxDiagnosticMessages = 200;
 // forever. Stay under the strictest link in that chain.
 const externalFetchTimeoutMs = 25_000;
 const maxReplayEvents = 500;
+const detachedClientRetentionMs = 5 * 60_000;
 const globalState = new Map<string, JsonValue>();
 const persistedAtomState = new Map<string, JsonValue>();
 const sharedObjectState = new Map<string, JsonValue>();
@@ -155,9 +162,7 @@ export class ExtensionWebview {
   private readonly handleThreadStreamSnapshotRequest:
     | ((hostId: string, conversationId: string) => Promise<void> | void)
     | undefined;
-  private readonly clients = new Map<string, SseClient>();
-  private readonly recentEvents: { id: number; payload: JsonObject }[] = [];
-  private eventSeq = 0;
+  private readonly clients = new Map<string, StreamClient>();
   private readonly startedAt = new Date().toISOString();
   private readonly messageCounts = new Map<string, number>();
   private readonly recentMessages: JsonObject[] = [];
@@ -383,20 +388,22 @@ select,
   }
 
   private async handleHostMessage(request: Request): Promise<Response> {
+    const client = this.clientFor(clientIdFromRequest(request));
     let message: HostMessage;
     try {
       message = (await request.json()) as HostMessage;
     } catch {
-      return jsonResponse({ messages: [makeFetchResponse({ requestId: undefined, error: "Invalid JSON", status: 400 })] }, 400);
+      this.send(client, makeFetchResponse({ requestId: undefined, error: "Invalid JSON", status: 400 }));
+      return jsonResponse({ accepted: false }, 400);
     }
 
     this.recordMessage("inbound", message);
     try {
-      const messages = await this.routeHostMessage(message);
-      for (const outbound of messages) {
+      for (const outbound of await this.routeHostMessage(message)) {
         this.recordMessage("outbound", outbound);
+        this.send(client, outbound);
       }
-      return jsonResponse({ messages });
+      return jsonResponse({ accepted: true });
     } catch (error) {
       const hostError = {
         type: "host-message-error",
@@ -404,7 +411,8 @@ select,
         sourceType: typeof message.type === "string" ? message.type : "unknown",
       };
       this.remember(this.hostErrors, hostError);
-      return jsonResponse({ messages: [hostError] }, 500);
+      this.send(client, hostError);
+      return jsonResponse({ accepted: false }, 500);
     }
   }
 
@@ -736,22 +744,24 @@ select,
 
   private openEventStream(request: Request): Response {
     const resumeFrom = parseLastEventId(request.headers.get("last-event-id"));
-    let clientId = "";
+    const client = this.clientFor(clientIdFromRequest(request));
+    this.pruneDetachedClients();
+
     const stream = new ReadableStream<Uint8Array>({
       start: (controller) => {
-        clientId = crypto.randomUUID();
-        const heartbeat = setInterval(() => {
+        this.detachClient(client);
+        client.controller = controller;
+        client.detachedAt = null;
+        client.heartbeat = setInterval(() => {
           try {
             controller.enqueue(encoder.encode(": heartbeat\n\n"));
           } catch {
-            clearInterval(heartbeat);
-            this.clients.delete(clientId);
+            this.detachClient(client);
           }
         }, 5_000);
-        this.clients.set(clientId, { id: clientId, controller, heartbeat });
         controller.enqueue(encoder.encode(": connected\n\n"));
 
-        const missed = resumeFrom === null ? null : this.eventsAfter(resumeFrom);
+        const missed = resumeFrom === null ? null : bufferedAfter(client, resumeFrom);
         if (missed) {
           for (const event of missed) {
             controller.enqueue(encodeSseMessage(event.payload, event.id));
@@ -762,17 +772,11 @@ select,
         // Either a fresh connection or a reconnect whose gap we can no longer
         // replay exactly, so resynchronise from current state instead.
         for (const message of this.getEventReplayMessages?.() ?? []) {
-          controller.enqueue(encodeSseMessage(message, this.eventSeq));
+          controller.enqueue(encodeSseMessage(message, client.seq));
         }
       },
       cancel: () => {
-        if (clientId) {
-          const client = this.clients.get(clientId);
-          if (client) {
-            clearInterval(client.heartbeat);
-          }
-          this.clients.delete(clientId);
-        }
+        this.detachClient(client);
       },
     });
 
@@ -784,32 +788,66 @@ select,
     });
   }
 
-  private eventsAfter(lastEventId: number): { id: number; payload: JsonObject }[] | null {
-    const oldest = this.recentEvents[0];
-    if (lastEventId === this.eventSeq) {
-      return [];
+  private clientFor(clientId: string): StreamClient {
+    const existing = this.clients.get(clientId);
+    if (existing) {
+      return existing;
     }
-    if (!oldest || lastEventId < oldest.id - 1 || lastEventId > this.eventSeq) {
-      return null;
+
+    const client: StreamClient = {
+      id: clientId,
+      controller: null,
+      heartbeat: null,
+      seq: 0,
+      buffer: [],
+      detachedAt: Date.now(),
+    };
+    this.clients.set(clientId, client);
+    return client;
+  }
+
+  private detachClient(client: StreamClient): void {
+    if (client.heartbeat) {
+      clearInterval(client.heartbeat);
+      client.heartbeat = null;
     }
-    return this.recentEvents.filter((event) => event.id > lastEventId);
+    client.controller = null;
+    client.detachedAt = Date.now();
+  }
+
+  private pruneDetachedClients(): void {
+    const cutoff = Date.now() - detachedClientRetentionMs;
+    for (const client of this.clients.values()) {
+      if (client.detachedAt !== null && client.detachedAt < cutoff) {
+        this.clients.delete(client.id);
+      }
+    }
+  }
+
+  // Queue for a single webview. Buffered while its stream is down so a reconnect
+  // can resume rather than lose the message.
+  private send(client: StreamClient, message: JsonObject): void {
+    client.seq += 1;
+    client.buffer.push({ id: client.seq, payload: message });
+    if (client.buffer.length > maxReplayEvents) {
+      client.buffer.splice(0, client.buffer.length - maxReplayEvents);
+    }
+
+    if (!client.controller) {
+      return;
+    }
+
+    try {
+      client.controller.enqueue(encodeSseMessage(message, client.seq));
+    } catch {
+      this.detachClient(client);
+    }
   }
 
   private broadcast(message: JsonObject): void {
     this.recordMessage("outbound", message);
-    this.eventSeq += 1;
-    this.recentEvents.push({ id: this.eventSeq, payload: message });
-    if (this.recentEvents.length > maxReplayEvents) {
-      this.recentEvents.splice(0, this.recentEvents.length - maxReplayEvents);
-    }
-    const payload = encodeSseMessage(message, this.eventSeq);
     for (const client of this.clients.values()) {
-      try {
-        client.controller.enqueue(payload);
-      } catch {
-        clearInterval(client.heartbeat);
-        this.clients.delete(client.id);
-      }
+      this.send(client, message);
     }
   }
 
@@ -1006,7 +1044,9 @@ select,
   else document.addEventListener("DOMContentLoaded", applyBodyThemeClass, { once: true });
 
   const hostMessageUrl = ${JSON.stringify(`${routePrefix}/host-message`)};
-  const eventsUrl = ${JSON.stringify(`${routePrefix}/events`)};
+  // Identifies this webview across event stream reconnects so buffered replies survive.
+  const clientId = (crypto.randomUUID?.() ?? String(Date.now()) + Math.random().toString(16).slice(2));
+  const eventsUrl = ${JSON.stringify(`${routePrefix}/events?client=`)} + encodeURIComponent(clientId);
   const vscodeStateKey = "codex-extension-webview:vscode-state";
   const maxMessages = 500;
   const remember = (target, message) => {
@@ -1029,13 +1069,13 @@ select,
   const sendHostMessage = async (message) => {
     remember(window.__codexHostAdapterMessages, message);
     try {
-      const response = await fetch(hostMessageUrl, {
+      // Replies come back over the event stream, not in this response body, so the
+      // webview observes host traffic in one order instead of racing two channels.
+      await fetch(hostMessageUrl, {
         method: "POST",
-        headers: { "content-type": "application/json" },
+        headers: { "content-type": "application/json", "x-dispatcher-client": clientId },
         body: JSON.stringify(message),
       });
-      const body = await response.json();
-      deliver(body.messages);
     } catch (error) {
       const adapterError = {
         type: "host-adapter-error",
@@ -1720,6 +1760,22 @@ function jsonResponse(value: JsonValue, status = 200): Response {
 
 function encodeSseMessage(message: JsonObject, eventId: number): Uint8Array {
   return encoder.encode(`id: ${eventId}\ndata: ${JSON.stringify(message)}\n\n`);
+}
+
+function bufferedAfter(client: StreamClient, lastEventId: number): { id: number; payload: JsonObject }[] | null {
+  if (lastEventId === client.seq) {
+    return [];
+  }
+  const oldest = client.buffer[0];
+  if (!oldest || lastEventId < oldest.id - 1 || lastEventId > client.seq) {
+    return null;
+  }
+  return client.buffer.filter((event) => event.id > lastEventId);
+}
+
+function clientIdFromRequest(request: Request): string {
+  const url = new URL(request.url);
+  return url.searchParams.get("client") ?? request.headers.get("x-dispatcher-client") ?? "default";
 }
 
 function parseLastEventId(header: string | null): number | null {

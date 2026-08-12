@@ -9,6 +9,52 @@ import {
   resolveWebviewAssetPath,
 } from "../src/extension-webview";
 
+type StreamCollector = {
+  waitFor: (expected: number, timeoutMs?: number) => Promise<JsonRecord[]>;
+  cancel: () => Promise<void>;
+};
+
+type JsonRecord = Record<string, unknown>;
+
+async function openEventStream(webview: ExtensionWebview, clientId: string, lastEventId?: string): Promise<StreamCollector> {
+  const target = `http://localhost/events?client=${clientId}`;
+  const headers: Record<string, string> = { cookie: "codex_dispatcher_session=secret" };
+  if (lastEventId !== undefined) {
+    headers["last-event-id"] = lastEventId;
+  }
+  const response = await webview.fetch(new Request(target, { headers }), new URL(target));
+  const reader = response.body!.getReader();
+  const decoder = new TextDecoder();
+  const messages: JsonRecord[] = [];
+  let pending = "";
+
+  return {
+    async waitFor(expected, timeoutMs = 1_000) {
+      const deadline = Date.now() + timeoutMs;
+      while (messages.length < expected && Date.now() < deadline) {
+        const chunk = await Promise.race([
+          reader.read(),
+          new Promise<null>((resolve) => setTimeout(() => resolve(null), 25)),
+        ]);
+        if (!chunk?.value) {
+          continue;
+        }
+        pending += decoder.decode(chunk.value);
+        const frames = pending.split("\n\n");
+        pending = frames.pop() ?? "";
+        for (const frame of frames) {
+          const data = frame.split("\n").find((line) => line.startsWith("data: "));
+          if (data) {
+            messages.push(JSON.parse(data.slice(6)) as JsonRecord);
+          }
+        }
+      }
+      return messages;
+    },
+    cancel: () => reader.cancel(),
+  };
+}
+
 describe("extension webview", () => {
   test("builds VS Code fetch success responses in the extension contract", () => {
     expect(makeFetchResponse({ requestId: "1", result: { ok: true } })).toEqual({
@@ -133,6 +179,7 @@ describe("extension webview", () => {
         },
       });
 
+      const stream = await openEventStream(webview, "tab-1");
       webview.handleIpcBroadcast({
         type: "broadcast",
         method: "thread-stream-state-changed",
@@ -144,7 +191,7 @@ describe("extension webview", () => {
       const roleResponse = await webview.fetch(
         new Request("http://localhost/host-message", {
           method: "POST",
-          headers: { cookie: "codex_dispatcher_session=secret" },
+          headers: { cookie: "codex_dispatcher_session=secret", "x-dispatcher-client": "tab-1" },
           body: JSON.stringify({
             type: "thread-role-request",
             requestId: "role-1",
@@ -153,14 +200,12 @@ describe("extension webview", () => {
         }),
         new URL("http://localhost/host-message"),
       );
-      await expect(roleResponse.json()).resolves.toEqual({
-        messages: [{ type: "thread-role-response", requestId: "role-1", role: "owner" }],
-      });
+      await expect(roleResponse.json()).resolves.toEqual({ accepted: true });
 
       const hostRoleResponse = await webview.fetch(
         new Request("http://localhost/host-message", {
           method: "POST",
-          headers: { cookie: "codex_dispatcher_session=secret" },
+          headers: { cookie: "codex_dispatcher_session=secret", "x-dispatcher-client": "tab-1" },
           body: JSON.stringify({
             type: "fetch",
             requestId: "host-role-1",
@@ -171,23 +216,12 @@ describe("extension webview", () => {
         }),
         new URL("http://localhost/host-message"),
       );
-      await expect(hostRoleResponse.json()).resolves.toEqual({
-        messages: [
-          {
-            type: "fetch-response",
-            responseType: "success",
-            requestId: "host-role-1",
-            status: 200,
-            headers: {},
-            bodyJsonString: "\"follower\"",
-          },
-        ],
-      });
+      await expect(hostRoleResponse.json()).resolves.toEqual({ accepted: true });
 
       const followerResponse = await webview.fetch(
         new Request("http://localhost/host-message", {
           method: "POST",
-          headers: { cookie: "codex_dispatcher_session=secret" },
+          headers: { cookie: "codex_dispatcher_session=secret", "x-dispatcher-client": "tab-1" },
           body: JSON.stringify({
             type: "thread-follower-start-turn-request",
             requestId: "follower-1",
@@ -196,9 +230,7 @@ describe("extension webview", () => {
         }),
         new URL("http://localhost/host-message"),
       );
-      await expect(followerResponse.json()).resolves.toEqual({
-        messages: [{ type: "thread-follower-start-turn-response", requestId: "follower-1", result: { ok: true } }],
-      });
+      await expect(followerResponse.json()).resolves.toEqual({ accepted: true });
       expect(followerRequests).toEqual([
         { method: "thread-follower-start-turn", params: { conversationId: "thread-1" } },
       ]);
@@ -206,7 +238,7 @@ describe("extension webview", () => {
       const hostFollowerResponse = await webview.fetch(
         new Request("http://localhost/host-message", {
           method: "POST",
-          headers: { cookie: "codex_dispatcher_session=secret" },
+          headers: { cookie: "codex_dispatcher_session=secret", "x-dispatcher-client": "tab-1" },
           body: JSON.stringify({
             type: "fetch",
             requestId: "host-follower-1",
@@ -221,18 +253,7 @@ describe("extension webview", () => {
         }),
         new URL("http://localhost/host-message"),
       );
-      await expect(hostFollowerResponse.json()).resolves.toEqual({
-        messages: [
-          {
-            type: "fetch-response",
-            responseType: "success",
-            requestId: "host-follower-1",
-            status: 200,
-            headers: {},
-            bodyJsonString: "{\"ok\":true}",
-          },
-        ],
-      });
+      await expect(hostFollowerResponse.json()).resolves.toEqual({ accepted: true });
       expect(followerRequests).toEqual([
         { method: "thread-follower-start-turn", params: { conversationId: "thread-1" } },
         {
@@ -247,7 +268,7 @@ describe("extension webview", () => {
       const hostAssertResponse = await webview.fetch(
         new Request("http://localhost/host-message", {
           method: "POST",
-          headers: { cookie: "codex_dispatcher_session=secret" },
+          headers: { cookie: "codex_dispatcher_session=secret", "x-dispatcher-client": "tab-1" },
           body: JSON.stringify({
             type: "fetch",
             requestId: "host-assert-1",
@@ -258,23 +279,12 @@ describe("extension webview", () => {
         }),
         new URL("http://localhost/host-message"),
       );
-      await expect(hostAssertResponse.json()).resolves.toEqual({
-        messages: [
-          {
-            type: "fetch-response",
-            responseType: "success",
-            requestId: "host-assert-1",
-            status: 200,
-            headers: {},
-            bodyJsonString: "{\"ok\":true}",
-          },
-        ],
-      });
+      await expect(hostAssertResponse.json()).resolves.toEqual({ accepted: true });
 
       const ipcResponse = await webview.fetch(
         new Request("http://localhost/host-message", {
           method: "POST",
-          headers: { cookie: "codex_dispatcher_session=secret" },
+          headers: { cookie: "codex_dispatcher_session=secret", "x-dispatcher-client": "tab-1" },
           body: JSON.stringify({
             type: "fetch",
             requestId: "ipc-1",
@@ -289,18 +299,7 @@ describe("extension webview", () => {
         }),
         new URL("http://localhost/host-message"),
       );
-      await expect(ipcResponse.json()).resolves.toEqual({
-        messages: [
-          {
-            type: "fetch-response",
-            responseType: "success",
-            requestId: "ipc-1",
-            status: 200,
-            headers: {},
-            bodyJsonString: "{\"mirrored\":true}",
-          },
-        ],
-      });
+      await expect(ipcResponse.json()).resolves.toEqual({ accepted: true });
       expect(ipcRequests).toEqual([
         {
           method: "thread-follower-steer-turn",
@@ -308,6 +307,22 @@ describe("extension webview", () => {
           targetClientId: "vscode-client",
         },
       ]);
+
+      // Broadcast and every reply arrive on one ordered channel, in causal order.
+      const delivered = await stream.waitFor(7);
+      await stream.cancel();
+      expect(delivered.map((message) => message.type)).toEqual([
+        "ipc-broadcast",
+        "thread-role-response",
+        "fetch-response",
+        "thread-follower-start-turn-response",
+        "fetch-response",
+        "fetch-response",
+        "fetch-response",
+      ]);
+      expect(delivered[1]).toEqual({ type: "thread-role-response", requestId: "role-1", role: "owner" });
+      expect(delivered[2]).toMatchObject({ requestId: "host-role-1", bodyJsonString: "\"follower\"" });
+      expect(delivered[6]).toMatchObject({ requestId: "ipc-1", bodyJsonString: "{\"mirrored\":true}" });
 
       const debug = await webview.fetch(
         new Request("http://localhost/debug", {
@@ -486,11 +501,12 @@ describe("extension webview", () => {
         defaultCwd: "/repo",
         getToken: () => "secret",
       });
+      const stream = await openEventStream(webview, "tab-1");
       const postHostMessage = (body: unknown) =>
         webview.fetch(
           new Request("http://localhost/host-message", {
             method: "POST",
-            headers: { cookie: "codex_dispatcher_session=secret" },
+            headers: { cookie: "codex_dispatcher_session=secret", "x-dispatcher-client": "tab-1" },
             body: JSON.stringify(body),
           }),
           new URL("http://localhost/host-message"),
@@ -503,18 +519,16 @@ describe("extension webview", () => {
         { id: "8", response: { result: { decision: "approved" } } },
       ]);
 
-      const numericRequest = await postHostMessage({
+      await postHostMessage({
         type: "mcp-request",
         request: { id: 11, method: "thread/read", params: {} },
       });
-      await expect(numericRequest.json()).resolves.toEqual({
-        messages: [
-          {
-            type: "mcp-response",
-            hostId: "local",
-            message: { id: 11, result: { echoed: "thread/read" } },
-          },
-        ],
+      const [reply] = await stream.waitFor(1);
+      await stream.cancel();
+      expect(reply).toEqual({
+        type: "mcp-response",
+        hostId: "local",
+        message: { id: 11, result: { echoed: "thread/read" } },
       });
     } finally {
       if (previousRoot === undefined) {
@@ -550,11 +564,13 @@ describe("extension webview", () => {
         defaultCwd: "/repo",
         getToken: () => "secret",
       });
+      const stream = await openEventStream(webview, "tab-1");
+      let delivered = 0;
       const postFetch = async (path: string) => {
-        const response = await webview.fetch(
+        await webview.fetch(
           new Request("http://localhost/host-message", {
             method: "POST",
-            headers: { cookie: "codex_dispatcher_session=secret" },
+            headers: { cookie: "codex_dispatcher_session=secret", "x-dispatcher-client": "tab-1" },
             body: JSON.stringify({
               type: "fetch",
               requestId: `req-${path}`,
@@ -564,7 +580,9 @@ describe("extension webview", () => {
           }),
           new URL("http://localhost/host-message"),
         );
-        return (await response.json()).messages[0];
+        delivered += 1;
+        const messages = await stream.waitFor(delivered);
+        return messages[delivered - 1] as { responseType: string; status: number; bodyJsonString: string };
       };
 
       const failed = await postFetch("/rate-limited");
@@ -574,6 +592,7 @@ describe("extension webview", () => {
       const succeeded = await postFetch("/ok");
       expect(succeeded).toMatchObject({ responseType: "success", status: 200 });
       expect(JSON.parse(succeeded.bodyJsonString)).toEqual({ ok: true });
+      await stream.cancel();
     } finally {
       await origin.stop(true);
       if (previousRoot === undefined) {
@@ -599,11 +618,12 @@ describe("extension webview", () => {
         getToken: () => "secret",
         statePath,
       });
+      const firstStream = await openEventStream(firstHost, "tab-1");
 
       const atomUpdate = await firstHost.fetch(
         new Request("http://localhost/host-message", {
           method: "POST",
-          headers: { cookie: "codex_dispatcher_session=secret" },
+          headers: { cookie: "codex_dispatcher_session=secret", "x-dispatcher-client": "tab-1" },
           body: JSON.stringify({
             type: "persisted-atom-update",
             key: "onboarding.complete",
@@ -612,12 +632,12 @@ describe("extension webview", () => {
         }),
         new URL("http://localhost/host-message"),
       );
-      await expect(atomUpdate.json()).resolves.toEqual({ messages: [] });
+      await expect(atomUpdate.json()).resolves.toEqual({ accepted: true });
 
       const globalUpdate = await firstHost.fetch(
         new Request("http://localhost/host-message", {
           method: "POST",
-          headers: { cookie: "codex_dispatcher_session=secret" },
+          headers: { cookie: "codex_dispatcher_session=secret", "x-dispatcher-client": "tab-1" },
           body: JSON.stringify({
             type: "fetch",
             requestId: "set-global",
@@ -628,18 +648,24 @@ describe("extension webview", () => {
         }),
         new URL("http://localhost/host-message"),
       );
-      await expect(globalUpdate.json()).resolves.toEqual({
-        messages: [
-          {
-            type: "fetch-response",
-            responseType: "success",
-            requestId: "set-global",
-            status: 200,
-            headers: {},
-            bodyJsonString: "{\"success\":true}",
-          },
-        ],
-      });
+      await expect(globalUpdate.json()).resolves.toEqual({ accepted: true });
+      expect(await firstStream.waitFor(2)).toEqual([
+        {
+          type: "persisted-atom-updated",
+          key: "onboarding.complete",
+          value: { done: true },
+          deleted: false,
+        },
+        {
+          type: "fetch-response",
+          responseType: "success",
+          requestId: "set-global",
+          status: 200,
+          headers: {},
+          bodyJsonString: "{\"success\":true}",
+        },
+      ]);
+      await firstStream.cancel();
 
       expect(JSON.parse(readFileSync(statePath, "utf8"))).toEqual({
         globalState: { "welcome.dismissed": true },
@@ -653,27 +679,27 @@ describe("extension webview", () => {
         getToken: () => "secret",
         statePath,
       });
+      const restartedStream = await openEventStream(restartedHost, "tab-1");
 
       const readyResponse = await restartedHost.fetch(
         new Request("http://localhost/host-message", {
           method: "POST",
-          headers: { cookie: "codex_dispatcher_session=secret" },
+          headers: { cookie: "codex_dispatcher_session=secret", "x-dispatcher-client": "tab-1" },
           body: JSON.stringify({ type: "ready" }),
         }),
         new URL("http://localhost/host-message"),
       );
-      await expect(readyResponse.json()).resolves.toEqual({
-        messages: [
-          { type: "chat-font-settings", chatFontSize: null, chatCodeFontSize: null },
-          { type: "custom-prompts-updated", prompts: [] },
-          { type: "persisted-atom-sync", state: { "onboarding.complete": { done: true } } },
-        ],
-      });
+      await expect(readyResponse.json()).resolves.toEqual({ accepted: true });
+      expect(await restartedStream.waitFor(3)).toEqual([
+        { type: "chat-font-settings", chatFontSize: null, chatCodeFontSize: null },
+        { type: "custom-prompts-updated", prompts: [] },
+        { type: "persisted-atom-sync", state: { "onboarding.complete": { done: true } } },
+      ]);
 
       const globalRead = await restartedHost.fetch(
         new Request("http://localhost/host-message", {
           method: "POST",
-          headers: { cookie: "codex_dispatcher_session=secret" },
+          headers: { cookie: "codex_dispatcher_session=secret", "x-dispatcher-client": "tab-1" },
           body: JSON.stringify({
             type: "fetch",
             requestId: "get-global",
@@ -684,18 +710,16 @@ describe("extension webview", () => {
         }),
         new URL("http://localhost/host-message"),
       );
-      await expect(globalRead.json()).resolves.toEqual({
-        messages: [
-          {
-            type: "fetch-response",
-            responseType: "success",
-            requestId: "get-global",
-            status: 200,
-            headers: {},
-            bodyJsonString: "{\"value\":true}",
-          },
-        ],
+      await expect(globalRead.json()).resolves.toEqual({ accepted: true });
+      expect((await restartedStream.waitFor(4))[3]).toEqual({
+        type: "fetch-response",
+        responseType: "success",
+        requestId: "get-global",
+        status: 200,
+        headers: {},
+        bodyJsonString: "{\"value\":true}",
       });
+      await restartedStream.cancel();
     } finally {
       if (previousRoot === undefined) {
         delete process.env.CODEX_EXTENSION_WEBVIEW_ROOT;
