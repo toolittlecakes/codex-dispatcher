@@ -180,6 +180,10 @@ export class ExtensionWebview {
     | undefined;
   private readonly onThreadActivity: ((method: string, conversationId: string, thread?: JsonObject) => void) | undefined;
   private readonly clients = new Map<string, StreamClient>();
+  // VS Code hosts exactly one webview, and the extension is written for that:
+  // an approval it answers twice is an error, and per-tab host replies drift
+  // apart. The tab that opened a stream last is the one webview we admit.
+  private activeClientId: string | null = null;
   private readonly startedAt = new Date().toISOString();
   private readonly messageCounts = new Map<string, number>();
   private readonly recentMessages: JsonObject[] = [];
@@ -415,6 +419,13 @@ select,
 
   private async handleHostMessage(request: Request): Promise<Response> {
     const client = this.clientFor(clientIdFromRequest(request));
+    if (this.activeClientId !== null && this.activeClientId !== client.id) {
+      // A tab that lost the seat may still be mid-flight with a batch; letting
+      // it through would drive the session from two webviews at once.
+      this.send(client, { type: "dispatcher-webview-superseded" });
+      return jsonResponse({ accepted: false, error: "superseded" }, 409);
+    }
+
     let batch: HostMessage[];
     try {
       batch = parseHostMessageBatch(await request.json());
@@ -786,6 +797,7 @@ select,
     // this stream attached to an orphan that broadcasts no longer reach.
     this.pruneDetachedClients();
     const client = this.clientFor(clientIdFromRequest(request));
+    this.makeActive(client);
     const resumeFrom = parseResumePoint(client, request.headers.get("last-event-id"));
 
     let streamController: ReadableStreamDefaultController<Uint8Array> | null = null;
@@ -833,6 +845,20 @@ select,
         "content-type": "text/event-stream; charset=utf-8",
       },
     });
+  }
+
+  private makeActive(client: StreamClient): void {
+    if (this.activeClientId === client.id) {
+      return;
+    }
+
+    const superseded = this.activeClientId === null ? undefined : this.clients.get(this.activeClientId);
+    this.activeClientId = client.id;
+    if (superseded) {
+      // Told on its own stream, before it stops receiving broadcasts, so the
+      // tab can say why it went quiet instead of just freezing.
+      this.send(superseded, { type: "dispatcher-webview-superseded" });
+    }
   }
 
   private clientFor(clientId: string): StreamClient {
@@ -903,8 +929,9 @@ select,
     // Tabs that never come back are only reachable from here: a closed webview
     // stops opening streams, so this is the one place left to collect it.
     this.pruneDetachedClients();
-    for (const client of this.clients.values()) {
-      this.send(client, message);
+    const active = this.activeClientId === null ? undefined : this.clients.get(this.activeClientId);
+    if (active) {
+      this.send(active, message);
     }
   }
 
@@ -1117,8 +1144,31 @@ select,
     });
   };
   const postToWindow = (message) => window.postMessage(message, window.location.origin);
+  let superseded = false;
+  const showSuperseded = () => {
+    if (superseded) return;
+    superseded = true;
+    events.close();
+    const overlay = document.createElement("div");
+    overlay.setAttribute("data-codex-dispatcher-superseded", "");
+    overlay.style.cssText = "position:fixed;inset:0;z-index:2147483647;display:flex;flex-direction:column;align-items:center;justify-content:center;gap:16px;padding:24px;text-align:center;background:rgba(0,0,0,.86);color:#fff;font:15px/1.45 system-ui,-apple-system,sans-serif";
+    const text = document.createElement("div");
+    text.textContent = "Codex moved to another tab. Only one can drive the session.";
+    const button = document.createElement("button");
+    button.textContent = "Use this tab instead";
+    button.style.cssText = "padding:10px 18px;border:0;border-radius:8px;font:inherit;cursor:pointer;background:#fff;color:#000";
+    button.addEventListener("click", () => window.location.reload());
+    overlay.append(text, button);
+    (document.body || document.documentElement).appendChild(overlay);
+  };
   const deliver = (messages) => {
     for (const message of messages || []) {
+      // Ours, not the extension's: the host contract has no notion of a webview
+      // being replaced, so this one stops here.
+      if (message && message.type === "dispatcher-webview-superseded") {
+        showSuperseded();
+        continue;
+      }
       remember(window.__codexHostAdapterInboundMessages, message);
       postToWindow(message);
     }
@@ -1144,6 +1194,9 @@ select,
             headers: { "content-type": "application/json", "x-dispatcher-client": clientId },
             body: '{"messages":[' + batch.map((entry) => entry.json).join(",") + ']}',
           });
+          if (response.status === 409) {
+            showSuperseded();
+          }
           if (!response.ok) {
             throw new Error("host rejected the message batch with " + response.status);
           }

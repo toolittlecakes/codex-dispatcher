@@ -776,6 +776,62 @@ describe("extension webview", () => {
     }
   });
 
+  test("hands the session to the newest tab instead of running two webviews", async () => {
+    const previousRoot = process.env.CODEX_EXTENSION_WEBVIEW_ROOT;
+    const root = mkdtempSync(join(tmpdir(), "codex-webview-tabs-"));
+    process.env.CODEX_EXTENSION_WEBVIEW_ROOT = root;
+    writeFileSync(join(root, "index.html"), "<html><head></head><body></body></html>");
+
+    try {
+      const webview = new ExtensionWebview({
+        appServer: {} as never,
+        defaultCwd: "/repo",
+        getToken: () => "secret",
+        statePath: join(root, "extension-state.json"),
+      });
+
+      const first = await openEventStream(webview, "tab-1");
+      const second = await openEventStream(webview, "tab-2");
+
+      webview.handleIpcBroadcast({
+        type: "broadcast",
+        method: "thread-stream-state-changed",
+        sourceClientId: "vscode-client",
+        params: { conversationId: "thread-1" },
+      });
+
+      // The displaced tab hears that it lost the seat and nothing after it: an
+      // approval delivered to both tabs is answered twice, and the second
+      // answer is an error from the app server.
+      expect((await first.waitFor(1)).map((message) => message.type)).toEqual(["dispatcher-webview-superseded"]);
+      expect((await second.waitFor(1)).map((message) => message.type)).toEqual(["ipc-broadcast"]);
+
+      const late = await webview.fetch(
+        new Request("http://localhost/host-message", {
+          method: "POST",
+          headers: {
+            "content-type": "application/json",
+            cookie: "codex_dispatcher_webview=secret",
+            "x-dispatcher-client": "tab-1",
+          },
+          body: JSON.stringify({ messages: [{ type: "ready" }] }),
+        }),
+        new URL("http://localhost/host-message"),
+      );
+      expect(late.status).toBe(409);
+
+      await first.cancel();
+      await second.cancel();
+    } finally {
+      if (previousRoot === undefined) {
+        delete process.env.CODEX_EXTENSION_WEBVIEW_ROOT;
+      } else {
+        process.env.CODEX_EXTENSION_WEBVIEW_ROOT = previousRoot;
+      }
+      rmSync(root, { recursive: true, force: true });
+    }
+  });
+
   test("resumes a snapshot that was cut in half instead of dropping its tail", async () => {
     const previousRoot = process.env.CODEX_EXTENSION_WEBVIEW_ROOT;
     const root = mkdtempSync(join(tmpdir(), "codex-webview-snapshot-"));
