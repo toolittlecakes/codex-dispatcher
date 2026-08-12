@@ -17,6 +17,34 @@ export function buildDispatcherSnapshotParams(conversationId: string, conversati
   };
 }
 
+// Asked once, when this dispatcher takes a thread over: every client with that
+// thread open answers with a following change, which is how an owner that
+// arrived after its followers finds out they are there.
+export function buildFollowingStatusRequestParams(conversationId: string): JsonObject {
+  return { conversationId, hostId: dispatcherIpcHostId };
+}
+
+export type StreamFollowingChange = {
+  conversationId: string;
+  clientId: string;
+  following: boolean;
+};
+
+export function parseStreamFollowingChange(
+  paramsValue: JsonValue | undefined,
+  sourceClientId: string,
+): StreamFollowingChange | null {
+  const params = asJsonObject(paramsValue);
+  if (!params || params.hostId !== dispatcherIpcHostId) {
+    return null;
+  }
+  if (typeof params.conversationId !== "string" || typeof params.following !== "boolean" || !sourceClientId) {
+    return null;
+  }
+
+  return { conversationId: params.conversationId, clientId: sourceClientId, following: params.following };
+}
+
 export function buildQueuedFollowUpsBroadcastParams(conversationId: string, stateValue: JsonValue): JsonObject {
   return {
     conversationId,

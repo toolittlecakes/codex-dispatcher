@@ -5,8 +5,10 @@ import { CodexIpcBridge, type IpcBroadcastMessage } from "./codex-ipc";
 import {
   buildDispatcherSnapshotParams,
   buildDispatcherTurnStartRequest,
+  buildFollowingStatusRequestParams,
   buildQueuedFollowUpsBroadcastParams,
   dispatcherIpcHostId,
+  parseStreamFollowingChange,
   updateCollaborationModeSettings,
 } from "./dispatcher-owner";
 import { ExtensionWebview } from "./extension-webview";
@@ -48,6 +50,9 @@ const streamOwners = new Map<string, string>();
 const mirroredConversations = new Map<string, JsonObject>();
 const dispatcherOwnedConversations = new Map<string, JsonObject>();
 const dispatcherOwnedRefreshTimers = new Map<string, ReturnType<typeof setTimeout>>();
+// Who asked to be kept up to date on which thread. A thread nobody follows is
+// still ours to drive, it just costs no traffic.
+const streamFollowersByConversation = new Map<string, Set<string>>();
 
 // Reading, listing, renaming or archiving a thread is not driving it: only a
 // call that runs or creates a turn makes this dispatcher the owner.
@@ -112,12 +117,6 @@ ipcBridge.onEvent((event) => {
   if (event.type === "broadcast") {
     extensionWebview.handleIpcBroadcast(event.broadcast);
     applyIpcBroadcastEffects(event.broadcast);
-    if (event.broadcast.method === "client-status-changed") {
-      const params = asJsonObject(event.broadcast.params);
-      if (params?.status === "connected") {
-        broadcastDispatcherOwnedSnapshots();
-      }
-    }
     return;
   }
 
@@ -195,6 +194,14 @@ function applyIpcBroadcastEffects(broadcastMessage: IpcBroadcastMessage): void {
     return;
   }
 
+  if (broadcastMessage.method === "thread-stream-following-changed") {
+    const change = parseStreamFollowingChange(broadcastMessage.params, broadcastMessage.sourceClientId);
+    if (change) {
+      applyStreamFollowingChange(change.conversationId, change.clientId, change.following);
+    }
+    return;
+  }
+
   if (broadcastMessage.method !== "client-status-changed") {
     return;
   }
@@ -202,6 +209,10 @@ function applyIpcBroadcastEffects(broadcastMessage: IpcBroadcastMessage): void {
   const params = asJsonObject(broadcastMessage.params);
   if (params?.status !== "disconnected" || typeof params.clientId !== "string") {
     return;
+  }
+
+  for (const followers of streamFollowersByConversation.values()) {
+    followers.delete(params.clientId);
   }
 
   for (const [threadId, ownerClientId] of streamOwners.entries()) {
@@ -212,6 +223,24 @@ function applyIpcBroadcastEffects(broadcastMessage: IpcBroadcastMessage): void {
     streamOwners.delete(threadId);
     mirroredConversations.delete(threadId);
   }
+}
+
+// A client announcing it follows a thread we drive is the only thing that opens
+// the tap: it gets the current state right away and every later change until it
+// says otherwise.
+function applyStreamFollowingChange(conversationId: string, clientId: string, following: boolean): void {
+  const followers = streamFollowersByConversation.get(conversationId) ?? new Set<string>();
+  if (!following) {
+    followers.delete(clientId);
+    if (followers.size === 0) {
+      streamFollowersByConversation.delete(conversationId);
+    }
+    return;
+  }
+
+  followers.add(clientId);
+  streamFollowersByConversation.set(conversationId, followers);
+  sendDispatcherOwnedSnapshot(conversationId, [clientId]);
 }
 
 async function handleDispatcherOwnerRequest(method: string, paramsValue: JsonValue | undefined): Promise<JsonValue> {
@@ -418,6 +447,7 @@ function releaseDispatcherOwnership(threadId: string): void {
   if (!dispatcherOwnedConversations.delete(threadId)) {
     return;
   }
+  streamFollowersByConversation.delete(threadId);
   const pending = dispatcherOwnedRefreshTimers.get(threadId);
   if (pending) {
     clearTimeout(pending);
@@ -446,6 +476,9 @@ function claimDispatcherOwnership(threadId: string): boolean {
   }
 
   dispatcherOwnedConversations.set(threadId, minimalDispatcherConversation(threadId));
+  // Windows that already had this thread open were following whoever drove it
+  // before us and have no reason to announce themselves again, so ask.
+  ipcBridge.broadcast("thread-stream-following-status-requested", buildFollowingStatusRequestParams(threadId));
   return true;
 }
 
@@ -496,19 +529,24 @@ async function refreshDispatcherOwnedConversation(threadId: string): Promise<voi
   broadcastDispatcherOwnedSnapshot(threadId);
 }
 
-function broadcastDispatcherOwnedSnapshots(): void {
-  for (const threadId of dispatcherOwnedConversations.keys()) {
-    broadcastDispatcherOwnedSnapshot(threadId);
+function broadcastDispatcherOwnedSnapshot(threadId: string): void {
+  const followers = streamFollowersByConversation.get(threadId);
+  if (!followers || followers.size === 0) {
+    return;
   }
+
+  sendDispatcherOwnedSnapshot(threadId, [...followers]);
 }
 
-function broadcastDispatcherOwnedSnapshot(threadId: string): void {
+function sendDispatcherOwnedSnapshot(threadId: string, targetClientIds: string[]): void {
   const conversation = dispatcherOwnedConversations.get(threadId);
   if (!conversation) {
     return;
   }
 
-  ipcBridge.broadcast("thread-stream-state-changed", buildDispatcherSnapshotParams(threadId, conversation));
+  ipcBridge.broadcast("thread-stream-state-changed", buildDispatcherSnapshotParams(threadId, conversation), {
+    targetClientIds,
+  });
 }
 
 function buildExtensionEventReplayMessages(): JsonObject[] {
@@ -532,21 +570,9 @@ function buildExtensionEventReplayMessages(): JsonObject[] {
     messages.push(buildThreadStreamSnapshotMessage(threadId, ownerClientId, conversation));
   }
 
-  const dispatcherClientId = ipcBridge.getSnapshot().clientId;
-  if (!dispatcherClientId) {
-    return messages;
-  }
-
-  for (const [threadId, conversation] of dispatcherOwnedConversations.entries()) {
-    messages.push({
-      type: "ipc-broadcast",
-      method: "thread-stream-state-changed",
-      sourceClientId: dispatcherClientId,
-      version: 6,
-      params: buildDispatcherSnapshotParams(threadId, conversation),
-    });
-  }
-
+  // Threads this dispatcher owns are deliberately absent: the webview drives
+  // them through our app server and already has their state, and a replay per
+  // owned thread grows with every thread the phone has ever run.
   return messages;
 }
 
@@ -734,6 +760,9 @@ function clearIpcMirrorsIfDisconnected(status: string): void {
 
   streamOwners.clear();
   mirroredConversations.clear();
+  // Client ids are handed out per connection, so nothing that followed us over
+  // the old socket exists any more; they announce again after reconnecting.
+  streamFollowersByConversation.clear();
 }
 
 function applyConversationMirror(threadId: string, params: JsonObject): boolean {

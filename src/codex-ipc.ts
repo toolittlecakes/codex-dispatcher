@@ -2,7 +2,7 @@ import { randomUUID } from "node:crypto";
 import { existsSync, mkdirSync, unlinkSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
-import { connect, createServer, type Server, type Socket } from "node:net";
+import { createServer, Socket, type Server } from "node:net";
 import type { JsonObject, JsonValue } from "./codex-app-server";
 import { isJsonObject, toError } from "./shared";
 
@@ -32,6 +32,9 @@ export type IpcBroadcastMessage = {
   sourceClientId: string;
   version?: number;
   params?: JsonValue;
+  // Present when the sender addressed named clients: per-conversation stream
+  // state only goes to the clients that said they follow that conversation.
+  targetClientIds?: string[];
 };
 
 type IpcClientDiscoveryRequestMessage = {
@@ -115,6 +118,8 @@ const maxBufferBytes = 512 * 1024 * 1024;
 
 const methodVersions: Record<string, number> = {
   "thread-stream-state-changed": 6,
+  "thread-stream-following-changed": 1,
+  "thread-stream-following-status-requested": 1,
   "thread-read-state-changed": 1,
   "thread-archived": 2,
   "thread-unarchived": 1,
@@ -146,7 +151,7 @@ export function getCodexIpcSocketPath(): string {
 }
 
 export class CodexIpcBridge {
-  private readonly routerManager = new IpcRouterManager();
+  private readonly routerManager: IpcRouterManager;
   private readonly listeners = new Set<(event: CodexIpcEvent) => void>();
   private readonly pendingResponses = new Map<string, PendingResponse>();
   private readonly peers = new Map<string, CodexIpcPeer>();
@@ -160,7 +165,12 @@ export class CodexIpcBridge {
   private status: CodexIpcSnapshot["status"] = "starting";
   private detail: string | null = null;
 
-  readonly socketPath = getCodexIpcSocketPath();
+  readonly socketPath: string;
+
+  constructor(socketPath: string = getCodexIpcSocketPath()) {
+    this.socketPath = socketPath;
+    this.routerManager = new IpcRouterManager(socketPath);
+  }
 
   onEvent(listener: (event: CodexIpcEvent) => void): () => void {
     this.listeners.add(listener);
@@ -242,19 +252,29 @@ export class CodexIpcBridge {
     };
   }
 
-  broadcast(method: string, params: JsonValue): boolean {
+  broadcast(method: string, params: JsonValue, options: { targetClientIds?: string[] } = {}): boolean {
     const socket = this.socket;
     if (!socket || !socket.writable || this.clientId === initializingClientId) {
       return false;
     }
+    // An addressed broadcast with nobody to address is not a broadcast to
+    // everyone: the sender scoped it, and an empty scope means send nothing.
+    if (options.targetClientIds?.length === 0) {
+      return false;
+    }
 
-    writeFrame(socket, {
+    const message: IpcBroadcastMessage = {
       type: "broadcast",
       method,
       sourceClientId: this.clientId,
       version: methodVersion(method),
       params,
-    });
+    };
+    if (options.targetClientIds) {
+      message.targetClientIds = options.targetClientIds;
+    }
+
+    writeFrame(socket, message);
     return true;
   }
 
@@ -264,7 +284,15 @@ export class CodexIpcBridge {
     }
 
     await new Promise<void>((resolve) => {
-      const socket = connect(this.socketPath, () => {
+      // Same ordering as the router probe: a missing socket path errors inside
+      // connect(), so the handlers have to be on the socket before it dials.
+      const socket = new Socket();
+      socket.on("error", (error) => {
+        this.setStatus("error", error.message);
+        resolve();
+      });
+
+      socket.connect(this.socketPath, () => {
         if (this.disposed) {
           socket.destroy();
           resolve();
@@ -301,11 +329,6 @@ export class CodexIpcBridge {
             socket.destroy();
           });
 
-        resolve();
-      });
-
-      socket.on("error", (error) => {
-        this.setStatus("error", error.message);
         resolve();
       });
 
@@ -387,6 +410,12 @@ export class CodexIpcBridge {
   }
 
   private handleBroadcast(message: IpcBroadcastMessage): void {
+    // The router already filters, but a client that is not on the list must
+    // not act on a frame it was only handed by an older router.
+    if (message.targetClientIds && !message.targetClientIds.includes(this.clientId)) {
+      return;
+    }
+
     if (message.method === "client-status-changed") {
       this.applyClientStatusBroadcast(message.params);
       this.emit({ type: "status", snapshot: this.getSnapshot() });
@@ -515,7 +544,8 @@ class IpcRouterManager {
   private router: IpcRouter | null = null;
   private started = false;
   private ownsSocket = false;
-  private readonly socketPath = getCodexIpcSocketPath();
+
+  constructor(private readonly socketPath: string) {}
 
   async startRouterIfNeeded(): Promise<void> {
     if (this.started || (await this.canConnectToSocket())) {
@@ -573,12 +603,16 @@ class IpcRouterManager {
 
   private canConnectToSocket(): Promise<boolean> {
     return new Promise((resolve) => {
-      const socket = connect(this.socketPath, () => {
-        socket.end();
-        resolve(true);
-      });
+      // Listener first: connecting to a socket path that does not exist reports
+      // ENOENT before connect() returns, and an unhandled error here would fail
+      // the start of the very router that is missing.
+      const socket = new Socket();
       socket.on("error", () => {
         resolve(false);
+      });
+      socket.connect(this.socketPath, () => {
+        socket.end();
+        resolve(true);
       });
     });
   }
@@ -676,9 +710,10 @@ class IpcRouter {
     const senderClientId = this.clients.get(socket)?.id ?? message.sourceClientId;
     const forwarded = { ...message, sourceClientId: senderClientId };
     const frame = makeFrame(forwarded);
+    const targets = message.targetClientIds ? new Set(message.targetClientIds) : null;
 
     for (const client of this.clients.values()) {
-      if (client.socket !== socket && client.socket.writable) {
+      if (client.socket !== socket && client.socket.writable && (targets === null || targets.has(client.id))) {
         writeFrame(client.socket, forwarded, frame);
       }
     }

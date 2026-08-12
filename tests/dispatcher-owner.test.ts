@@ -4,6 +4,7 @@ import {
   buildDispatcherTurnStartRequest,
   buildQueuedFollowUpsBroadcastParams,
   dispatcherIpcHostId,
+  parseStreamFollowingChange,
   updateCollaborationModeSettings,
 } from "../src/dispatcher-owner";
 
@@ -63,6 +64,24 @@ describe("dispatcher owner IPC helpers", () => {
       effort: "high",
       collaborationMode: null,
     });
+  });
+
+  test("reads a following announcement addressed to our host", () => {
+    expect(
+      parseStreamFollowingChange({ conversationId: "thread-1", hostId: dispatcherIpcHostId, following: true }, "client-7"),
+    ).toEqual({ conversationId: "thread-1", clientId: "client-7", following: true });
+  });
+
+  test("ignores a following announcement for someone else's host", () => {
+    // A remote host's threads are not ours to stream, and answering them would
+    // push our conversation state to a client that asked another owner for it.
+    expect(
+      parseStreamFollowingChange({ conversationId: "thread-1", hostId: "ssh-remote", following: true }, "client-7"),
+    ).toBeNull();
+    expect(parseStreamFollowingChange({ conversationId: "thread-1", hostId: dispatcherIpcHostId }, "client-7")).toBeNull();
+    expect(
+      parseStreamFollowingChange({ conversationId: "thread-1", hostId: dispatcherIpcHostId, following: true }, ""),
+    ).toBeNull();
   });
 
   test("keeps model and effort inside collaboration mode settings", () => {
