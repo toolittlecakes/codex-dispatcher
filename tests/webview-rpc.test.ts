@@ -40,6 +40,7 @@ type HostClientCoordination = {
   requestThreadFollower(payload: {
     request: { method: string; params: JsonValue };
     targetClientId?: string;
+    timeoutMs?: number;
   }): Promise<IpcRequestOutcome>;
 };
 
@@ -147,13 +148,13 @@ describe("webview rpc session", () => {
     writeFileSync(join(root, "index.html"), "<html><head></head><body></body></html>");
 
     const broadcasts: Broadcast[] = [];
-    const requests: { method: string; params: JsonValue; targetClientId: string | undefined }[] = [];
+    const requests: { method: string; params: JsonValue; options: unknown }[] = [];
     const ipcCoordination: WebviewIpcCoordination = {
       broadcast: (method, params, targetClientIds) => {
         broadcasts.push({ method, params, targetClientIds });
       },
-      request: async (method, params, targetClientId) => {
-        requests.push({ method, params, targetClientId });
+      request: async (method, params, options) => {
+        requests.push({ method, params, options });
         return { resultType: "success", method, result: { ok: true } };
       },
       ideContext: () => null,
@@ -185,13 +186,16 @@ describe("webview rpc session", () => {
       const outcome = await client.host.requestThreadFollower({
         request: { method: "thread-follower-start-turn", params: { conversationId: "thread-1" } },
         targetClientId: "vscode-client",
+        timeoutMs: 300_000,
       });
       expect(outcome).toMatchObject({ resultType: "success", result: { ok: true } });
+      // The caller's timeout travels with the request: loading a long history
+      // is given minutes, and the bridge default would cut it off in seconds.
       expect(requests).toEqual([
         {
           method: "thread-follower-start-turn",
           params: { conversationId: "thread-1" },
-          targetClientId: "vscode-client",
+          options: { targetClientId: "vscode-client", timeoutMs: 300_000 },
         },
       ]);
 

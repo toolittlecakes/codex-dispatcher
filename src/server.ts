@@ -35,7 +35,7 @@ const extensionWebview = new ExtensionWebview({
   handleFollowerRequest: (method, params) => handleExtensionFollowerRequest(method, params),
   ipcCoordination: {
     broadcast: (method, params, targetClientIds) => broadcastForWebview(method, params, targetClientIds),
-    request: (method, params, targetClientId) => requestForWebview(method, params, targetClientId),
+    request: (method, params, options) => requestForWebview(method, params, options),
     // No editor behind this host, so there is no IDE context to report.
     ideContext: () => null,
   },
@@ -716,9 +716,9 @@ function broadcastForWebview(method: string, params: JsonValue, targetClientIds:
 async function requestForWebview(
   method: string,
   params: JsonValue,
-  targetClientId: string | undefined,
+  options: { targetClientId?: string | undefined; timeoutMs?: number | undefined },
 ): Promise<IpcRequestOutcome> {
-  const response = await ipcBridge.request(method, params, targetClientId ? { targetClientId } : {});
+  const response = await ipcBridge.request(method, params, options);
   if (response.resultType === "error") {
     return { resultType: "error", method, error: response.error ?? `${method} failed` };
   }

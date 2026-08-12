@@ -19,7 +19,11 @@ export type IpcRequestOutcome =
 
 export type WebviewIpcCoordination = {
   broadcast(method: string, params: JsonValue, targetClientIds?: string[]): void;
-  request(method: string, params: JsonValue, targetClientId?: string): Promise<IpcRequestOutcome>;
+  request(
+    method: string,
+    params: JsonValue,
+    options: { targetClientId?: string | undefined; timeoutMs?: number | undefined },
+  ): Promise<IpcRequestOutcome>;
   ideContext(): JsonValue;
 };
 
@@ -108,7 +112,7 @@ class ClientCoordination extends RpcTarget {
   }
 
   async findThreadOwner({ hostId, conversationId }: { hostId: string; conversationId: string }): Promise<string | null> {
-    const response = await this.ipc.request("thread-owner-discovery", { hostId, conversationId });
+    const response = await this.ipc.request("thread-owner-discovery", { hostId, conversationId }, {});
     if (response.resultType === "error") {
       if (response.error === "no-client-found") {
         return null;
@@ -119,14 +123,19 @@ class ClientCoordination extends RpcTarget {
     return response.handledByClientId ?? null;
   }
 
+  // The caller's timeout is part of the request: loading the complete history
+  // of a long thread is given five minutes by the extension, and the default
+  // five seconds would cut it off every time.
   requestThreadFollower({
     request,
     targetClientId,
+    timeoutMs,
   }: {
     request: { method: string; params: JsonValue };
     targetClientId?: string;
+    timeoutMs?: number;
   }): Promise<IpcRequestOutcome> {
-    return this.ipc.request(request.method, request.params, targetClientId);
+    return this.ipc.request(request.method, request.params, { targetClientId, timeoutMs });
   }
 }
 

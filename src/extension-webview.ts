@@ -806,6 +806,11 @@ select,
     const superseded = this.activeClientId === null ? undefined : this.clients.get(this.activeClientId);
     this.activeClientId = client.id;
     if (superseded) {
+      // Its RPC session goes with the seat: a displaced tab is refused at
+      // /host-message, so anything we asked it would wait for an answer that
+      // can no longer come back.
+      this.rpcSessions.get(superseded.id)?.dispose();
+      this.rpcSessions.delete(superseded.id);
       // Told on its own stream, before it stops receiving broadcasts, so the
       // tab can say why it went quiet instead of just freezing.
       this.send(superseded, { type: "dispatcher-webview-superseded" });

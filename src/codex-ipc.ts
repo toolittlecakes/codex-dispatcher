@@ -241,7 +241,7 @@ export class CodexIpcBridge {
   request(
     method: string,
     params: JsonValue,
-    options: { targetClientId?: string } = {},
+    options: { targetClientId?: string | undefined; timeoutMs?: number | undefined } = {},
   ): Promise<IpcResponseMessage> {
     return this.sendRequest(method, params, options);
   }
@@ -361,7 +361,7 @@ export class CodexIpcBridge {
   private sendRequest(
     method: string,
     params: JsonValue,
-    options: { targetClientId?: string } = {},
+    options: { targetClientId?: string | undefined; timeoutMs?: number | undefined } = {},
   ): Promise<IpcResponseMessage> {
     const socket = this.socket;
     if (!socket || !socket.writable) {
@@ -384,7 +384,7 @@ export class CodexIpcBridge {
       const timer = setTimeout(() => {
         this.pendingResponses.delete(request.requestId);
         reject(new Error("timeout"));
-      }, requestTimeoutMs);
+      }, options.timeoutMs ?? requestTimeoutMs);
 
       this.pendingResponses.set(request.requestId, { timer, resolve, reject });
       writeFrame(socket, request);
