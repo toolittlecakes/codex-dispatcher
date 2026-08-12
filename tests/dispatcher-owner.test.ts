@@ -5,6 +5,8 @@ import {
   buildDispatcherTurnStartRequest,
   buildQueuedFollowUpsBroadcastParams,
   dispatcherIpcHostId,
+  isNoActiveTurnError,
+  mismatchedTurnId,
   parseStreamFollowingChange,
 } from "../src/dispatcher-owner";
 import { asJsonObject } from "../src/shared";
@@ -152,6 +154,16 @@ describe("dispatcher owner IPC helpers", () => {
       mode: "plan",
       settings: { model: "gpt-5", reasoning_effort: "high" },
     });
+  });
+
+  // Our copy of the thread is a throttled read, so a stop can name a turn the app
+  // server has already moved past; it answers by naming the one it is running.
+  test("reads the running turn out of an interrupt the app server refused", () => {
+    expect(mismatchedTurnId("expected active turn id `turn-1` but found `turn-2`")).toBe("turn-2");
+    expect(mismatchedTurnId('ExpectedTurnMismatch { expected: "turn-1", actual: "turn-2" }')).toBe("turn-2");
+    expect(mismatchedTurnId("no active turn to interrupt")).toBeNull();
+    expect(isNoActiveTurnError("no active turn to interrupt")).toBe(true);
+    expect(isNoActiveTurnError("thread not found")).toBe(false);
   });
 
   test("resolves a permissions change into the profile the next turn runs with", () => {

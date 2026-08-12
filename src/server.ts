@@ -10,11 +10,13 @@ import {
   buildFollowingStatusRequestParams,
   buildQueuedFollowUpsBroadcastParams,
   dispatcherIpcHostId,
+  isNoActiveTurnError,
+  mismatchedTurnId,
   parseStreamFollowingChange,
 } from "./dispatcher-owner";
 import { ExtensionWebview } from "./extension-webview";
 import { applyJsonPatches, cloneJson } from "./json-patch";
-import { asJsonObject, isJsonObject } from "./shared";
+import { asJsonObject, isJsonObject, toError } from "./shared";
 import type { IpcRequestOutcome } from "./webview-rpc";
 
 const port = Number(process.env.PORT ?? "8787");
@@ -511,12 +513,49 @@ async function handleDispatcherOwnerInterruptTurn(
     return { interruptedTurnId: null, ok: true };
   }
 
-  await appServer.request("turn/interrupt", {
-    threadId: conversationId,
-    turnId,
-  });
+  const interruptedTurnId = await interruptDispatcherOwnedTurn(conversationId, turnId, expectedTurnId);
   scheduleDispatcherOwnedRefresh(conversationId, 0);
-  return { interruptedTurnId: turnId, ok: true };
+  return { interruptedTurnId, ok: true };
+}
+
+// Our copy of the thread is a throttled read, so a stop pressed at the wrong
+// millisecond aims at a turn the app server has already moved past: it answers
+// with the turn that is really running, or with «no active turn» when the last
+// one just finished. The extension resolves both without an error (`Lze`), and
+// a stop that throws in the follower's UI for winning a race is worse than a
+// stop that quietly did nothing.
+async function interruptDispatcherOwnedTurn(
+  conversationId: string,
+  turnId: string,
+  expectedTurnId: string | null,
+): Promise<string | null> {
+  try {
+    await appServer.request("turn/interrupt", { threadId: conversationId, turnId });
+    return turnId;
+  } catch (error) {
+    const message = toError(error).message;
+    const actualTurnId = mismatchedTurnId(message);
+    if (actualTurnId) {
+      if (expectedTurnId !== null && actualTurnId !== expectedTurnId) {
+        return null;
+      }
+
+      try {
+        await appServer.request("turn/interrupt", { threadId: conversationId, turnId: actualTurnId });
+      } catch (retryError) {
+        if (!isNoActiveTurnError(toError(retryError).message)) {
+          throw retryError;
+        }
+      }
+      return actualTurnId;
+    }
+
+    if (isNoActiveTurnError(message)) {
+      return expectedTurnId === null ? turnId : null;
+    }
+
+    throw error;
+  }
 }
 
 function canHandleDispatcherOwnerRequest(method: string, paramsValue: JsonValue | undefined): boolean {

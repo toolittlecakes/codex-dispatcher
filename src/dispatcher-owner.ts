@@ -149,6 +149,22 @@ function collaborationModeModel(collaborationModeValue: JsonValue | undefined): 
   return asJsonObject(asJsonObject(collaborationModeValue)?.settings)?.model;
 }
 
+// The app server names the turn it is actually running when it refuses an
+// interrupt aimed at another one. Both spellings come from the webview's own
+// parser (`Fze`), which reads either the message or the raw Rust error.
+export function mismatchedTurnId(message: string): string | null {
+  const named = /expected active turn id `?([^`\s]+)`? but found `?([^`\s]+)`?/.exec(message);
+  if (named) {
+    return named[2] ?? null;
+  }
+
+  return /ExpectedTurnMismatch\s*\{[^}]*actual:\s*"([^"]+)"/.exec(message)?.[1] ?? null;
+}
+
+export function isNoActiveTurnError(message: string): boolean {
+  return message === "no active turn to interrupt";
+}
+
 // Asked once, when this dispatcher takes a thread over: every client with that
 // thread open answers with a following change, which is how an owner that
 // arrived after its followers finds out they are there.
