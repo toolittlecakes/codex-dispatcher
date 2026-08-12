@@ -485,6 +485,85 @@ describe("extension webview", () => {
     }
   });
 
+  test("delivers replies produced before the webview managed to open its event stream", async () => {
+    const previousRoot = process.env.CODEX_EXTENSION_WEBVIEW_ROOT;
+    const root = mkdtempSync(join(tmpdir(), "codex-webview-race-"));
+    process.env.CODEX_EXTENSION_WEBVIEW_ROOT = root;
+    writeFileSync(join(root, "index.html"), "<html><head></head><body></body></html>");
+
+    try {
+      const webview = new ExtensionWebview({
+        appServer: {} as never,
+        defaultCwd: "/repo",
+        getToken: () => "secret",
+        statePath: join(root, "extension-state.json"),
+        getEventReplayMessages: () => [{ type: "resync-snapshot" }],
+      });
+
+      // EventSource connects asynchronously, so a webview that posts during boot
+      // can be answered before its stream exists.
+      const accepted = await webview.fetch(
+        new Request("http://localhost/host-message", {
+          method: "POST",
+          headers: { cookie: "codex_dispatcher_session=secret", "x-dispatcher-client": "tab-1" },
+          body: JSON.stringify({ type: "persisted-atom-sync-request" }),
+        }),
+        new URL("http://localhost/host-message"),
+      );
+      await expect(accepted.json()).resolves.toEqual({ accepted: true });
+
+      const stream = await openEventStream(webview, "tab-1");
+      const delivered = await stream.waitFor(1);
+      await stream.cancel();
+      expect(delivered).toEqual([{ type: "persisted-atom-sync", state: {} }]);
+    } finally {
+      if (previousRoot === undefined) {
+        delete process.env.CODEX_EXTENSION_WEBVIEW_ROOT;
+      } else {
+        process.env.CODEX_EXTENSION_WEBVIEW_ROOT = previousRoot;
+      }
+      rmSync(root, { recursive: true, force: true });
+    }
+  });
+
+  test("keeps a reconnected event stream alive when the stale connection is torn down", async () => {
+    const previousRoot = process.env.CODEX_EXTENSION_WEBVIEW_ROOT;
+    const root = mkdtempSync(join(tmpdir(), "codex-webview-stale-"));
+    process.env.CODEX_EXTENSION_WEBVIEW_ROOT = root;
+    writeFileSync(join(root, "index.html"), "<html><head></head><body></body></html>");
+
+    try {
+      const webview = new ExtensionWebview({
+        appServer: {} as never,
+        defaultCwd: "/repo",
+        getToken: () => "secret",
+      });
+
+      const stale = await openEventStream(webview, "tab-1");
+      const reconnected = await openEventStream(webview, "tab-1");
+      // The dead socket is only noticed after the tab already reconnected.
+      await stale.cancel();
+
+      webview.handleIpcBroadcast({
+        type: "broadcast",
+        method: "thread-stream-state-changed",
+        sourceClientId: "vscode-client",
+        params: { conversationId: "thread-1" },
+      });
+
+      const delivered = await reconnected.waitFor(1);
+      await reconnected.cancel();
+      expect(delivered.map((message) => message.type)).toEqual(["ipc-broadcast"]);
+    } finally {
+      if (previousRoot === undefined) {
+        delete process.env.CODEX_EXTENSION_WEBVIEW_ROOT;
+      } else {
+        process.env.CODEX_EXTENSION_WEBVIEW_ROOT = previousRoot;
+      }
+      rmSync(root, { recursive: true, force: true });
+    }
+  });
+
   test("forwards webview mcp-response errors and numeric request ids to the app server", async () => {
     const previousRoot = process.env.CODEX_EXTENSION_WEBVIEW_ROOT;
     const root = mkdtempSync(join(tmpdir(), "codex-webview-mcp-"));

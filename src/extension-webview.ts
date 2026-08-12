@@ -747,6 +747,7 @@ select,
     const client = this.clientFor(clientIdFromRequest(request));
     this.pruneDetachedClients();
 
+    let streamController: ReadableStreamDefaultController<Uint8Array> | null = null;
     const stream = new ReadableStream<Uint8Array>({
       start: (controller) => {
         this.detachClient(client);
@@ -756,12 +757,13 @@ select,
           try {
             controller.enqueue(encoder.encode(": heartbeat\n\n"));
           } catch {
-            this.detachClient(client);
+            this.detachIfCurrent(client, controller);
           }
         }, 5_000);
+        streamController = controller;
         controller.enqueue(encoder.encode(": connected\n\n"));
 
-        const missed = resumeFrom === null ? null : bufferedAfter(client, resumeFrom);
+        const missed = bufferedAfter(client, resumeFrom);
         if (missed) {
           for (const event of missed) {
             controller.enqueue(encodeSseMessage(event.payload, event.id));
@@ -776,7 +778,9 @@ select,
         }
       },
       cancel: () => {
-        this.detachClient(client);
+        // A dead socket can be reported long after the tab already reconnected;
+        // only the connection that is still attached may tear the client down.
+        this.detachIfCurrent(client, streamController);
       },
     });
 
@@ -804,6 +808,12 @@ select,
     };
     this.clients.set(clientId, client);
     return client;
+  }
+
+  private detachIfCurrent(client: StreamClient, controller: ReadableStreamDefaultController<Uint8Array> | null): void {
+    if (controller !== null && client.controller === controller) {
+      this.detachClient(client);
+    }
   }
 
   private detachClient(client: StreamClient): void {
@@ -846,6 +856,9 @@ select,
 
   private broadcast(message: JsonObject): void {
     this.recordMessage("outbound", message);
+    // Tabs that never come back are only reachable from here: a closed webview
+    // stops opening streams, so this is the one place left to collect it.
+    this.pruneDetachedClients();
     for (const client of this.clients.values()) {
       this.send(client, message);
     }
@@ -1762,7 +1775,14 @@ function encodeSseMessage(message: JsonObject, eventId: number): Uint8Array {
   return encoder.encode(`id: ${eventId}\ndata: ${JSON.stringify(message)}\n\n`);
 }
 
-function bufferedAfter(client: StreamClient, lastEventId: number): { id: number; payload: JsonObject }[] | null {
+function bufferedAfter(client: StreamClient, lastEventId: number | null): { id: number; payload: JsonObject }[] | null {
+  if (lastEventId === null) {
+    // No Last-Event-ID means this webview has not seen a single event yet, so
+    // an intact buffer (still starting at the first event) is exactly what it
+    // missed — a POST whose reply landed before the stream came up.
+    const first = client.buffer[0];
+    return first && first.id === 1 ? [...client.buffer] : null;
+  }
   if (lastEventId === client.seq) {
     return [];
   }
