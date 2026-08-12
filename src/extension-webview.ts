@@ -43,6 +43,7 @@ type ExtensionWebviewOptions = {
 // transports could otherwise be observed out of causal order.
 type StreamClient = {
   id: string;
+  epoch: string;
   controller: ReadableStreamDefaultController<Uint8Array> | null;
   heartbeat: ReturnType<typeof setInterval> | null;
   seq: number;
@@ -393,7 +394,7 @@ select,
     try {
       batch = parseHostMessageBatch(await request.json());
     } catch {
-      this.send(client, makeFetchResponse({ requestId: undefined, error: "Invalid JSON", status: 400 }));
+      this.send(client, { type: "host-message-error", error: "Malformed host-message batch", sourceType: "unknown" });
       return jsonResponse({ accepted: false }, 400);
     }
 
@@ -751,8 +752,8 @@ select,
   }
 
   private openEventStream(request: Request): Response {
-    const resumeFrom = parseLastEventId(request.headers.get("last-event-id"));
     const client = this.clientFor(clientIdFromRequest(request));
+    const resumeFrom = parseResumePoint(client, request.headers.get("last-event-id"));
     this.pruneDetachedClients();
 
     let streamController: ReadableStreamDefaultController<Uint8Array> | null = null;
@@ -772,17 +773,18 @@ select,
         controller.enqueue(encoder.encode(": connected\n\n"));
 
         const missed = bufferedAfter(client, resumeFrom);
-        if (missed) {
-          for (const event of missed) {
-            controller.enqueue(encodeSseMessage(event.payload, event.id));
-          }
+        for (const event of missed ?? []) {
+          controller.enqueue(encodeSseMessage(client, event.payload, event.id));
+        }
+        if (resumeFrom !== null && missed) {
           return;
         }
 
-        // Either a fresh connection or a reconnect whose gap we can no longer
-        // replay exactly, so resynchronise from current state instead.
+        // A stream this webview has never read from: whatever we could replay
+        // above is its own pending traffic, and current state still has to
+        // follow it — pending approvals live only in this snapshot.
         for (const message of this.getEventReplayMessages?.() ?? []) {
-          controller.enqueue(encodeSseMessage(message, client.seq));
+          controller.enqueue(encodeSseMessage(client, message, client.seq));
         }
       },
       cancel: () => {
@@ -808,6 +810,7 @@ select,
 
     const client: StreamClient = {
       id: clientId,
+      epoch: crypto.randomUUID(),
       controller: null,
       heartbeat: null,
       seq: 0,
@@ -856,7 +859,7 @@ select,
     }
 
     try {
-      client.controller.enqueue(encodeSseMessage(message, client.seq));
+      client.controller.enqueue(encodeSseMessage(client, message, client.seq));
     } catch {
       this.detachClient(client);
     }
@@ -1103,17 +1106,22 @@ select,
         try {
           // Replies come back over the event stream, not in this response body, so the
           // webview observes host traffic in one order instead of racing two channels.
-          await fetch(hostMessageUrl, {
+          const response = await fetch(hostMessageUrl, {
             method: "POST",
             headers: { "content-type": "application/json", "x-dispatcher-client": clientId },
-            body: JSON.stringify({ messages: batch }),
+            body: '{"messages":[' + batch.map((entry) => entry.json).join(",") + ']}',
           });
+          if (!response.ok) {
+            throw new Error("host rejected the message batch with " + response.status);
+          }
         } catch (error) {
-          for (const message of batch) {
+          // A dropped batch is a dead end for every promise waiting on it, so
+          // make it loud instead of leaving the webview waiting forever.
+          for (const entry of batch) {
             remember(window.__codexHostAdapterInboundMessages, {
               type: "host-adapter-error",
               error: error instanceof Error ? error.message : String(error),
-              sourceType: typeof message?.type === "string" ? message.type : "unknown",
+              sourceType: entry.sourceType,
             });
           }
           console.error("[codex-extension-webview] host-message failed", error);
@@ -1125,7 +1133,12 @@ select,
   };
   const sendHostMessage = (message) => {
     remember(window.__codexHostAdapterMessages, message);
-    outbox.push(message);
+    // Serialise per message: VS Code's postMessage throws at the caller for a
+    // value it cannot clone, instead of taking its neighbours down with it.
+    outbox.push({
+      json: JSON.stringify(message),
+      sourceType: typeof message?.type === "string" ? message.type : "unknown",
+    });
     void flushOutbox();
   };
 
@@ -1800,8 +1813,8 @@ function jsonResponse(value: JsonValue, status = 200): Response {
   });
 }
 
-function encodeSseMessage(message: JsonObject, eventId: number): Uint8Array {
-  return encoder.encode(`id: ${eventId}\ndata: ${JSON.stringify(message)}\n\n`);
+function encodeSseMessage(client: StreamClient, message: JsonObject, eventId: number): Uint8Array {
+  return encoder.encode(`id: ${client.epoch}.${eventId}\ndata: ${JSON.stringify(message)}\n\n`);
 }
 
 function bufferedAfter(client: StreamClient, lastEventId: number | null): { id: number; payload: JsonObject }[] | null {
@@ -1835,11 +1848,14 @@ function clientIdFromRequest(request: Request): string {
   return url.searchParams.get("client") ?? request.headers.get("x-dispatcher-client") ?? "default";
 }
 
-function parseLastEventId(header: string | null): number | null {
-  if (!header) {
+// Sequence numbers restart whenever a client record is recreated (prune, host
+// restart), so a resume is only meaningful when the epoch still matches.
+function parseResumePoint(client: StreamClient, header: string | null): number | null {
+  const separator = header?.lastIndexOf(".") ?? -1;
+  if (!header || separator < 0 || header.slice(0, separator) !== client.epoch) {
     return null;
   }
-  const parsed = Number(header);
+  const parsed = Number(header.slice(separator + 1));
   return Number.isSafeInteger(parsed) && parsed >= 0 ? parsed : null;
 }
 

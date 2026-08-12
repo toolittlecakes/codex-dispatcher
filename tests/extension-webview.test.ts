@@ -11,6 +11,7 @@ import {
 
 type StreamCollector = {
   waitFor: (expected: number, timeoutMs?: number) => Promise<JsonRecord[]>;
+  lastEventId: () => string | null;
   cancel: () => Promise<void>;
 };
 
@@ -27,6 +28,7 @@ async function openEventStream(webview: ExtensionWebview, clientId: string, last
   const decoder = new TextDecoder();
   const messages: JsonRecord[] = [];
   let pending = "";
+  let latestEventId: string | null = null;
 
   // One read is kept in flight across poll iterations: a read abandoned on
   // timeout still consumes the next chunk, which would silently drop events.
@@ -42,6 +44,9 @@ async function openEventStream(webview: ExtensionWebview, clientId: string, last
           settled.then((result) => result),
           new Promise<null>((resolve) => setTimeout(() => resolve(null), 25)),
         ]);
+        if (chunk?.done) {
+          break;
+        }
         if (!chunk?.value) {
           continue;
         }
@@ -50,6 +55,10 @@ async function openEventStream(webview: ExtensionWebview, clientId: string, last
         const frames = pending.split("\n\n");
         pending = frames.pop() ?? "";
         for (const frame of frames) {
+          const id = frame.split("\n").find((line) => line.startsWith("id: "));
+          if (id) {
+            latestEventId = id.slice(4);
+          }
           const data = frame.split("\n").find((line) => line.startsWith("data: "));
           if (data) {
             messages.push(JSON.parse(data.slice(6)) as JsonRecord);
@@ -58,6 +67,7 @@ async function openEventStream(webview: ExtensionWebview, clientId: string, last
       }
       return messages;
     },
+    lastEventId: () => latestEventId,
     cancel: () => reader.cancel(),
   };
 }
@@ -403,7 +413,7 @@ describe("extension webview", () => {
 
       expect(text).toContain(": connected");
       expect(text).toContain(`data: ${JSON.stringify(replayMessage)}`);
-      expect(text).toContain("id: 0");
+      expect(text).toMatch(/id: [0-9a-f-]+\.0\n/);
     } finally {
       if (previousRoot === undefined) {
         delete process.env.CODEX_EXTENSION_WEBVIEW_ROOT;
@@ -454,8 +464,11 @@ describe("extension webview", () => {
       };
 
       const first = await openStream();
-      expect(await readAvailable(first, 3)).toContain("resync-snapshot");
+      const firstText = await readAvailable(first, 3);
+      expect(firstText).toContain("resync-snapshot");
       await first.cancel();
+      const epoch = firstText.match(/id: ([^.\n]+)\./)?.[1];
+      expect(epoch).toBeDefined();
 
       // Events broadcast while nothing is listening must survive for the reconnect.
       webview.handleIpcBroadcast({
@@ -469,16 +482,16 @@ describe("extension webview", () => {
         notification: { method: "codex/event/agent_message_delta", params: { delta: "missed while asleep" } },
       });
 
-      const resumed = await openStream("0");
+      const resumed = await openStream(`${epoch}.0`);
       const resumedText = await readAvailable(resumed, 4);
       await resumed.cancel();
       expect(resumedText).toContain("thread-stream-state-changed");
       expect(resumedText).toContain("missed while asleep");
-      expect(resumedText).toContain("id: 2");
+      expect(resumedText).toContain(`id: ${epoch}.2`);
       expect(resumedText).not.toContain("resync-snapshot");
 
       // An id the buffer cannot account for falls back to a full resynchronisation.
-      const stale = await openStream("9999");
+      const stale = await openStream(`${epoch}.9999`);
       const staleText = await readAvailable(stale, 3);
       await stale.cancel();
       expect(staleText).toContain("resync-snapshot");
@@ -520,9 +533,11 @@ describe("extension webview", () => {
       await expect(accepted.json()).resolves.toEqual({ accepted: true });
 
       const stream = await openEventStream(webview, "tab-1");
-      const delivered = await stream.waitFor(1);
+      const delivered = await stream.waitFor(2);
       await stream.cancel();
-      expect(delivered).toEqual([{ type: "persisted-atom-sync", state: {} }]);
+      // The buffered reply must not cost the tab its state snapshot: pending
+      // approvals only ever arrive in the resync.
+      expect(delivered).toEqual([{ type: "persisted-atom-sync", state: {} }, { type: "resync-snapshot" }]);
     } finally {
       if (previousRoot === undefined) {
         delete process.env.CODEX_EXTENSION_WEBVIEW_ROOT;
@@ -561,6 +576,46 @@ describe("extension webview", () => {
       const delivered = await reconnected.waitFor(1);
       await reconnected.cancel();
       expect(delivered.map((message) => message.type)).toEqual(["ipc-broadcast"]);
+    } finally {
+      if (previousRoot === undefined) {
+        delete process.env.CODEX_EXTENSION_WEBVIEW_ROOT;
+      } else {
+        process.env.CODEX_EXTENSION_WEBVIEW_ROOT = previousRoot;
+      }
+      rmSync(root, { recursive: true, force: true });
+    }
+  });
+
+  test("ignores a Last-Event-ID from an earlier incarnation of the same client", async () => {
+    const previousRoot = process.env.CODEX_EXTENSION_WEBVIEW_ROOT;
+    const root = mkdtempSync(join(tmpdir(), "codex-webview-epoch-"));
+    process.env.CODEX_EXTENSION_WEBVIEW_ROOT = root;
+    writeFileSync(join(root, "index.html"), "<html><head></head><body></body></html>");
+
+    try {
+      const webview = new ExtensionWebview({
+        appServer: {} as never,
+        defaultCwd: "/repo",
+        getToken: () => "secret",
+        statePath: join(root, "extension-state.json"),
+        getEventReplayMessages: () => [{ type: "resync-snapshot" }],
+      });
+
+      await webview.fetch(
+        new Request("http://localhost/host-message", {
+          method: "POST",
+          headers: { cookie: "codex_dispatcher_session=secret", "x-dispatcher-client": "tab-1" },
+          body: JSON.stringify({ messages: [{ type: "persisted-atom-sync-request" }] }),
+        }),
+        new URL("http://localhost/host-message"),
+      );
+
+      // Sequence numbers restarted with this client record; the browser still
+      // remembers an id from before, and must not be resumed against it.
+      const stream = await openEventStream(webview, "tab-1", "00000000-0000-4000-8000-000000000000.7");
+      const delivered = await stream.waitFor(2);
+      await stream.cancel();
+      expect(delivered).toEqual([{ type: "persisted-atom-sync", state: {} }, { type: "resync-snapshot" }]);
     } finally {
       if (previousRoot === undefined) {
         delete process.env.CODEX_EXTENSION_WEBVIEW_ROOT;
@@ -664,9 +719,29 @@ describe("extension webview", () => {
       // The ack must not wait for the network call the first message started.
       await expect(accepted.json()).resolves.toEqual({ accepted: true });
 
-      const delivered = await stream.waitFor(2, 3_000);
+      // Messages that answer at the same speed keep their send order.
+      await webview.fetch(
+        new Request("http://localhost/host-message", {
+          method: "POST",
+          headers: { cookie: "codex_dispatcher_session=secret", "x-dispatcher-client": "tab-1" },
+          body: JSON.stringify({
+            messages: [
+              { type: "shared-object-subscribe", key: "workspace" },
+              { type: "persisted-atom-sync-request" },
+            ],
+          }),
+        }),
+        new URL("http://localhost/host-message"),
+      );
+
+      const delivered = await stream.waitFor(4, 3_000);
       await stream.cancel();
-      expect(delivered.map((message) => message.type)).toEqual(["persisted-atom-sync", "fetch-response"]);
+      expect(delivered.map((message) => message.type)).toEqual([
+        "persisted-atom-sync",
+        "shared-object-updated",
+        "persisted-atom-sync",
+        "fetch-response",
+      ]);
     } finally {
       await origin.stop(true);
       if (previousRoot === undefined) {
