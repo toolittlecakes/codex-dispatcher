@@ -752,9 +752,11 @@ select,
   }
 
   private openEventStream(request: Request): Response {
+    // Prune first: collecting a record right after handing it out would leave
+    // this stream attached to an orphan that broadcasts no longer reach.
+    this.pruneDetachedClients();
     const client = this.clientFor(clientIdFromRequest(request));
     const resumeFrom = parseResumePoint(client, request.headers.get("last-event-id"));
-    this.pruneDetachedClients();
 
     let streamController: ReadableStreamDefaultController<Uint8Array> | null = null;
     const stream = new ReadableStream<Uint8Array>({
@@ -782,9 +784,10 @@ select,
 
         // A stream this webview has never read from: whatever we could replay
         // above is its own pending traffic, and current state still has to
-        // follow it — pending approvals live only in this snapshot.
+        // follow it — pending approvals live only in this snapshot. These go
+        // through the normal numbering so a drop mid-snapshot can be resumed.
         for (const message of this.getEventReplayMessages?.() ?? []) {
-          controller.enqueue(encodeSseMessage(client, message, client.seq));
+          this.send(client, message);
         }
       },
       cancel: () => {
@@ -1135,10 +1138,11 @@ select,
     remember(window.__codexHostAdapterMessages, message);
     // Serialise per message: VS Code's postMessage throws at the caller for a
     // value it cannot clone, instead of taking its neighbours down with it.
-    outbox.push({
-      json: JSON.stringify(message),
-      sourceType: typeof message?.type === "string" ? message.type : "unknown",
-    });
+    const json = JSON.stringify(message);
+    if (json === undefined) {
+      throw new TypeError("postMessage payload is not serialisable for the host channel");
+    }
+    outbox.push({ json, sourceType: typeof message?.type === "string" ? message.type : "unknown" });
     void flushOutbox();
   };
 

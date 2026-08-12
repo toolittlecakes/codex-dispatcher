@@ -413,7 +413,7 @@ describe("extension webview", () => {
 
       expect(text).toContain(": connected");
       expect(text).toContain(`data: ${JSON.stringify(replayMessage)}`);
-      expect(text).toMatch(/id: [0-9a-f-]+\.0\n/);
+      expect(text).toMatch(/id: [0-9a-f-]+\.1\n/);
     } finally {
       if (previousRoot === undefined) {
         delete process.env.CODEX_EXTENSION_WEBVIEW_ROOT;
@@ -430,12 +430,16 @@ describe("extension webview", () => {
     process.env.CODEX_EXTENSION_WEBVIEW_ROOT = root;
     writeFileSync(join(root, "index.html"), "<html><head></head><body></body></html>");
 
+    let replayCalls = 0;
     try {
       const webview = new ExtensionWebview({
         appServer: {} as never,
         defaultCwd: "/repo",
         getToken: () => "secret",
-        getEventReplayMessages: () => [{ type: "resync-snapshot" }],
+        getEventReplayMessages: () => {
+          replayCalls += 1;
+          return [{ type: "resync-snapshot" }];
+        },
       });
       const openStream = async (lastEventId?: string) => {
         const headers: Record<string, string> = { cookie: "codex_dispatcher_session=secret" };
@@ -487,8 +491,9 @@ describe("extension webview", () => {
       await resumed.cancel();
       expect(resumedText).toContain("thread-stream-state-changed");
       expect(resumedText).toContain("missed while asleep");
-      expect(resumedText).toContain(`id: ${epoch}.2`);
-      expect(resumedText).not.toContain("resync-snapshot");
+      expect(resumedText).toContain(`id: ${epoch}.3`);
+      // A resume replays the recorded stream; it must not regenerate state.
+      expect(replayCalls).toBe(1);
 
       // An id the buffer cannot account for falls back to a full resynchronisation.
       const stale = await openStream(`${epoch}.9999`);
@@ -576,6 +581,50 @@ describe("extension webview", () => {
       const delivered = await reconnected.waitFor(1);
       await reconnected.cancel();
       expect(delivered.map((message) => message.type)).toEqual(["ipc-broadcast"]);
+    } finally {
+      if (previousRoot === undefined) {
+        delete process.env.CODEX_EXTENSION_WEBVIEW_ROOT;
+      } else {
+        process.env.CODEX_EXTENSION_WEBVIEW_ROOT = previousRoot;
+      }
+      rmSync(root, { recursive: true, force: true });
+    }
+  });
+
+  test("resumes a snapshot that was cut in half instead of dropping its tail", async () => {
+    const previousRoot = process.env.CODEX_EXTENSION_WEBVIEW_ROOT;
+    const root = mkdtempSync(join(tmpdir(), "codex-webview-snapshot-"));
+    process.env.CODEX_EXTENSION_WEBVIEW_ROOT = root;
+    writeFileSync(join(root, "index.html"), "<html><head></head><body></body></html>");
+
+    try {
+      const webview = new ExtensionWebview({
+        appServer: {} as never,
+        defaultCwd: "/repo",
+        getToken: () => "secret",
+        statePath: join(root, "extension-state.json"),
+        getEventReplayMessages: () => [
+          { type: "mcp-request", request: { id: "approval-1" } },
+          { type: "thread-snapshot", conversationId: "thread-1" },
+          { type: "thread-snapshot", conversationId: "thread-2" },
+        ],
+      });
+
+      const first = await openEventStream(webview, "tab-1");
+      const seen = await first.waitFor(1);
+      expect(seen[0]).toEqual({ type: "mcp-request", request: { id: "approval-1" } });
+      const lastEventId = first.lastEventId();
+      await first.cancel();
+
+      // The tab acknowledged only the approval; the rest of the snapshot must
+      // still be reachable, otherwise the turn stalls with no prompt.
+      const resumed = await openEventStream(webview, "tab-1", lastEventId!);
+      const delivered = await resumed.waitFor(2);
+      await resumed.cancel();
+      expect(delivered).toEqual([
+        { type: "thread-snapshot", conversationId: "thread-1" },
+        { type: "thread-snapshot", conversationId: "thread-2" },
+      ]);
     } finally {
       if (previousRoot === undefined) {
         delete process.env.CODEX_EXTENSION_WEBVIEW_ROOT;
