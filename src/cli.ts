@@ -8,7 +8,7 @@ import { dirname, join, resolve } from "node:path";
 import packageJson from "../package.json" with { type: "json" };
 import { resolveCodexCliPath } from "./codex-app-server";
 import { readDispatcherConfig, writeDispatcherConfig, type DispatcherConfig } from "./dispatcher-config";
-import { resolveExtensionWebviewRoot } from "./extension-webview";
+import { resolveExtensionWebviewRoot, verifiedExtensionVersion } from "./extension-webview";
 import { buildGitHubDeviceCodeBody, buildGitHubDeviceTokenBody } from "./github-oauth";
 import { startRelayClient, type RelayClient } from "./relay-client";
 
@@ -593,7 +593,7 @@ async function runDoctor(options: CliOptions): Promise<boolean> {
     ok: unsupportedExtension === null && (webviewRoot !== null || (options.installExtension && codeCli.ok)),
     detail: unsupportedExtension ?? webviewRoot ?? (
       options.installExtension && codeCli.ok
-        ? `not installed yet; serve will install ${extensionId}`
+        ? `not installed yet; serve will install ${extensionId}@${verifiedExtensionVersion}`
         : "not found; install the extension or set CODEX_EXTENSION_WEBVIEW_ROOT"
     ),
   });
@@ -645,8 +645,8 @@ async function ensureCodexExtensionWebviewRoot(installMissing: boolean): Promise
     );
   }
 
-  console.log(`Codex VS Code extension was not found. Installing ${extensionId} with the VS Code CLI...`);
-  await runCommand("code", ["--install-extension", extensionId]);
+  console.log(`Codex VS Code extension was not found. Installing ${extensionId}@${verifiedExtensionVersion} with the VS Code CLI...`);
+  await runCommand("code", ["--install-extension", `${extensionId}@${verifiedExtensionVersion}`]);
 
   const installed = resolveExtensionWebviewRoot();
   if (!installed) {

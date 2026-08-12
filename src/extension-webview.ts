@@ -1225,6 +1225,10 @@ select,
 // version verified end to end.
 const supportedExtensionVersions = { min: [26, 422], max: [26, 803] };
 
+// The build `serve --install-extension` puts on a fresh machine: installing
+// marketplace latest would hand us a version the range above rejects.
+export const verifiedExtensionVersion = "26.803.61601";
+
 export function parseExtensionVersion(directoryName: string): number[] | null {
   const match = /^openai\.chatgpt-(\d+)\.(\d+)\.(\d+)/.exec(directoryName);
   return match ? [Number(match[1]), Number(match[2]), Number(match[3])] : null;
@@ -1238,8 +1242,12 @@ export function isSupportedExtensionVersion(version: number[]): boolean {
 
 export function resolveExtensionWebviewRoot(): string | null {
   const configured = process.env.CODEX_EXTENSION_WEBVIEW_ROOT;
-  if (configured && existsSync(join(configured, "index.html"))) {
-    // An explicit root is the operator saying which contract to speak to.
+  if (configured) {
+    // An explicit root is the operator saying which contract to speak to, so a
+    // path that holds no webview is their mistake to see, not ours to skip.
+    if (!existsSync(join(configured, "index.html"))) {
+      throw new Error(`CODEX_EXTENSION_WEBVIEW_ROOT=${configured} has no index.html`);
+    }
     return resolve(configured);
   }
 

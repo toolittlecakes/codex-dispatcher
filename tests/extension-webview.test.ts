@@ -9,6 +9,7 @@ import {
   makeFetchResponse,
   parseExtensionVersion,
   resolveExtensionWebviewRoot,
+  extensionVersionOf,
   resolveWebviewAssetPath,
   selectExtensionWebviewRoot,
 } from "../src/extension-webview";
@@ -115,6 +116,7 @@ describe("extension webview", () => {
 
     try {
       installVersion("openai.chatgpt-26.422.10000-darwin-arm64");
+      installVersion("openai.chatgpt-26.803.10000-darwin-arm64");
       const verified = installVersion("openai.chatgpt-26.803.61601-darwin-arm64");
       // Newer than anything this bridge speaks to: picking it would silently
       // serve a contract nobody checked.
@@ -122,7 +124,12 @@ describe("extension webview", () => {
 
       expect(selectExtensionWebviewRoot(extensionsDir)).toBe(verified);
 
+      expect(extensionVersionOf(verified)).toBe("26.803.61601");
+      expect(extensionVersionOf(null)).toBe("0.0.0");
+      expect(extensionVersionOf("/somewhere/custom/webview")).toBe("0.0.0");
+
       rmSync(join(extensionsDir, "openai.chatgpt-26.422.10000-darwin-arm64"), { recursive: true });
+      rmSync(join(extensionsDir, "openai.chatgpt-26.803.10000-darwin-arm64"), { recursive: true });
       rmSync(join(extensionsDir, "openai.chatgpt-26.803.61601-darwin-arm64"), { recursive: true });
       expect(() => selectExtensionWebviewRoot(extensionsDir)).toThrow("27.101.10000 is outside the range");
 
@@ -134,13 +141,31 @@ describe("extension webview", () => {
     }
   });
 
+  test("refuses an explicit webview root that holds no webview", () => {
+    const previousRoot = process.env.CODEX_EXTENSION_WEBVIEW_ROOT;
+    const empty = mkdtempSync(join(tmpdir(), "codex-empty-root-"));
+    process.env.CODEX_EXTENSION_WEBVIEW_ROOT = join(empty, "typo");
+
+    try {
+      // Falling back to the scan here would answer a question the operator
+      // already answered, with a different extension version.
+      expect(() => resolveExtensionWebviewRoot()).toThrow("has no index.html");
+    } finally {
+      if (previousRoot === undefined) {
+        delete process.env.CODEX_EXTENSION_WEBVIEW_ROOT;
+      } else {
+        process.env.CODEX_EXTENSION_WEBVIEW_ROOT = previousRoot;
+      }
+      rmSync(empty, { recursive: true, force: true });
+    }
+  });
+
   test("the extension installed on this machine is one the bridge claims to support", () => {
     const previousRoot = process.env.CODEX_EXTENSION_WEBVIEW_ROOT;
     delete process.env.CODEX_EXTENSION_WEBVIEW_ROOT;
     try {
-      const installed = readdirSync(join(homedir(), ".vscode", "extensions"), { withFileTypes: true })
-        .filter((entry) => entry.isDirectory())
-        .map((entry) => parseExtensionVersion(entry.name))
+      const installed = readdirSync(join(homedir(), ".vscode", "extensions"))
+        .map((entry) => parseExtensionVersion(entry))
         .filter((version): version is number[] => version !== null);
       if (installed.length === 0) {
         return;
