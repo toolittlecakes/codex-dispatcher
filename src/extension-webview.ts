@@ -389,21 +389,30 @@ select,
 
   private async handleHostMessage(request: Request): Promise<Response> {
     const client = this.clientFor(clientIdFromRequest(request));
-    let message: HostMessage;
+    let batch: HostMessage[];
     try {
-      message = (await request.json()) as HostMessage;
+      batch = parseHostMessageBatch(await request.json());
     } catch {
       this.send(client, makeFetchResponse({ requestId: undefined, error: "Invalid JSON", status: 400 }));
       return jsonResponse({ accepted: false }, 400);
     }
 
-    this.recordMessage("inbound", message);
+    // VS Code invokes the extension's message handler in send order but never
+    // waits for it, so start each message in order and let the slow ones (an
+    // external fetch) finish behind the messages that came after them.
+    for (const message of batch) {
+      this.recordMessage("inbound", message);
+      void this.dispatchHostMessage(client, message);
+    }
+    return jsonResponse({ accepted: true });
+  }
+
+  private async dispatchHostMessage(client: StreamClient, message: HostMessage): Promise<void> {
     try {
       for (const outbound of await this.routeHostMessage(message)) {
         this.recordMessage("outbound", outbound);
         this.send(client, outbound);
       }
-      return jsonResponse({ accepted: true });
     } catch (error) {
       const hostError = {
         type: "host-message-error",
@@ -412,7 +421,6 @@ select,
       };
       this.remember(this.hostErrors, hostError);
       this.send(client, hostError);
-      return jsonResponse({ accepted: false }, 500);
     }
   }
 
@@ -1079,25 +1087,46 @@ select,
       postToWindow(message);
     }
   };
-  const sendHostMessage = async (message) => {
-    remember(window.__codexHostAdapterMessages, message);
-    try {
-      // Replies come back over the event stream, not in this response body, so the
-      // webview observes host traffic in one order instead of racing two channels.
-      await fetch(hostMessageUrl, {
-        method: "POST",
-        headers: { "content-type": "application/json", "x-dispatcher-client": clientId },
-        body: JSON.stringify(message),
-      });
-    } catch (error) {
-      const adapterError = {
-        type: "host-adapter-error",
-        error: error instanceof Error ? error.message : String(error),
-        sourceType: typeof message?.type === "string" ? message.type : "unknown",
-      };
-      remember(window.__codexHostAdapterInboundMessages, adapterError);
-      console.error("[codex-extension-webview] host-message failed", error);
+  const outbox = [];
+  let flushing = false;
+  const flushOutbox = async () => {
+    if (flushing) {
+      return;
     }
+    flushing = true;
+    try {
+      while (outbox.length > 0) {
+        // One request in flight at a time: parallel posts arrive in whatever
+        // order the network feels like, and VS Code hands the extension its
+        // postMessage traffic strictly in send order.
+        const batch = outbox.splice(0, outbox.length);
+        try {
+          // Replies come back over the event stream, not in this response body, so the
+          // webview observes host traffic in one order instead of racing two channels.
+          await fetch(hostMessageUrl, {
+            method: "POST",
+            headers: { "content-type": "application/json", "x-dispatcher-client": clientId },
+            body: JSON.stringify({ messages: batch }),
+          });
+        } catch (error) {
+          for (const message of batch) {
+            remember(window.__codexHostAdapterInboundMessages, {
+              type: "host-adapter-error",
+              error: error instanceof Error ? error.message : String(error),
+              sourceType: typeof message?.type === "string" ? message.type : "unknown",
+            });
+          }
+          console.error("[codex-extension-webview] host-message failed", error);
+        }
+      }
+    } finally {
+      flushing = false;
+    }
+  };
+  const sendHostMessage = (message) => {
+    remember(window.__codexHostAdapterMessages, message);
+    outbox.push(message);
+    void flushOutbox();
   };
 
   window.__codexHostAdapterMessages = [];
@@ -1106,7 +1135,7 @@ select,
   window.addEventListener("error", (event) => rememberClientError(event.error ?? event.message));
   window.addEventListener("unhandledrejection", (event) => rememberClientError(event.reason));
   window.acquireVsCodeApi = () => ({
-    postMessage: (message) => { void sendHostMessage(message); },
+    postMessage: (message) => { sendHostMessage(message); },
     getState: () => {
       try { return JSON.parse(localStorage.getItem(vscodeStateKey) || "null"); } catch { return null; }
     },
@@ -1791,6 +1820,14 @@ function bufferedAfter(client: StreamClient, lastEventId: number | null): { id: 
     return null;
   }
   return client.buffer.filter((event) => event.id > lastEventId);
+}
+
+function parseHostMessageBatch(body: unknown): HostMessage[] {
+  const messages = (body as { messages?: unknown } | null)?.messages;
+  if (!Array.isArray(messages)) {
+    throw new Error("host-message body must be { messages: [...] }");
+  }
+  return messages as HostMessage[];
 }
 
 function clientIdFromRequest(request: Request): string {

@@ -28,17 +28,24 @@ async function openEventStream(webview: ExtensionWebview, clientId: string, last
   const messages: JsonRecord[] = [];
   let pending = "";
 
+  // One read is kept in flight across poll iterations: a read abandoned on
+  // timeout still consumes the next chunk, which would silently drop events.
+  let inFlight: Promise<ReadableStreamReadResult<Uint8Array>> | null = null;
+
   return {
     async waitFor(expected, timeoutMs = 1_000) {
       const deadline = Date.now() + timeoutMs;
       while (messages.length < expected && Date.now() < deadline) {
+        inFlight ??= reader.read();
+        const settled = inFlight;
         const chunk = await Promise.race([
-          reader.read(),
+          settled.then((result) => result),
           new Promise<null>((resolve) => setTimeout(() => resolve(null), 25)),
         ]);
         if (!chunk?.value) {
           continue;
         }
+        inFlight = null;
         pending += decoder.decode(chunk.value);
         const frames = pending.split("\n\n");
         pending = frames.pop() ?? "";
@@ -192,11 +199,11 @@ describe("extension webview", () => {
         new Request("http://localhost/host-message", {
           method: "POST",
           headers: { cookie: "codex_dispatcher_session=secret", "x-dispatcher-client": "tab-1" },
-          body: JSON.stringify({
+          body: JSON.stringify({ messages: [{
             type: "thread-role-request",
             requestId: "role-1",
             conversationId: "owned-thread",
-          }),
+          }] }),
         }),
         new URL("http://localhost/host-message"),
       );
@@ -206,13 +213,13 @@ describe("extension webview", () => {
         new Request("http://localhost/host-message", {
           method: "POST",
           headers: { cookie: "codex_dispatcher_session=secret", "x-dispatcher-client": "tab-1" },
-          body: JSON.stringify({
+          body: JSON.stringify({ messages: [{
             type: "fetch",
             requestId: "host-role-1",
             url: "vscode://codex/thread-role-for-host",
             method: "POST",
             body: JSON.stringify({ hostId: "local", conversationId: "thread-1" }),
-          }),
+          }] }),
         }),
         new URL("http://localhost/host-message"),
       );
@@ -222,11 +229,11 @@ describe("extension webview", () => {
         new Request("http://localhost/host-message", {
           method: "POST",
           headers: { cookie: "codex_dispatcher_session=secret", "x-dispatcher-client": "tab-1" },
-          body: JSON.stringify({
+          body: JSON.stringify({ messages: [{
             type: "thread-follower-start-turn-request",
             requestId: "follower-1",
             params: { conversationId: "thread-1" },
-          }),
+          }] }),
         }),
         new URL("http://localhost/host-message"),
       );
@@ -239,7 +246,7 @@ describe("extension webview", () => {
         new Request("http://localhost/host-message", {
           method: "POST",
           headers: { cookie: "codex_dispatcher_session=secret", "x-dispatcher-client": "tab-1" },
-          body: JSON.stringify({
+          body: JSON.stringify({ messages: [{
             type: "fetch",
             requestId: "host-follower-1",
             url: "vscode://codex/thread-follower-start-turn-for-host",
@@ -249,7 +256,7 @@ describe("extension webview", () => {
               conversationId: "thread-1",
               turnStartParams: { input: [{ type: "text", text: "from phone" }] },
             }),
-          }),
+          }] }),
         }),
         new URL("http://localhost/host-message"),
       );
@@ -269,13 +276,13 @@ describe("extension webview", () => {
         new Request("http://localhost/host-message", {
           method: "POST",
           headers: { cookie: "codex_dispatcher_session=secret", "x-dispatcher-client": "tab-1" },
-          body: JSON.stringify({
+          body: JSON.stringify({ messages: [{
             type: "fetch",
             requestId: "host-assert-1",
             url: "vscode://codex/assert-thread-follower-owner-for-host",
             method: "POST",
             body: JSON.stringify({ hostId: "local", conversationId: "thread-1" }),
-          }),
+          }] }),
         }),
         new URL("http://localhost/host-message"),
       );
@@ -285,7 +292,7 @@ describe("extension webview", () => {
         new Request("http://localhost/host-message", {
           method: "POST",
           headers: { cookie: "codex_dispatcher_session=secret", "x-dispatcher-client": "tab-1" },
-          body: JSON.stringify({
+          body: JSON.stringify({ messages: [{
             type: "fetch",
             requestId: "ipc-1",
             url: "vscode://codex/ipc-request",
@@ -295,7 +302,7 @@ describe("extension webview", () => {
               targetClientId: "vscode-client",
               params: { conversationId: "thread-1", input: [] },
             }),
-          }),
+          }] }),
         }),
         new URL("http://localhost/host-message"),
       );
@@ -506,7 +513,7 @@ describe("extension webview", () => {
         new Request("http://localhost/host-message", {
           method: "POST",
           headers: { cookie: "codex_dispatcher_session=secret", "x-dispatcher-client": "tab-1" },
-          body: JSON.stringify({ type: "persisted-atom-sync-request" }),
+          body: JSON.stringify({ messages: [{ type: "persisted-atom-sync-request" }] }),
         }),
         new URL("http://localhost/host-message"),
       );
@@ -586,7 +593,7 @@ describe("extension webview", () => {
           new Request("http://localhost/host-message", {
             method: "POST",
             headers: { cookie: "codex_dispatcher_session=secret", "x-dispatcher-client": "tab-1" },
-            body: JSON.stringify(body),
+            body: JSON.stringify({ messages: [body] }),
           }),
           new URL("http://localhost/host-message"),
         );
@@ -610,6 +617,58 @@ describe("extension webview", () => {
         message: { id: 11, result: { echoed: "thread/read" } },
       });
     } finally {
+      if (previousRoot === undefined) {
+        delete process.env.CODEX_EXTENSION_WEBVIEW_ROOT;
+      } else {
+        process.env.CODEX_EXTENSION_WEBVIEW_ROOT = previousRoot;
+      }
+      rmSync(root, { recursive: true, force: true });
+    }
+  });
+
+  test("starts batched host messages in order without letting a slow one block the rest", async () => {
+    const previousRoot = process.env.CODEX_EXTENSION_WEBVIEW_ROOT;
+    const root = mkdtempSync(join(tmpdir(), "codex-webview-fifo-"));
+    process.env.CODEX_EXTENSION_WEBVIEW_ROOT = root;
+    writeFileSync(join(root, "index.html"), "<html><head></head><body></body></html>");
+    const origin = Bun.serve({
+      port: 0,
+      async fetch() {
+        await Bun.sleep(150);
+        return new Response(JSON.stringify({ ok: true }), { headers: { "content-type": "application/json" } });
+      },
+    });
+
+    try {
+      const webview = new ExtensionWebview({
+        appServer: {} as never,
+        defaultCwd: "/repo",
+        getToken: () => "secret",
+        statePath: join(root, "extension-state.json"),
+      });
+      const stream = await openEventStream(webview, "tab-1");
+
+      const accepted = await webview.fetch(
+        new Request("http://localhost/host-message", {
+          method: "POST",
+          headers: { cookie: "codex_dispatcher_session=secret", "x-dispatcher-client": "tab-1" },
+          body: JSON.stringify({
+            messages: [
+              { type: "fetch", requestId: "slow", url: `${origin.url.origin}/slow`, method: "GET" },
+              { type: "persisted-atom-sync-request" },
+            ],
+          }),
+        }),
+        new URL("http://localhost/host-message"),
+      );
+      // The ack must not wait for the network call the first message started.
+      await expect(accepted.json()).resolves.toEqual({ accepted: true });
+
+      const delivered = await stream.waitFor(2, 3_000);
+      await stream.cancel();
+      expect(delivered.map((message) => message.type)).toEqual(["persisted-atom-sync", "fetch-response"]);
+    } finally {
+      await origin.stop(true);
       if (previousRoot === undefined) {
         delete process.env.CODEX_EXTENSION_WEBVIEW_ROOT;
       } else {
@@ -650,12 +709,12 @@ describe("extension webview", () => {
           new Request("http://localhost/host-message", {
             method: "POST",
             headers: { cookie: "codex_dispatcher_session=secret", "x-dispatcher-client": "tab-1" },
-            body: JSON.stringify({
+            body: JSON.stringify({ messages: [{
               type: "fetch",
               requestId: `req-${path}`,
               url: `${origin.url.origin}${path}`,
               method: "GET",
-            }),
+            }] }),
           }),
           new URL("http://localhost/host-message"),
         );
@@ -703,11 +762,11 @@ describe("extension webview", () => {
         new Request("http://localhost/host-message", {
           method: "POST",
           headers: { cookie: "codex_dispatcher_session=secret", "x-dispatcher-client": "tab-1" },
-          body: JSON.stringify({
+          body: JSON.stringify({ messages: [{
             type: "persisted-atom-update",
             key: "onboarding.complete",
             value: { done: true },
-          }),
+          }] }),
         }),
         new URL("http://localhost/host-message"),
       );
@@ -717,13 +776,13 @@ describe("extension webview", () => {
         new Request("http://localhost/host-message", {
           method: "POST",
           headers: { cookie: "codex_dispatcher_session=secret", "x-dispatcher-client": "tab-1" },
-          body: JSON.stringify({
+          body: JSON.stringify({ messages: [{
             type: "fetch",
             requestId: "set-global",
             url: "vscode://codex/set-global-state",
             method: "POST",
             body: JSON.stringify({ key: "welcome.dismissed", value: true }),
-          }),
+          }] }),
         }),
         new URL("http://localhost/host-message"),
       );
@@ -764,7 +823,7 @@ describe("extension webview", () => {
         new Request("http://localhost/host-message", {
           method: "POST",
           headers: { cookie: "codex_dispatcher_session=secret", "x-dispatcher-client": "tab-1" },
-          body: JSON.stringify({ type: "ready" }),
+          body: JSON.stringify({ messages: [{ type: "ready" }] }),
         }),
         new URL("http://localhost/host-message"),
       );
@@ -779,13 +838,13 @@ describe("extension webview", () => {
         new Request("http://localhost/host-message", {
           method: "POST",
           headers: { cookie: "codex_dispatcher_session=secret", "x-dispatcher-client": "tab-1" },
-          body: JSON.stringify({
+          body: JSON.stringify({ messages: [{
             type: "fetch",
             requestId: "get-global",
             url: "vscode://codex/get-global-state",
             method: "POST",
             body: JSON.stringify({ key: "welcome.dismissed" }),
-          }),
+          }] }),
         }),
         new URL("http://localhost/host-message"),
       );
