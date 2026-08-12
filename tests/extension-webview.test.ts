@@ -381,6 +381,85 @@ describe("extension webview", () => {
 
       expect(text).toContain(": connected");
       expect(text).toContain(`data: ${JSON.stringify(replayMessage)}`);
+      expect(text).toContain("id: 0");
+    } finally {
+      if (previousRoot === undefined) {
+        delete process.env.CODEX_EXTENSION_WEBVIEW_ROOT;
+      } else {
+        process.env.CODEX_EXTENSION_WEBVIEW_ROOT = previousRoot;
+      }
+      rmSync(root, { recursive: true, force: true });
+    }
+  });
+
+  test("replays events missed while the event stream was disconnected", async () => {
+    const previousRoot = process.env.CODEX_EXTENSION_WEBVIEW_ROOT;
+    const root = mkdtempSync(join(tmpdir(), "codex-webview-resume-"));
+    process.env.CODEX_EXTENSION_WEBVIEW_ROOT = root;
+    writeFileSync(join(root, "index.html"), "<html><head></head><body></body></html>");
+
+    try {
+      const webview = new ExtensionWebview({
+        appServer: {} as never,
+        defaultCwd: "/repo",
+        getToken: () => "secret",
+        getEventReplayMessages: () => [{ type: "resync-snapshot" }],
+      });
+      const openStream = async (lastEventId?: string) => {
+        const headers: Record<string, string> = { cookie: "codex_dispatcher_session=secret" };
+        if (lastEventId !== undefined) {
+          headers["last-event-id"] = lastEventId;
+        }
+        const response = await webview.fetch(
+          new Request("http://localhost/events", { headers }),
+          new URL("http://localhost/events"),
+        );
+        return response.body!.getReader();
+      };
+      const readAvailable = async (reader: ReadableStreamDefaultReader<Uint8Array>, chunks: number) => {
+        let text = "";
+        for (let index = 0; index < chunks; index += 1) {
+          const chunk = await Promise.race([
+            reader.read(),
+            new Promise<null>((resolve) => setTimeout(() => resolve(null), 150)),
+          ]);
+          if (!chunk?.value) {
+            break;
+          }
+          text += new TextDecoder().decode(chunk.value);
+        }
+        return text;
+      };
+
+      const first = await openStream();
+      expect(await readAvailable(first, 3)).toContain("resync-snapshot");
+      await first.cancel();
+
+      // Events broadcast while nothing is listening must survive for the reconnect.
+      webview.handleIpcBroadcast({
+        type: "broadcast",
+        method: "thread-stream-state-changed",
+        sourceClientId: "vscode-client",
+        params: { conversationId: "thread-1" },
+      });
+      webview.handleAppServerEvent({
+        type: "notification",
+        notification: { method: "codex/event/agent_message_delta", params: { delta: "missed while asleep" } },
+      });
+
+      const resumed = await openStream("0");
+      const resumedText = await readAvailable(resumed, 4);
+      await resumed.cancel();
+      expect(resumedText).toContain("thread-stream-state-changed");
+      expect(resumedText).toContain("missed while asleep");
+      expect(resumedText).toContain("id: 2");
+      expect(resumedText).not.toContain("resync-snapshot");
+
+      // An id the buffer cannot account for falls back to a full resynchronisation.
+      const stale = await openStream("9999");
+      const staleText = await readAvailable(stale, 3);
+      await stale.cancel();
+      expect(staleText).toContain("resync-snapshot");
     } finally {
       if (previousRoot === undefined) {
         delete process.env.CODEX_EXTENSION_WEBVIEW_ROOT;

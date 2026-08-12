@@ -780,6 +780,17 @@ function broadcastDispatcherOwnedSnapshot(threadId: string): void {
 
 function buildExtensionEventReplayMessages(): JsonObject[] {
   const messages: JsonObject[] = [];
+
+  // Approvals and elicitations are requests the app server is still blocked on, so
+  // a reconnecting webview has to see them again or the turn stalls with no prompt.
+  for (const request of appServer.getPendingServerRequests()) {
+    messages.push({
+      type: "mcp-request",
+      hostId: "local",
+      request: { id: request.id, method: request.method, params: request.params },
+    });
+  }
+
   for (const [threadId, conversation] of mirroredConversations.entries()) {
     const ownerClientId = streamOwners.get(threadId);
     if (!ownerClientId) {

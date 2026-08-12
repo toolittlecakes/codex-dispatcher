@@ -66,6 +66,7 @@ const maxDiagnosticMessages = 200;
 // after 60s, so a host fetch that outlives either would leave the webview waiting
 // forever. Stay under the strictest link in that chain.
 const externalFetchTimeoutMs = 25_000;
+const maxReplayEvents = 500;
 const globalState = new Map<string, JsonValue>();
 const persistedAtomState = new Map<string, JsonValue>();
 const sharedObjectState = new Map<string, JsonValue>();
@@ -155,6 +156,8 @@ export class ExtensionWebview {
     | ((hostId: string, conversationId: string) => Promise<void> | void)
     | undefined;
   private readonly clients = new Map<string, SseClient>();
+  private readonly recentEvents: { id: number; payload: JsonObject }[] = [];
+  private eventSeq = 0;
   private readonly startedAt = new Date().toISOString();
   private readonly messageCounts = new Map<string, number>();
   private readonly recentMessages: JsonObject[] = [];
@@ -194,7 +197,7 @@ export class ExtensionWebview {
     }
 
     if (url.pathname === `${routePrefix}/events`) {
-      return this.openEventStream();
+      return this.openEventStream(request);
     }
 
     if (url.pathname === `${routePrefix}/debug`) {
@@ -731,7 +734,8 @@ select,
     };
   }
 
-  private openEventStream(): Response {
+  private openEventStream(request: Request): Response {
+    const resumeFrom = parseLastEventId(request.headers.get("last-event-id"));
     let clientId = "";
     const stream = new ReadableStream<Uint8Array>({
       start: (controller) => {
@@ -746,8 +750,19 @@ select,
         }, 5_000);
         this.clients.set(clientId, { id: clientId, controller, heartbeat });
         controller.enqueue(encoder.encode(": connected\n\n"));
+
+        const missed = resumeFrom === null ? null : this.eventsAfter(resumeFrom);
+        if (missed) {
+          for (const event of missed) {
+            controller.enqueue(encodeSseMessage(event.payload, event.id));
+          }
+          return;
+        }
+
+        // Either a fresh connection or a reconnect whose gap we can no longer
+        // replay exactly, so resynchronise from current state instead.
         for (const message of this.getEventReplayMessages?.() ?? []) {
-          controller.enqueue(encodeSseMessage(message));
+          controller.enqueue(encodeSseMessage(message, this.eventSeq));
         }
       },
       cancel: () => {
@@ -769,9 +784,25 @@ select,
     });
   }
 
+  private eventsAfter(lastEventId: number): { id: number; payload: JsonObject }[] | null {
+    const oldest = this.recentEvents[0];
+    if (lastEventId === this.eventSeq) {
+      return [];
+    }
+    if (!oldest || lastEventId < oldest.id - 1 || lastEventId > this.eventSeq) {
+      return null;
+    }
+    return this.recentEvents.filter((event) => event.id > lastEventId);
+  }
+
   private broadcast(message: JsonObject): void {
     this.recordMessage("outbound", message);
-    const payload = encodeSseMessage(message);
+    this.eventSeq += 1;
+    this.recentEvents.push({ id: this.eventSeq, payload: message });
+    if (this.recentEvents.length > maxReplayEvents) {
+      this.recentEvents.splice(0, this.recentEvents.length - maxReplayEvents);
+    }
+    const payload = encodeSseMessage(message, this.eventSeq);
     for (const client of this.clients.values()) {
       try {
         client.controller.enqueue(payload);
@@ -1035,6 +1066,17 @@ select,
   const events = new EventSource(eventsUrl);
   events.onmessage = (event) => {
     try { deliver([JSON.parse(event.data)]); } catch (error) { console.error(error); }
+  };
+  // EventSource reconnects on its own and replays through Last-Event-ID, but a
+  // silent drop used to look identical to an idle session, so make it visible.
+  events.onerror = () => {
+    remember(window.__codexHostAdapterClientErrors, {
+      message: "event stream disconnected",
+      readyState: events.readyState,
+    });
+    if (events.readyState === EventSource.CLOSED) {
+      console.error("[codex-extension-webview] event stream closed");
+    }
   };
 })();
 </script>`;
@@ -1676,8 +1718,16 @@ function jsonResponse(value: JsonValue, status = 200): Response {
   });
 }
 
-function encodeSseMessage(message: JsonObject): Uint8Array {
-  return encoder.encode(`data: ${JSON.stringify(message)}\n\n`);
+function encodeSseMessage(message: JsonObject, eventId: number): Uint8Array {
+  return encoder.encode(`id: ${eventId}\ndata: ${JSON.stringify(message)}\n\n`);
+}
+
+function parseLastEventId(header: string | null): number | null {
+  if (!header) {
+    return null;
+  }
+  const parsed = Number(header);
+  return Number.isSafeInteger(parsed) && parsed >= 0 ? parsed : null;
 }
 
 function authCookie(token: string): string {
