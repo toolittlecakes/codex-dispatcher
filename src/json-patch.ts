@@ -1,38 +1,44 @@
-export function applyJsonPatches(base, patches) {
+import type { JsonValue } from "./codex-app-server";
+
+type PatchOp = "add" | "replace" | "remove";
+type PathPart = string | number;
+type PatchTarget = Record<string, JsonValue> | JsonValue[];
+
+export function applyJsonPatches(base: JsonValue, patches: JsonValue[]): JsonValue {
   let next = cloneJson(base);
   for (const patch of patches) {
     if (!isPlainObject(patch) || typeof patch.op !== "string") {
       throw new Error("Invalid patch object");
     }
-    validatePatchOp(patch.op);
-    validatePatchValue(patch);
+    const op = validatePatchOp(patch.op);
+    validatePatchValue(patch, op);
 
     const path = normalizePatchPath(patch.path);
     if (path.length === 0) {
-      next = patch.op === "remove" ? null : cloneJson(patch.value);
+      next = op === "remove" ? null : cloneJson(patch.value ?? null);
       continue;
     }
 
     const { target, key } = resolvePatchTarget(next, path);
-    if (patch.op === "remove") {
+    if (op === "remove") {
       removePatchValue(target, key);
       continue;
     }
 
-    setPatchValue(target, key, cloneJson(patch.value), patch.op);
+    setPatchValue(target, key, cloneJson(patch.value ?? null), op);
   }
   return next;
 }
 
-export function isPlainObject(value) {
+export function isPlainObject(value: JsonValue | undefined): value is Record<string, JsonValue> {
   return typeof value === "object" && value !== null && !Array.isArray(value);
 }
 
-export function cloneJson(value) {
-  return JSON.parse(JSON.stringify(value));
+export function cloneJson<T extends JsonValue>(value: T): T {
+  return JSON.parse(JSON.stringify(value)) as T;
 }
 
-function normalizePatchPath(path) {
+function normalizePatchPath(path: JsonValue | undefined): PathPart[] {
   if (Array.isArray(path)) {
     return path.map(validatePathPart);
   }
@@ -55,7 +61,7 @@ function normalizePatchPath(path) {
     .map((part) => validatePathPart(decodePointerPathPart(part)));
 }
 
-function validatePathPart(part) {
+function validatePathPart(part: JsonValue): PathPart {
   if (typeof part !== "string" && typeof part !== "number") {
     throw new Error("Invalid patch path part");
   }
@@ -71,21 +77,21 @@ function validatePathPart(part) {
   throw new Error(`Forbidden patch path segment ${part}`);
 }
 
-function validatePatchOp(op) {
+function validatePatchOp(op: string): PatchOp {
   if (op === "add" || op === "replace" || op === "remove") {
-    return;
+    return op;
   }
 
   throw new Error(`Unsupported patch op ${op}`);
 }
 
-function validatePatchValue(patch) {
-  if ((patch.op === "add" || patch.op === "replace") && !hasOwn(patch, "value")) {
-    throw new Error(`Patch op ${patch.op} requires value`);
+function validatePatchValue(patch: Record<string, JsonValue>, op: PatchOp): void {
+  if ((op === "add" || op === "replace") && !hasOwn(patch, "value")) {
+    throw new Error(`Patch op ${op} requires value`);
   }
 }
 
-function decodePointerPathPart(part) {
+function decodePointerPathPart(part: string): string {
   if (/~(?![01])/u.test(part)) {
     throw new Error("Invalid JSON pointer escape");
   }
@@ -93,14 +99,14 @@ function decodePointerPathPart(part) {
   return part.replace(/~1/g, "/").replace(/~0/g, "~");
 }
 
-function resolvePatchTarget(root, path) {
-  let target = root;
+function resolvePatchTarget(root: JsonValue, path: PathPart[]): { target: PatchTarget; key: PathPart } {
+  let target: JsonValue = root;
   for (const part of path.slice(0, -1)) {
     if (!isPlainObject(target) && !Array.isArray(target)) {
       throw new Error("Patch target is not traversable");
     }
 
-    const nextTarget = target[part];
+    const nextTarget = Array.isArray(target) ? target[Number(part)] : target[String(part)];
     if (nextTarget === undefined) {
       throw new Error("Patch path does not exist");
     }
@@ -120,7 +126,7 @@ function resolvePatchTarget(root, path) {
   return { target, key };
 }
 
-function setPatchValue(target, key, value, op) {
+function setPatchValue(target: PatchTarget, key: PathPart, value: JsonValue, op: PatchOp): void {
   if (!Array.isArray(target)) {
     if (op === "replace" && !hasOwn(target, String(key))) {
       throw new Error("Object replace patch key does not exist");
@@ -153,7 +159,7 @@ function setPatchValue(target, key, value, op) {
   target[index] = value;
 }
 
-function removePatchValue(target, key) {
+function removePatchValue(target: PatchTarget, key: PathPart): void {
   if (Array.isArray(target)) {
     const index = parseArrayIndex(key);
     if (index < 0 || index >= target.length) {
@@ -170,11 +176,11 @@ function removePatchValue(target, key) {
   delete target[String(key)];
 }
 
-function hasOwn(value, key) {
+function hasOwn(value: Record<string, JsonValue>, key: string): boolean {
   return Object.prototype.hasOwnProperty.call(value, key);
 }
 
-function parseArrayIndex(key) {
+function parseArrayIndex(key: PathPart): number {
   if (typeof key === "number") {
     if (Number.isInteger(key) && key >= 0) {
       return key;

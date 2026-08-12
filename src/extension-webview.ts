@@ -188,10 +188,6 @@ export class ExtensionWebview {
     this.webviewRoot = resolveExtensionWebviewRoot();
   }
 
-  canHandle(pathname: string): boolean {
-    return pathname.startsWith("/");
-  }
-
   async fetch(request: Request, url: URL): Promise<Response> {
     if (!this.webviewRoot) {
       return new Response("Codex VS Code extension webview was not found.", { status: 404 });

@@ -1,7 +1,5 @@
-import { createHash, randomBytes } from "node:crypto";
+import { randomBytes } from "node:crypto";
 import { networkInterfaces } from "node:os";
-import { resolve, sep } from "node:path";
-import { applyJsonPatches, cloneJson } from "../public/json-patch.js";
 import { CodexAppServer, type JsonObject, type JsonValue } from "./codex-app-server";
 import { CodexIpcBridge, type IpcBroadcastMessage } from "./codex-ipc";
 import {
@@ -12,45 +10,13 @@ import {
   updateCollaborationModeSettings,
 } from "./dispatcher-owner";
 import { ExtensionWebview } from "./extension-webview";
-
-type ClientMessage = {
-  type?: string;
-  requestId?: string;
-  threadId?: string;
-  turnId?: string;
-  ownerClientId?: string;
-  method?: string;
-  text?: string;
-  cwd?: string;
-  input?: JsonValue;
-  model?: string | null;
-  effort?: string | null;
-  reasoningEffort?: string | null;
-  collaborationMode?: JsonValue;
-  inheritThreadSettings?: boolean;
-  state?: JsonValue;
-  limit?: number;
-  searchTerm?: string;
-  appServerRequestId?: string;
-  params?: JsonValue;
-  result?: JsonValue;
-};
-
-type WsData = {
-  connectionId: string;
-  connectedAt: number;
-  remoteAddress: string | null;
-  userAgent: string | null;
-};
+import { applyJsonPatches, cloneJson } from "./json-patch";
 
 const port = Number(process.env.PORT ?? "8787");
 const host = process.env.HOST ?? "0.0.0.0";
-let dispatcherToken = process.env.DISPATCHER_TOKEN ?? randomBytes(18).toString("base64url");
-let tokenCreatedAt = Date.now();
+const dispatcherToken = process.env.DISPATCHER_TOKEN ?? randomBytes(18).toString("base64url");
 const defaultCwd = process.env.CODEX_DISPATCHER_CWD ?? process.cwd();
-const dispatcherRemoteUrl = normalizeBaseUrl(process.env.DISPATCHER_REMOTE_URL);
 const primaryClientPath = "/";
-const publicRoot = resolve(import.meta.dir, "../public");
 const appServer = new CodexAppServer();
 const ipcBridge = new CodexIpcBridge();
 const extensionWebview = new ExtensionWebview({
@@ -77,7 +43,6 @@ const extensionWebview = new ExtensionWebview({
     scheduleDispatcherOwnedRefresh(conversationId, 0);
   },
 });
-const clients = new Set<Bun.ServerWebSocket<WsData>>();
 const streamOwners = new Map<string, string>();
 const mirroredConversations = new Map<string, JsonObject>();
 const dispatcherOwnedConversations = new Map<string, JsonObject>();
@@ -96,21 +61,6 @@ const threadDrivingMethods = new Set([
   "turn/interrupt",
 ]);
 
-const followerRequestMethods = new Set([
-  "thread-follower-start-turn",
-  "thread-follower-steer-turn",
-  "thread-follower-interrupt-turn",
-  "thread-follower-compact-thread",
-  "thread-follower-set-model-and-reasoning",
-  "thread-follower-set-collaboration-mode",
-  "thread-follower-edit-last-user-turn",
-  "thread-follower-command-approval-decision",
-  "thread-follower-file-approval-decision",
-  "thread-follower-permissions-request-approval-response",
-  "thread-follower-submit-user-input",
-  "thread-follower-submit-mcp-server-elicitation-response",
-  "thread-follower-set-queued-follow-ups-state",
-]);
 
 const dispatcherOwnerRequestMethods = new Set([
   "thread-follower-start-turn",
@@ -132,7 +82,6 @@ appServer.onEvent((event) => {
   extensionWebview.handleAppServerEvent(event);
 
   if (event.type === "notification") {
-    broadcast({ type: "codexNotification", notification: event.notification });
     const threadId = notificationThreadId(event.notification);
     if (threadId && claimDispatcherOwnership(threadId) && dispatcherOwnedThreadHasTurns(threadId)) {
       scheduleDispatcherOwnedRefresh(threadId);
@@ -141,7 +90,6 @@ appServer.onEvent((event) => {
   }
 
   if (event.type === "serverRequest") {
-    broadcast({ type: "serverRequest", request: event.request });
     const threadId = requestThreadId(event.request);
     if (threadId && claimDispatcherOwnership(threadId)) {
       scheduleDispatcherOwnedRefresh(threadId, 0);
@@ -149,32 +97,20 @@ appServer.onEvent((event) => {
     return;
   }
 
-  if (event.type === "serverRequestResolved") {
-    broadcast({ type: "serverRequestResolved", id: event.id });
-    return;
-  }
-
   if (event.type === "stderr") {
-    broadcast({ type: "appServerStderr", text: event.text });
+    console.error(`[app-server] ${event.text.trimEnd()}`);
     return;
   }
 
-  broadcast({ type: "appServerStatus", status: event.status, detail: event.detail });
+  if (event.type === "status") {
+    console.log(`[app-server] ${event.status}${event.detail ? `: ${event.detail}` : ""}`);
+  }
 });
 
 ipcBridge.onEvent((event) => {
   if (event.type === "broadcast") {
     extensionWebview.handleIpcBroadcast(event.broadcast);
-    const ownersChanged = applyIpcBroadcastEffects(event.broadcast);
-    broadcast({
-      type: "codexIpcBroadcast",
-      broadcast: event.broadcast,
-      ipc: event.snapshot,
-      streamOwners: streamOwnersSnapshot(),
-    });
-    if (ownersChanged) {
-      broadcast({ type: "threadStreamOwners", streamOwners: streamOwnersSnapshot() });
-    }
+    applyIpcBroadcastEffects(event.broadcast);
     if (event.broadcast.method === "client-status-changed") {
       const params = asJsonObject(event.broadcast.params);
       if (params?.status === "connected") {
@@ -185,22 +121,11 @@ ipcBridge.onEvent((event) => {
   }
 
   if (event.type === "stderr") {
-    broadcast({
-      type: "codexIpcStderr",
-      text: event.text,
-      ipc: event.snapshot,
-    });
+    console.error(`[codex-ipc] ${event.text.trimEnd()}`);
     return;
   }
 
-  const ownersCleared = clearIpcMirrorsIfDisconnected(event.snapshot.status);
-  broadcast({
-    type: "codexIpcStatus",
-    ipc: event.snapshot,
-  });
-  if (ownersCleared) {
-    broadcast({ type: "threadStreamOwners", streamOwners: streamOwnersSnapshot() });
-  }
+  clearIpcMirrorsIfDisconnected(event.snapshot.status);
 });
 
 for (const method of dispatcherOwnerRequestMethods) {
@@ -214,62 +139,14 @@ for (const method of dispatcherOwnerRequestMethods) {
 await appServer.start();
 await ipcBridge.start();
 
-let server: Bun.Server<WsData>;
+let server: Bun.Server<undefined>;
 try {
-  server = Bun.serve<WsData>({
-  port,
-  hostname: host,
-  async fetch(request, bunServer) {
-    const url = new URL(request.url);
-    if (url.pathname === "/ws") {
-      if (url.searchParams.get("token") !== dispatcherToken) {
-        return new Response("Unauthorized", { status: 401 });
-      }
-
-      if (bunServer.upgrade(request, {
-        data: {
-          connectionId: randomBytes(8).toString("base64url"),
-          connectedAt: Date.now(),
-          remoteAddress: clientAddress(request),
-          userAgent: request.headers.get("user-agent"),
-        },
-      })) {
-        return undefined;
-      }
-
-      return new Response("WebSocket upgrade failed", { status: 400 });
-    }
-
-    if (extensionWebview.canHandle(url.pathname)) {
-      return extensionWebview.fetch(request, url);
-    }
-
-    return serveStatic(url.pathname);
-  },
-  websocket: {
-    open(ws) {
-      clients.add(ws);
-      send(ws, {
-        type: "ready",
-        appServer: appServer.initialized,
-        codexCliPath: appServer.codexCliPath,
-        defaultCwd,
-        ipc: ipcBridge.getSnapshot(),
-        security: securitySnapshot(ws.data.connectionId),
-        streamOwners: streamOwnersSnapshot(),
-        mirroredConversations: mirroredConversationsSnapshot(),
-        pendingServerRequests: appServer.getPendingServerRequests(),
-      });
-      broadcastSecurity();
+  server = Bun.serve({
+    port,
+    hostname: host,
+    fetch(request) {
+      return extensionWebview.fetch(request, new URL(request.url));
     },
-    close(ws) {
-      clients.delete(ws);
-      broadcastSecurity();
-    },
-    message(ws, rawMessage) {
-      void handleClientMessage(ws, rawMessage);
-    },
-  },
   });
 } catch (error) {
   ipcBridge.stop();
@@ -294,256 +171,6 @@ process.once("SIGTERM", () => {
   appServer.stop();
   process.exit(0);
 });
-
-async function handleClientMessage(ws: Bun.ServerWebSocket<WsData>, rawMessage: string | Buffer): Promise<void> {
-  let message: ClientMessage;
-  try {
-    message = JSON.parse(rawMessage.toString()) as ClientMessage;
-  } catch {
-    send(ws, { type: "error", error: "Invalid JSON message" });
-    return;
-  }
-
-  if (!message.type) {
-    respond(ws, message.requestId, false, null, "Missing message type");
-    return;
-  }
-
-  try {
-    const result = await routeClientMessage(message, ws.data.connectionId);
-    respond(ws, message.requestId, true, result, null);
-  } catch (error) {
-    respond(ws, message.requestId, false, null, error instanceof Error ? error.message : String(error));
-  }
-}
-
-async function routeClientMessage(message: ClientMessage, connectionId?: string): Promise<JsonValue> {
-  switch (message.type) {
-    case "listThreads":
-      return appServer.request("thread/list", {
-        limit: typeof message.limit === "number" ? message.limit : 40,
-        sortKey: "updated_at",
-        sortDirection: "desc",
-        archived: false,
-        sourceKinds: [
-          "cli",
-          "vscode",
-          "exec",
-          "appServer",
-          "subAgent",
-          "subAgentReview",
-          "subAgentCompact",
-          "subAgentThreadSpawn",
-          "subAgentOther",
-          "unknown",
-        ],
-        searchTerm: normalizeOptionalString(message.searchTerm),
-      });
-
-    case "readThread":
-      return appServer.request("thread/read", {
-        threadId: requireString(message.threadId, "threadId"),
-        includeTurns: true,
-      });
-
-    case "startThread": {
-      const result = await appServer.request("thread/start", {
-        cwd: normalizeOptionalString(message.cwd) ?? defaultCwd,
-        serviceName: "codex_mobile_dispatcher",
-        experimentalRawEvents: false,
-        persistExtendedHistory: true,
-      });
-      markDispatcherOwnerFromResult(result);
-      return result;
-    }
-
-    case "resumeThread":
-      return appServer.request("thread/resume", {
-        threadId: requireString(message.threadId, "threadId"),
-        persistExtendedHistory: true,
-      });
-
-    case "forkThread":
-      return appServer.request("thread/fork", {
-        threadId: requireString(message.threadId, "threadId"),
-      });
-
-    case "startTurn": {
-      const threadId = requireString(message.threadId, "threadId");
-      const result = await appServer.request("turn/start", buildClientTurnStartRequest(message, threadId));
-      markDispatcherOwner(threadId);
-      scheduleDispatcherOwnedRefresh(threadId, 0);
-      return result;
-    }
-
-    case "steerTurn": {
-      const threadId = requireString(message.threadId, "threadId");
-      const result = await appServer.request("turn/steer", {
-        threadId,
-        expectedTurnId: requireString(message.turnId, "turnId"),
-        input: clientInput(message),
-      });
-      scheduleDispatcherOwnedRefresh(threadId, 0);
-      return result;
-    }
-
-    case "interruptTurn": {
-      const threadId = requireString(message.threadId, "threadId");
-      const result = await appServer.request("turn/interrupt", {
-        threadId,
-        turnId: requireString(message.turnId, "turnId"),
-      });
-      scheduleDispatcherOwnedRefresh(threadId, 0);
-      return result;
-    }
-
-    case "compactThread": {
-      const threadId = requireString(message.threadId, "threadId");
-      const result = await appServer.request("thread/compact/start", { threadId });
-      scheduleDispatcherOwnedRefresh(threadId, 0);
-      return result ?? { ok: true };
-    }
-
-    case "setThreadSettings": {
-      const threadId = requireString(message.threadId, "threadId");
-      await ensureDispatcherOwnedConversation(threadId);
-      updateDispatcherOwnedConversation(threadId, (conversation) => {
-        const model = normalizeNullableString(message.model);
-        const reasoningEffort = normalizeNullableString(message.reasoningEffort ?? message.effort);
-        if (model !== undefined) {
-          conversation.latestModel = model;
-        }
-        if (reasoningEffort !== undefined) {
-          conversation.latestReasoningEffort = reasoningEffort;
-        }
-        if (message.inheritThreadSettings === false || message.collaborationMode !== undefined) {
-          conversation.latestCollaborationMode = message.collaborationMode ?? null;
-        } else {
-          const nextModel = model === undefined ? nullableConversationString(conversation.latestModel) : model;
-          const nextReasoningEffort = reasoningEffort === undefined ? conversation.latestReasoningEffort : reasoningEffort;
-          conversation.latestCollaborationMode = updateCollaborationModeSettings(
-            conversation.latestCollaborationMode,
-            nextModel,
-            nextReasoningEffort,
-          );
-        }
-      });
-      broadcastDispatcherOwnedSnapshot(threadId);
-      return { ok: true };
-    }
-
-    case "setQueuedFollowUps": {
-      const threadId = requireString(message.threadId, "threadId");
-      const stateValue = message.state ?? {};
-      await ensureDispatcherOwnedConversation(threadId);
-      updateDispatcherOwnedConversation(threadId, (conversation) => {
-        conversation.queuedFollowUpsState = stateValue;
-      });
-      ipcBridge.broadcast("thread-queued-followups-changed", buildQueuedFollowUpsBroadcastParams(threadId, stateValue));
-      broadcastDispatcherOwnedSnapshot(threadId);
-      return { ok: true };
-    }
-
-    case "rotateToken": {
-      dispatcherToken = randomBytes(18).toString("base64url");
-      tokenCreatedAt = Date.now();
-      const snapshot = securitySnapshot(connectionId);
-      broadcastSecurity();
-      return {
-        token: dispatcherToken,
-        security: snapshot,
-      };
-    }
-
-    case "ipcFollowerRequest": {
-      const threadId = requireString(message.threadId, "threadId");
-      const method = requireFollowerRequestMethod(message.method);
-      const ownerClientId = normalizeOptionalString(message.ownerClientId) ?? streamOwners.get(threadId);
-      if (!ownerClientId) {
-        throw new Error(`No IPC owner for thread ${threadId}`);
-      }
-
-      const response = await ipcBridge.request(method, message.params ?? {}, {
-        targetClientId: ownerClientId,
-      });
-      if (response.resultType === "error") {
-        throw new Error(response.error ?? `${method} failed`);
-      }
-
-      return response.result ?? { ok: true };
-    }
-
-    case "respondServerRequest":
-      scheduleRefreshForServerRequest(requireString(message.appServerRequestId, "appServerRequestId"));
-      appServer.respondToServerRequest(
-        requireString(message.appServerRequestId, "appServerRequestId"),
-        { result: message.result ?? null },
-      );
-      return { ok: true };
-
-    default:
-      throw new Error(`Unsupported client message type: ${message.type}`);
-  }
-}
-
-function textInput(text: string): JsonValue {
-  return {
-    type: "text",
-    text,
-    text_elements: [],
-  };
-}
-
-function buildClientTurnStartRequest(message: ClientMessage, threadId: string): JsonObject {
-  const params: JsonObject = {
-    threadId,
-    input: clientInput(message),
-    cwd: normalizeOptionalString(message.cwd),
-  };
-  const model = normalizeNullableString(message.model);
-  const effort = normalizeNullableString(message.effort ?? message.reasoningEffort);
-  if (model !== undefined) {
-    params.model = model;
-  }
-  if (effort !== undefined) {
-    params.effort = effort;
-  }
-  if (message.collaborationMode !== undefined || message.inheritThreadSettings === false) {
-    params.collaborationMode = message.collaborationMode ?? null;
-  }
-  return params;
-}
-
-function clientInput(message: ClientMessage): JsonValue[] {
-  if (Array.isArray(message.input) && message.input.length > 0) {
-    const input = message.input.filter(isJsonObject);
-    if (input.length > 0) {
-      return input;
-    }
-  }
-  return [textInput(requireString(message.text, "text"))];
-}
-
-async function readThreadObject(threadId: string): Promise<JsonObject> {
-  const result = await appServer.request("thread/read", {
-    threadId,
-    includeTurns: true,
-  });
-  const resultObject = asJsonObject(result);
-  const thread = asJsonObject(resultObject?.thread);
-  if (!thread) {
-    throw new Error(`Thread ${threadId} not found`);
-  }
-  return thread;
-}
-
-async function ensureDispatcherOwnedConversation(threadId: string): Promise<void> {
-  if (dispatcherOwnedConversations.has(threadId)) {
-    return;
-  }
-  const thread = await readThreadObject(threadId);
-  dispatcherOwnedConversations.set(threadId, conversationFromThread(threadId, thread));
-}
 
 function applyIpcBroadcastEffects(broadcastMessage: IpcBroadcastMessage): boolean {
   if (broadcastMessage.method === "thread-stream-state-changed") {
@@ -801,16 +428,6 @@ function releaseDispatcherOwnership(threadId: string): void {
   }
 }
 
-function markDispatcherOwnerFromResult(result: JsonValue): void {
-  const resultObject = asJsonObject(result);
-  const thread = asJsonObject(resultObject?.thread);
-  if (!thread || typeof thread.id !== "string") {
-    return;
-  }
-
-  adoptDispatcherOwnedThread(thread.id, thread);
-}
-
 function adoptDispatcherOwnedThread(threadId: string, thread: JsonObject): void {
   dispatcherOwnedConversations.set(
     threadId,
@@ -833,13 +450,6 @@ function claimDispatcherOwnership(threadId: string): boolean {
 
   dispatcherOwnedConversations.set(threadId, minimalDispatcherConversation(threadId));
   return true;
-}
-
-function markDispatcherOwner(threadId: string): void {
-  if (!dispatcherOwnedConversations.has(threadId)) {
-    dispatcherOwnedConversations.set(threadId, minimalDispatcherConversation(threadId));
-  }
-  broadcastDispatcherOwnedSnapshot(threadId);
 }
 
 // Trailing throttle, not debounce: a thread streaming faster than the interval
@@ -887,14 +497,6 @@ async function refreshDispatcherOwnedConversation(threadId: string): Promise<voi
     conversationFromThread(threadId, thread, dispatcherOwnedConversations.get(threadId)),
   );
   broadcastDispatcherOwnedSnapshot(threadId);
-}
-
-function scheduleRefreshForServerRequest(requestId: string): void {
-  const request = appServer.getPendingServerRequest(requestId);
-  const threadId = request ? requestThreadId(request) : null;
-  if (threadId && dispatcherOwnedConversations.has(threadId)) {
-    scheduleDispatcherOwnedRefresh(threadId, 0);
-  }
 }
 
 function broadcastDispatcherOwnedSnapshots(): void {
@@ -1128,55 +730,6 @@ function findInProgressTurnId(conversation: JsonObject | undefined): string | nu
   return null;
 }
 
-function streamOwnersSnapshot(): JsonValue {
-  return Array.from(streamOwners.entries()).map(([threadId, ownerClientId]) => ({
-    threadId,
-    ownerClientId,
-  }));
-}
-
-function mirroredConversationsSnapshot(): JsonValue {
-  return Array.from(mirroredConversations.entries()).map(([threadId, conversation]) => ({
-    threadId,
-    conversation,
-  }));
-}
-
-function securitySnapshot(currentConnectionId?: string): JsonObject {
-  return {
-    tokenFingerprint: tokenFingerprint(dispatcherToken),
-    tokenCreatedAt,
-    localUrl: `http://localhost:${port}`,
-    lanUrls: lanAddresses().map((address) => `http://${address}:${port}`),
-    remoteUrl: dispatcherRemoteUrl,
-    activeSessions: Array.from(clients).map((client) => ({
-      id: client.data.connectionId,
-      connectedAt: client.data.connectedAt,
-      current: client.data.connectionId === currentConnectionId,
-      remoteAddress: client.data.remoteAddress,
-      userAgent: client.data.userAgent,
-    })),
-  };
-}
-
-function broadcastSecurity(): void {
-  for (const client of clients) {
-    send(client, {
-      type: "dispatcherSecurity",
-      security: securitySnapshot(client.data.connectionId),
-    });
-  }
-}
-
-function tokenFingerprint(token: string): string {
-  return createHash("sha256").update(token).digest("hex").slice(0, 12);
-}
-
-function clientAddress(request: Request): string | null {
-  const forwarded = request.headers.get("cf-connecting-ip") || request.headers.get("x-forwarded-for");
-  return forwarded?.split(",")[0]?.trim() || null;
-}
-
 function clearIpcMirrorsIfDisconnected(status: string): boolean {
   if (status !== "disconnected" && status !== "error" && status !== "closed") {
     return false;
@@ -1234,14 +787,6 @@ function applyConversationMirror(threadId: string, params: JsonObject): boolean 
   return false;
 }
 
-function requireFollowerRequestMethod(method: string | undefined): string {
-  if (!method || !followerRequestMethods.has(method)) {
-    throw new Error(`Unsupported IPC follower method: ${method ?? "missing"}`);
-  }
-
-  return method;
-}
-
 function asJsonObject(value: JsonValue | undefined): JsonObject | null {
   return isJsonObject(value) ? value : null;
 }
@@ -1260,69 +805,6 @@ function cloneJsonObject(value: JsonObject): JsonObject {
     throw new Error("Cloned JSON object changed shape");
   }
   return cloned;
-}
-
-async function serveStatic(pathname: string): Promise<Response> {
-  const decodedPath = decodeURIComponent(pathname === "/" ? "/index.html" : pathname);
-  const filePath = resolve(publicRoot, `.${decodedPath}`);
-  if (!filePath.startsWith(`${publicRoot}${sep}`)) {
-    return new Response("Not found", { status: 404 });
-  }
-
-  const file = Bun.file(filePath);
-  if (!(await file.exists())) {
-    return new Response("Not found", { status: 404 });
-  }
-
-  return new Response(file, {
-    headers: {
-      "content-type": contentType(filePath),
-    },
-  });
-}
-
-function contentType(filePath: string): string {
-  if (filePath.endsWith(".html")) return "text/html; charset=utf-8";
-  if (filePath.endsWith(".css")) return "text/css; charset=utf-8";
-  if (filePath.endsWith(".js")) return "text/javascript; charset=utf-8";
-  if (filePath.endsWith(".webmanifest")) return "application/manifest+json; charset=utf-8";
-  if (filePath.endsWith(".svg")) return "image/svg+xml";
-  return "application/octet-stream";
-}
-
-function send(ws: Bun.ServerWebSocket<WsData>, value: JsonValue): void {
-  ws.send(JSON.stringify(value));
-}
-
-function broadcast(value: JsonValue): void {
-  const payload = JSON.stringify(value);
-  for (const ws of clients) {
-    ws.send(payload);
-  }
-}
-
-function respond(
-  ws: Bun.ServerWebSocket<WsData>,
-  requestId: string | undefined,
-  ok: boolean,
-  result: JsonValue,
-  error: string | null,
-): void {
-  send(ws, {
-    type: "response",
-    requestId,
-    ok,
-    result,
-    error,
-  });
-}
-
-function requireString(value: string | undefined, name: string): string {
-  if (!value || value.trim().length === 0) {
-    throw new Error(`Missing ${name}`);
-  }
-
-  return value;
 }
 
 function requireJsonObject(value: JsonValue | undefined, name: string): JsonObject {
@@ -1352,46 +834,6 @@ function nullableJsonString(value: JsonValue | undefined, name: string): string 
 
   const trimmed = value.trim();
   return trimmed.length > 0 ? trimmed : null;
-}
-
-function nullableConversationString(value: JsonValue | undefined): string | null {
-  return typeof value === "string" && value.trim().length > 0 ? value : null;
-}
-
-function normalizeOptionalString(value: string | undefined): string | null {
-  if (!value) {
-    return null;
-  }
-
-  const trimmed = value.trim();
-  return trimmed.length > 0 ? trimmed : null;
-}
-
-function normalizeNullableString(value: string | null | undefined): string | null | undefined {
-  if (value === undefined) {
-    return undefined;
-  }
-  if (value === null) {
-    return null;
-  }
-
-  const trimmed = value.trim();
-  return trimmed.length > 0 ? trimmed : null;
-}
-
-function normalizeBaseUrl(value: string | undefined): string | null {
-  if (!value) {
-    return null;
-  }
-  try {
-    const url = new URL(value);
-    url.pathname = "";
-    url.search = "";
-    url.hash = "";
-    return url.toString().replace(/\/$/, "");
-  } catch {
-    return null;
-  }
 }
 
 function clientUrl(baseUrl: string): string {

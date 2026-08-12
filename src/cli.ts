@@ -90,7 +90,6 @@ try {
   const token = randomBytes(18).toString("base64url");
   const localTarget = `http://localhost:${port}`;
   const relayConfig = options.relay ? requireRelayConfig(options) : null;
-  const stableRemoteUrl = relayConfig ? stableRelayUrl(relayConfig) : null;
 
   console.log(`Codex extension webview: ${webviewRoot}`);
 
@@ -102,7 +101,6 @@ try {
     cwd: options.cwd,
     host: options.host,
     port,
-    remoteUrl: stableRemoteUrl ?? tunnelStart?.url ?? null,
     token,
   });
 
@@ -705,7 +703,6 @@ function startDispatcher(options: {
   cwd: string;
   host: string;
   port: number;
-  remoteUrl: string | null;
   token: string;
 }): Promise<ChildProcess> {
   return new Promise((resolve, reject) => {
@@ -718,7 +715,6 @@ function startDispatcher(options: {
         DISPATCHER_TOKEN: options.token,
         HOST: options.host,
         PORT: String(options.port),
-        ...(options.remoteUrl ? { DISPATCHER_REMOTE_URL: options.remoteUrl } : {}),
       },
     });
 

@@ -1,5 +1,5 @@
 import { describe, expect, test } from "bun:test";
-import { applyJsonPatches } from "../public/json-patch.js";
+import { applyJsonPatches } from "../src/json-patch";
 
 describe("applyJsonPatches", () => {
   test("applies immer-style array add, replace, and remove patches", () => {
