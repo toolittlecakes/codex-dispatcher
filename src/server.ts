@@ -1,6 +1,6 @@
 import { randomBytes } from "node:crypto";
 import { networkInterfaces } from "node:os";
-import { CodexAppServer, type JsonObject, type JsonValue } from "./codex-app-server";
+import { AppServerError, CodexAppServer, type JsonObject, type JsonValue } from "./codex-app-server";
 import { CodexIpcBridge, type IpcBroadcastMessage } from "./codex-ipc";
 import {
   applyThreadSettingsUpdate,
@@ -533,7 +533,9 @@ async function interruptDispatcherOwnedTurn(
     await appServer.request("turn/interrupt", { threadId: conversationId, turnId });
     return turnId;
   } catch (error) {
-    const message = toError(error).message;
+    // The app server's own message, not ours: our wrapper prefixes it with the
+    // method, and these are matched against what the app server said.
+    const message = error instanceof AppServerError ? error.reason : toError(error).message;
     const actualTurnId = mismatchedTurnId(message);
     if (actualTurnId) {
       if (expectedTurnId !== null && actualTurnId !== expectedTurnId) {
@@ -543,7 +545,7 @@ async function interruptDispatcherOwnedTurn(
       try {
         await appServer.request("turn/interrupt", { threadId: conversationId, turnId: actualTurnId });
       } catch (retryError) {
-        if (!isNoActiveTurnError(toError(retryError).message)) {
+        if (!(retryError instanceof AppServerError) || !isNoActiveTurnError(retryError.reason)) {
           throw retryError;
         }
       }

@@ -59,6 +59,19 @@ export function resolveCodexCliPath(): string {
   return "codex";
 }
 
+// Callers that have to tell one failure from another — a turn that ended before
+// the stop reached it, say — need the app server's own words, so they survive
+// the method prefix that makes the message readable in a log.
+export class AppServerError extends Error {
+  constructor(
+    readonly method: string,
+    readonly reason: string,
+  ) {
+    super(`${method}: ${reason}`);
+    this.name = "AppServerError";
+  }
+}
+
 export class CodexAppServer {
   readonly codexCliPath: string;
 
@@ -227,7 +240,7 @@ export class CodexAppServer {
 
     this.pending.delete(key);
     if ("error" in message && message.error !== undefined && message.error !== null) {
-      pending.reject(new Error(formatAppServerError(pending.method, message.error)));
+      pending.reject(new AppServerError(pending.method, appServerErrorReason(message.error)));
       return;
     }
 
@@ -248,13 +261,13 @@ export class CodexAppServer {
   }
 }
 
-function formatAppServerError(method: string, error: JsonValue): string {
+function appServerErrorReason(error: JsonValue): string {
   if (typeof error === "object" && error !== null && !Array.isArray(error)) {
     const message = error.message;
     if (typeof message === "string") {
-      return `${method}: ${message}`;
+      return message;
     }
   }
 
-  return `${method}: ${JSON.stringify(error)}`;
+  return JSON.stringify(error);
 }

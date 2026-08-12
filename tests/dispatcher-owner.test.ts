@@ -1,4 +1,5 @@
 import { describe, expect, test } from "bun:test";
+import { AppServerError } from "../src/codex-app-server";
 import {
   applyThreadSettingsUpdate,
   buildDispatcherSnapshotParams,
@@ -164,6 +165,16 @@ describe("dispatcher owner IPC helpers", () => {
     expect(mismatchedTurnId("no active turn to interrupt")).toBeNull();
     expect(isNoActiveTurnError("no active turn to interrupt")).toBe(true);
     expect(isNoActiveTurnError("thread not found")).toBe(false);
+  });
+
+  // These strings are the app server's, and it is the only party that phrases
+  // them: a wrapper that folds the method into the message leaves nothing to
+  // match on.
+  test("keeps the app server's own wording out of our framing", () => {
+    const error = new AppServerError("turn/interrupt", "no active turn to interrupt");
+
+    expect(error.message).toBe("turn/interrupt: no active turn to interrupt");
+    expect(isNoActiveTurnError(error.reason)).toBe(true);
   });
 
   test("resolves a permissions change into the profile the next turn runs with", () => {
