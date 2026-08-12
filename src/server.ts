@@ -172,39 +172,37 @@ process.once("SIGTERM", () => {
   process.exit(0);
 });
 
-function applyIpcBroadcastEffects(broadcastMessage: IpcBroadcastMessage): boolean {
+function applyIpcBroadcastEffects(broadcastMessage: IpcBroadcastMessage): void {
   if (broadcastMessage.method === "thread-stream-state-changed") {
     const params = asJsonObject(broadcastMessage.params);
     if (!params) {
-      return false;
+      return;
     }
 
     const threadId = typeof params?.conversationId === "string" ? params.conversationId : null;
     if (!threadId || !broadcastMessage.sourceClientId) {
-      return false;
+      return;
     }
 
-    const previousOwner = streamOwners.get(threadId);
     if (!applyConversationMirror(threadId, params)) {
       streamOwners.delete(threadId);
-      return previousOwner !== undefined;
+      return;
     }
 
     streamOwners.set(threadId, broadcastMessage.sourceClientId);
     releaseDispatcherOwnership(threadId);
-    return previousOwner !== broadcastMessage.sourceClientId;
+    return;
   }
 
   if (broadcastMessage.method !== "client-status-changed") {
-    return false;
+    return;
   }
 
   const params = asJsonObject(broadcastMessage.params);
   if (params?.status !== "disconnected" || typeof params.clientId !== "string") {
-    return false;
+    return;
   }
 
-  let changed = false;
   for (const [threadId, ownerClientId] of streamOwners.entries()) {
     if (ownerClientId !== params.clientId) {
       continue;
@@ -212,9 +210,7 @@ function applyIpcBroadcastEffects(broadcastMessage: IpcBroadcastMessage): boolea
 
     streamOwners.delete(threadId);
     mirroredConversations.delete(threadId);
-    changed = true;
   }
-  return changed;
 }
 
 async function handleDispatcherOwnerRequest(method: string, paramsValue: JsonValue | undefined): Promise<JsonValue> {
@@ -730,15 +726,13 @@ function findInProgressTurnId(conversation: JsonObject | undefined): string | nu
   return null;
 }
 
-function clearIpcMirrorsIfDisconnected(status: string): boolean {
+function clearIpcMirrorsIfDisconnected(status: string): void {
   if (status !== "disconnected" && status !== "error" && status !== "closed") {
-    return false;
+    return;
   }
 
-  const changed = streamOwners.size > 0 || mirroredConversations.size > 0;
   streamOwners.clear();
   mirroredConversations.clear();
-  return changed;
 }
 
 function applyConversationMirror(threadId: string, params: JsonObject): boolean {

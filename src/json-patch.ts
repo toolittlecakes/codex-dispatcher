@@ -106,7 +106,10 @@ function resolvePatchTarget(root: JsonValue, path: PathPart[]): { target: PatchT
       throw new Error("Patch target is not traversable");
     }
 
-    const nextTarget = Array.isArray(target) ? target[Number(part)] : target[String(part)];
+    // Array steps go through the same index check as the final one: coercing
+    // with Number() would quietly turn "" or "01" into a valid position and
+    // patch the wrong element instead of rejecting the path.
+    const nextTarget = Array.isArray(target) ? target[parseArrayIndex(part)] : target[String(part)];
     if (nextTarget === undefined) {
       throw new Error("Patch path does not exist");
     }

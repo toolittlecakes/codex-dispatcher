@@ -4,6 +4,11 @@ export const pwaManifestPath = "/manifest.webmanifest";
 export const pwaServiceWorkerPath = "/sw.js";
 export const pwaIconPath = "/icon.png";
 
+// A browser discovers an installable app through anonymous fetches: the manifest
+// (and the icon it points at) are pulled without our session cookie, so every
+// hop in front of the webview has to let these three through unauthenticated.
+export const pwaPublicPaths: ReadonlySet<string> = new Set([pwaManifestPath, pwaServiceWorkerPath, pwaIconPath]);
+
 // The home-screen icon is the icon of the extension we host, taken from the
 // installed package so it always matches the build the webview came from.
 export function pwaIconFilePath(webviewRoot: string): string {

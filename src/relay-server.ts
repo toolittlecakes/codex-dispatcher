@@ -1,5 +1,6 @@
 import { randomBytes } from "node:crypto";
 import { buildGitHubAuthorizeRequest, buildGitHubWebTokenBody } from "./github-oauth";
+import { pwaPublicPaths } from "./pwa";
 import { isRelayTlsDomainAllowed, slugFromRelayHostname } from "./relay-host";
 import { decodeRelayFrame, encodeRelayFrame, type RelayFrame } from "./relay-protocol";
 import { readRelayState, writeRelayState } from "./relay-store";
@@ -232,15 +233,17 @@ async function proxyBrowserRequest(request: Request, url: URL): Promise<Response
     return new Response("Unknown dispatcher user.", { status: 404 });
   }
 
-  const browserToken = cookieValue(request.headers.get("cookie"), "codex_dispatcher_session");
-  const browserUser = browserToken ? state.authenticateBrowserSession(browserToken, Date.now()) : null;
-  if (browserToken && !browserUser) {
-    persistRelayState();
-  }
-  if (!browserToken || browserUser?.id !== user.id) {
-    const loginUrl = new URL("/auth/github/start", publicBaseUrl);
-    loginUrl.searchParams.set("returnTo", `${url.pathname}${url.search}`);
-    return redirectResponse(loginUrl.toString());
+  if (!pwaPublicPaths.has(url.pathname)) {
+    const browserToken = cookieValue(request.headers.get("cookie"), "codex_dispatcher_session");
+    const browserUser = browserToken ? state.authenticateBrowserSession(browserToken, Date.now()) : null;
+    if (browserToken && !browserUser) {
+      persistRelayState();
+    }
+    if (!browserToken || browserUser?.id !== user.id) {
+      const loginUrl = new URL("/auth/github/start", publicBaseUrl);
+      loginUrl.searchParams.set("returnTo", `${url.pathname}${url.search}`);
+      return redirectResponse(loginUrl.toString());
+    }
   }
 
   const dispatcher = state.activeDispatcherForSlug(slug);

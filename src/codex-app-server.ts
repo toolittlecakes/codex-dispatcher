@@ -34,8 +34,7 @@ export type CodexAppServerEvent =
   | { type: "status"; status: "starting" | "ready" | "exited"; detail?: string }
   | { type: "stderr"; text: string }
   | { type: "notification"; notification: RpcMessage }
-  | { type: "serverRequest"; request: AppServerRequest }
-  | { type: "serverRequestResolved"; id: string };
+  | { type: "serverRequest"; request: AppServerRequest };
 
 type PendingRequest = {
   method: string;
@@ -78,10 +77,6 @@ export class CodexAppServer {
 
   getPendingServerRequests(): AppServerRequest[] {
     return Array.from(this.serverRequests.values());
-  }
-
-  getPendingServerRequest(id: string): AppServerRequest | null {
-    return this.serverRequests.get(id) ?? null;
   }
 
   onEvent(listener: (event: CodexAppServerEvent) => void): () => void {
@@ -164,7 +159,6 @@ export class CodexAppServer {
 
     this.write("error" in response ? { id: request.id, error: response.error } : { id: request.id, result: response.result });
     this.serverRequests.delete(id);
-    this.emit({ type: "serverRequestResolved", id });
   }
 
   stop(): void {

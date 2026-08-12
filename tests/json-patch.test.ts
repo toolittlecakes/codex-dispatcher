@@ -56,6 +56,18 @@ describe("applyJsonPatches", () => {
     );
   });
 
+  test("rejects non-canonical array indexes while walking down a path", () => {
+    // A coerced index would patch turns[0] instead of rejecting the path, and
+    // the mirror would keep serving the wrongly patched thread to followers.
+    for (const index of ["", "01", " 1", "-0"]) {
+      expect(() =>
+        applyJsonPatches({ turns: [{ status: "queued" }] }, [
+          { op: "replace", path: ["turns", index, "status"], value: "done" },
+        ]),
+      ).toThrow("Array patch key is not a valid index");
+    }
+  });
+
   test("rejects prototype pollution paths", () => {
     expect(() => applyJsonPatches({}, [{ op: "add", path: ["__proto__", "polluted"], value: true }])).toThrow(
       "Forbidden patch path segment __proto__",

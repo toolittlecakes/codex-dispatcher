@@ -268,6 +268,80 @@ describe("relay server", () => {
       await relay.exited.catch(() => undefined);
     }
   });
+
+  test("lets an anonymous browser read the PWA install metadata it never sends cookies for", async () => {
+    const dir = mkdtempSync(join(tmpdir(), "codex-dispatcher-relay-"));
+    tempDirs.push(dir);
+    const statePath = join(dir, "state.json");
+    writeFileSync(statePath, JSON.stringify(relayStateSnapshot(), null, 2));
+
+    const relay = Bun.spawn([process.execPath, "run", "src/relay-server.ts"], {
+      cwd: process.cwd(),
+      env: {
+        ...Bun.env,
+        GITHUB_CLIENT_ID: "test-client",
+        GITHUB_CLIENT_SECRET: "test-secret",
+        HOST: "127.0.0.1",
+        PORT: "0",
+        RELAY_DATA_PATH: statePath,
+        RELAY_PUBLIC_BASE_URL: `http://${baseHostname}`,
+      },
+      stderr: "pipe",
+      stdout: "pipe",
+    });
+
+    try {
+      const relayUrl = await waitForRelayUrl(relay);
+      const dispatcher = new WebSocket(new URL(`/api/dispatcher/connect?token=${dispatcherToken}`, relayUrl));
+      expect((await waitForFrame(dispatcher)).type).toBe("dispatcher-accepted");
+
+      dispatcher.addEventListener("message", (event) => {
+        const frame = decodeRelayFrame(String(event.data));
+        if (frame.type !== "http-request") {
+          return;
+        }
+        dispatcher.send(encodeRelayFrame({
+          type: "http-response-start",
+          requestId: frame.requestId,
+          status: 200,
+          headers: [["content-type", "application/manifest+json"]],
+        }));
+        dispatcher.send(encodeRelayFrame({
+          type: "http-response-chunk",
+          requestId: frame.requestId,
+          bodyBase64: Buffer.from(`{"path":"${frame.path}"}`).toString("base64"),
+        }));
+        dispatcher.send(encodeRelayFrame({ type: "http-response-end", requestId: frame.requestId }));
+      });
+
+      // The browser fetches the manifest with credentials omitted, so a login
+      // redirect here is what makes a relay URL uninstallable.
+      const manifest = await fetch(new URL("/manifest.webmanifest", relayUrl), {
+        headers: { host: `toolittlecakes.${baseHostname}` },
+        redirect: "manual",
+      });
+      expect(manifest.status).toBe(200);
+      expect(await manifest.text()).toBe('{"path":"/manifest.webmanifest"}');
+
+      const icon = await fetch(new URL("/icon.png", relayUrl), {
+        headers: { host: `toolittlecakes.${baseHostname}` },
+        redirect: "manual",
+      });
+      expect(icon.status).toBe(200);
+
+      const page = await fetch(new URL("/", relayUrl), {
+        headers: { host: `toolittlecakes.${baseHostname}` },
+        redirect: "manual",
+      });
+      expect(page.status).toBe(302);
+      expect(page.headers.get("location")).toContain("/auth/github/start");
+
+      dispatcher.close();
+    } finally {
+      relay.kill();
+      await relay.exited.catch(() => undefined);
+    }
+  });
 });
 
 function relayStateSnapshot(): unknown {
