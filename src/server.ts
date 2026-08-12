@@ -149,6 +149,17 @@ for (const method of dispatcherOwnerRequestMethods) {
   );
 }
 
+// The one owner call that is not a follower request: before resuming a thread a
+// client asks who is already driving it, and only its owner answers (the
+// registration next to `wq`). Left unanswered, the asker concludes the thread is
+// free and resumes it itself — taking the rollout out from under a turn the
+// phone is running.
+ipcBridge.addRequestHandler(
+  "thread-owner-discovery",
+  (requestMessage) => canAnswerThreadOwnerDiscovery(requestMessage.params),
+  async () => ({}),
+);
+
 await appServer.start();
 await ipcBridge.start();
 
@@ -494,6 +505,18 @@ function canHandleDispatcherOwnerRequest(method: string, paramsValue: JsonValue 
 
   const params = asJsonObject(paramsValue);
   const conversationId = typeof params?.conversationId === "string" ? params.conversationId : null;
+  return Boolean(conversationId && dispatcherOwnedConversations.has(conversationId));
+}
+
+// Discovery is asked of every client at once, so the answer has to be narrow:
+// only the host the thread belongs to, and only while we still own it.
+function canAnswerThreadOwnerDiscovery(paramsValue: JsonValue | undefined): boolean {
+  const params = asJsonObject(paramsValue);
+  if (params?.hostId !== dispatcherIpcHostId) {
+    return false;
+  }
+
+  const conversationId = typeof params.conversationId === "string" ? params.conversationId : null;
   return Boolean(conversationId && dispatcherOwnedConversations.has(conversationId));
 }
 
