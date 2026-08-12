@@ -72,7 +72,7 @@ EventSource авто-реконнектится, но нет Last-Event-ID/бу�
 
 ## B. Мёртвый код
 
-### B1. `canHandle` всегда true → `public/` и WS-протокол недостижимы
+### B1. `canHandle` всегда true → `public/` и WS-протокол недостижимы — DONE
 
 `extension-webview.ts:168`: `canHandle` = `pathname.startsWith("/")` — всегда true. Следствия:
 
@@ -81,6 +81,10 @@ EventSource авто-реконнектится, но нет Last-Event-ID/бу�
 - Почти весь WS-протокол `ClientMessage` в `server.ts` (~400 строк: listThreads/startTurn/rotateToken/...) обслуживает мёртвый UI.
 
 Решение нужно явное: либо выпилить legacy UI + мёртвую часть WS-протокола (и перенести `json-patch.js` в `src/`), либо это баг routing'а и PWA-ассеты надо начать отдавать. Blast radius больше, чем кажется: вместе с WS-протоколом мертва вся dispatcher-owner подсистема — см. E3.
+
+Сделано (решение пользователя: выпилить UI, PWA сделать по-настоящему). Удалены `public/`, `serveStatic`, `/ws` и весь `ClientMessage`-протокол вместе с осиротевшими хелперами (`securitySnapshot`, `broadcastSecurity`, `markDispatcherOwner*`, `ensureDispatcherOwnedConversation`, `scheduleRefreshForServerRequest`); `json-patch` переехал в `src/json-patch.ts` с типами (закрывает D2). `DISPATCHER_REMOTE_URL` больше некому читать — убран и из `cli.ts`. stderr app-server'а и IPC писались только в мёртвый UI — теперь идут в консоль.
+
+PWA сделан на поверхности вебвью (`src/pwa.ts`): `/manifest.webmanifest`, `/sw.js` и `/icon.png` (иконка берётся из самого расширения, 385x385) отдаются без токена — браузер тянет манифест без нашей куки; в `<head>` инжектятся link'и, apple-touch-icon и регистрация worker'а. Worker намеренно ничего не кэширует (кэш отдавал бы ассеты версии расширения, которую диспетчер больше не хостит) — только `fetch`-listener ради installability. Кука сессии получила `Max-Age`, иначе установленное приложение стартовало бы с `start_url` в 401. Проверено живьём: манифест/worker/иконка отдаются анонимно, `/` без токена — 401, `/ws` — 404.
 
 ### E6. `dispatcherOwnedConversations` растёт монотонно (найдено ревью E3)
 
@@ -116,9 +120,9 @@ EventSource авто-реконнектится, но нет Last-Event-ID/бу�
 
 `globalState`/`persistedAtomState`/`sharedObjectState`/`activeExtensionStatePath` (`extension-webview.ts:57-60`) — глобальные синглтоны вне класса. Второй инстанс `ExtensionWebview` (тесты) клобает первый; конструктор молча перезагружает глобальное состояние. Фикс: перенести в поля класса / отдельный state-объект, инжектируемый в конструктор.
 
-### D2. Server импортирует untyped `.js` из `public/`
+### D2. Server импортирует untyped `.js` из `public/` — DONE
 
-`server.ts:4`: `import ... from "../public/json-patch.js"`. Shared-модуль должен жить в `src/` с типами; в `public/` (если public остаётся) — build-копия или реэкспорт.
+`server.ts:4`: `import ... from "../public/json-patch.js"`. Закрыто вместе с B1: модуль переехал в `src/json-patch.ts` с типами, тест — в `tests/json-patch.test.ts`, `public/` больше нет.
 
 ### D3. Дублирование helpers
 

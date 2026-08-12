@@ -184,6 +184,81 @@ describe("extension webview", () => {
     }
   });
 
+  test("hands the browser everything it needs to install the webview as an app", async () => {
+    const previousRoot = process.env.CODEX_EXTENSION_WEBVIEW_ROOT;
+    const root = mkdtempSync(join(tmpdir(), "codex-webview-"));
+    process.env.CODEX_EXTENSION_WEBVIEW_ROOT = root;
+    writeFileSync(join(root, "index.html"), "<html><head></head><body></body></html>");
+
+    try {
+      const webview = new ExtensionWebview({
+        appServer: {} as never,
+        defaultCwd: "/repo",
+        getToken: () => "secret",
+      });
+
+      // The browser fetches the manifest and the worker without our session
+      // cookie, so both have to answer an anonymous request.
+      const manifestResponse = await webview.fetch(
+        new Request("http://localhost/manifest.webmanifest"),
+        new URL("http://localhost/manifest.webmanifest"),
+      );
+      expect(manifestResponse.status).toBe(200);
+      expect(manifestResponse.headers.get("content-type")).toContain("application/manifest+json");
+      const manifest = (await manifestResponse.json()) as {
+        start_url: string;
+        display: string;
+        icons: Array<{ src: string; sizes: string; type: string }>;
+      };
+      expect(manifest.start_url).toBe("/");
+      expect(manifest.display).toBe("standalone");
+      expect(manifest.icons[0]?.src).toBe("/icon.png");
+      expect(manifest.icons[0]?.type).toBe("image/png");
+
+      const workerResponse = await webview.fetch(new Request("http://localhost/sw.js"), new URL("http://localhost/sw.js"));
+      expect(workerResponse.status).toBe(200);
+      expect(workerResponse.headers.get("content-type")).toContain("text/javascript");
+      const worker = await workerResponse.text();
+      expect(worker).toContain('addEventListener("fetch"');
+      expect(worker).not.toContain("caches");
+
+      const html = await (
+        await webview.fetch(new Request("http://localhost/?token=secret"), new URL("http://localhost/?token=secret"))
+      ).text();
+      expect(html).toContain('rel="manifest" href="/manifest.webmanifest"');
+      expect(html).toContain('rel="apple-touch-icon" href="/icon.png"');
+      expect(html).toContain('navigator.serviceWorker.register("/sw.js"');
+    } finally {
+      if (previousRoot === undefined) {
+        delete process.env.CODEX_EXTENSION_WEBVIEW_ROOT;
+      } else {
+        process.env.CODEX_EXTENSION_WEBVIEW_ROOT = previousRoot;
+      }
+      rmSync(root, { recursive: true, force: true });
+    }
+  });
+
+  test("serves the hosted extension's own icon as the home-screen icon", async () => {
+    const previousRoot = process.env.CODEX_EXTENSION_WEBVIEW_ROOT;
+    delete process.env.CODEX_EXTENSION_WEBVIEW_ROOT;
+    try {
+      const webview = new ExtensionWebview({
+        appServer: {} as never,
+        defaultCwd: "/repo",
+        getToken: () => "secret",
+      });
+      const response = await webview.fetch(new Request("http://localhost/icon.png"), new URL("http://localhost/icon.png"));
+
+      expect(response.status).toBe(200);
+      expect(response.headers.get("content-type")).toBe("image/png");
+      expect((await response.arrayBuffer()).byteLength).toBeGreaterThan(1000);
+    } finally {
+      if (previousRoot !== undefined) {
+        process.env.CODEX_EXTENSION_WEBVIEW_ROOT = previousRoot;
+      }
+    }
+  });
+
   test("promotes URL token to an HttpOnly cookie for extension traffic", async () => {
     const previousRoot = process.env.CODEX_EXTENSION_WEBVIEW_ROOT;
     const root = mkdtempSync(join(tmpdir(), "codex-webview-"));
@@ -207,6 +282,7 @@ describe("extension webview", () => {
 
       expect(response.headers.get("set-cookie")).toContain("codex_dispatcher_session=secret");
       expect(response.headers.get("set-cookie")).toContain("HttpOnly");
+      expect(response.headers.get("set-cookie")).toContain("Max-Age=7776000");
       expect(html).toContain("history.replaceState");
       expect(html).toContain('name="viewport"');
       expect(html).toContain("maximum-scale=1");

@@ -9,6 +9,15 @@ import type {
   ServerRequestResponse,
 } from "./codex-app-server";
 import type { IpcBroadcastMessage } from "./codex-ipc";
+import {
+  pwaHeadTags,
+  pwaIconFilePath,
+  pwaIconPath,
+  pwaManifest,
+  pwaManifestPath,
+  pwaServiceWorkerPath,
+  pwaServiceWorkerSource,
+} from "./pwa";
 
 type HostMessage = JsonObject & {
   type?: string;
@@ -193,6 +202,24 @@ export class ExtensionWebview {
       return new Response("Codex VS Code extension webview was not found.", { status: 404 });
     }
 
+    // The install metadata carries no secrets and the browser fetches the
+    // manifest without our session cookie, so it stays outside the token gate.
+    if (url.pathname === pwaManifestPath) {
+      return new Response(pwaManifest(), {
+        headers: { "content-type": "application/manifest+json; charset=utf-8" },
+      });
+    }
+
+    if (url.pathname === pwaServiceWorkerPath) {
+      return new Response(pwaServiceWorkerSource, {
+        headers: { "content-type": "text/javascript; charset=utf-8", "service-worker-allowed": "/" },
+      });
+    }
+
+    if (url.pathname === pwaIconPath) {
+      return serveFile(pwaIconFilePath(this.webviewRoot));
+    }
+
     if (!this.isAuthorized(request, url)) {
       return new Response("Unauthorized", { status: 401 });
     }
@@ -277,7 +304,10 @@ export class ExtensionWebview {
     } else {
       html = html.replace("<head>", `<head>\n${this.buildViewportMeta()}`);
     }
-    html = html.replace("<head>", `<head>\n${this.buildViewportStyle()}\n${this.buildShim(url.searchParams.get("token") ?? "")}`);
+    html = html.replace(
+      "<head>",
+      `<head>\n${pwaHeadTags()}\n${this.buildViewportStyle()}\n${this.buildShim(url.searchParams.get("token") ?? "")}`,
+    );
 
     const headers = new Headers({ "content-type": "text/html; charset=utf-8" });
     if (url.searchParams.get("token") === this.getToken()) {
@@ -297,16 +327,7 @@ export class ExtensionWebview {
       return new Response("Not found", { status: 404 });
     }
 
-    const file = Bun.file(assetPath);
-    if (!(await file.exists())) {
-      return new Response("Not found", { status: 404 });
-    }
-
-    return new Response(file, {
-      headers: {
-        "content-type": contentType(assetPath),
-      },
-    });
+    return serveFile(assetPath);
   }
 
   private buildViewportStyle(): string {
@@ -1933,8 +1954,12 @@ function parseResumePoint(client: StreamClient, header: string | null): number |
   return Number.isSafeInteger(parsed) && parsed >= 0 ? parsed : null;
 }
 
+// An installed app launches its start_url without the token in the query, so
+// the session has to outlive the browser process that first opened the link.
+const authCookieMaxAgeSeconds = 90 * 24 * 60 * 60;
+
 function authCookie(token: string): string {
-  return `${authCookieName}=${encodeURIComponent(token)}; HttpOnly; SameSite=Lax; Path=${routePrefix || "/"}`;
+  return `${authCookieName}=${encodeURIComponent(token)}; HttpOnly; SameSite=Lax; Max-Age=${authCookieMaxAgeSeconds}; Path=${routePrefix || "/"}`;
 }
 
 function cookieValue(header: string | null, name: string): string | null {
@@ -1953,6 +1978,19 @@ function cookieValue(header: string | null, name: string): string | null {
 
 function jsonValuesEqual(left: JsonValue, right: JsonValue): boolean {
   return JSON.stringify(left) === JSON.stringify(right);
+}
+
+async function serveFile(filePath: string): Promise<Response> {
+  const file = Bun.file(filePath);
+  if (!(await file.exists())) {
+    return new Response("Not found", { status: 404 });
+  }
+
+  return new Response(file, {
+    headers: {
+      "content-type": contentType(filePath),
+    },
+  });
 }
 
 function contentType(filePath: string): string {
