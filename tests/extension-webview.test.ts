@@ -1,12 +1,16 @@
 import { describe, expect, test } from "bun:test";
-import { mkdtempSync, readFileSync, rmSync, statSync, writeFileSync } from "node:fs";
-import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, rmSync, statSync, writeFileSync } from "node:fs";
+import { homedir, tmpdir } from "node:os";
+import { basename, dirname, join } from "node:path";
 import {
   ExtensionWebview,
   handleVSCodeRequest,
+  isSupportedExtensionVersion,
   makeFetchResponse,
+  parseExtensionVersion,
+  resolveExtensionWebviewRoot,
   resolveWebviewAssetPath,
+  selectExtensionWebviewRoot,
 } from "../src/extension-webview";
 
 type StreamCollector = {
@@ -90,14 +94,69 @@ describe("extension webview", () => {
   });
 
   test("handles explicit vscode endpoints needed during bootstrap", async () => {
-    await expect(handleVSCodeRequest("extension-info", {}, "/repo")).resolves.toMatchObject({
+    await expect(handleVSCodeRequest("extension-info", {}, "/repo", "/ext/openai.chatgpt-26.803.61601-darwin-arm64/webview")).resolves.toMatchObject({
       appName: "Codex",
       buildFlavor: "prod",
     });
-    await expect(handleVSCodeRequest("list-pinned-threads", {}, "/repo")).resolves.toEqual({ threadIds: [] });
-    await expect(handleVSCodeRequest("unknown-endpoint", {}, "/repo")).rejects.toThrow(
+    await expect(handleVSCodeRequest("list-pinned-threads", {}, "/repo", null)).resolves.toEqual({ threadIds: [] });
+    await expect(handleVSCodeRequest("unknown-endpoint", {}, "/repo", null)).rejects.toThrow(
       "Unsupported vscode://codex/unknown-endpoint",
     );
+  });
+
+  test("serves the newest extension version the bridge was verified against", () => {
+    const extensionsDir = mkdtempSync(join(tmpdir(), "codex-extensions-"));
+    const installVersion = (directory: string) => {
+      const webview = join(extensionsDir, directory, "webview");
+      mkdirSync(webview, { recursive: true });
+      writeFileSync(join(webview, "index.html"), "<html></html>");
+      return webview;
+    };
+
+    try {
+      installVersion("openai.chatgpt-26.422.10000-darwin-arm64");
+      const verified = installVersion("openai.chatgpt-26.803.61601-darwin-arm64");
+      // Newer than anything this bridge speaks to: picking it would silently
+      // serve a contract nobody checked.
+      installVersion("openai.chatgpt-27.101.10000-darwin-arm64");
+
+      expect(selectExtensionWebviewRoot(extensionsDir)).toBe(verified);
+
+      rmSync(join(extensionsDir, "openai.chatgpt-26.422.10000-darwin-arm64"), { recursive: true });
+      rmSync(join(extensionsDir, "openai.chatgpt-26.803.61601-darwin-arm64"), { recursive: true });
+      expect(() => selectExtensionWebviewRoot(extensionsDir)).toThrow("27.101.10000 is outside the range");
+
+      rmSync(join(extensionsDir, "openai.chatgpt-27.101.10000-darwin-arm64"), { recursive: true });
+      expect(selectExtensionWebviewRoot(extensionsDir)).toBeNull();
+      expect(selectExtensionWebviewRoot(join(extensionsDir, "missing"))).toBeNull();
+    } finally {
+      rmSync(extensionsDir, { recursive: true, force: true });
+    }
+  });
+
+  test("the extension installed on this machine is one the bridge claims to support", () => {
+    const previousRoot = process.env.CODEX_EXTENSION_WEBVIEW_ROOT;
+    delete process.env.CODEX_EXTENSION_WEBVIEW_ROOT;
+    try {
+      const installed = readdirSync(join(homedir(), ".vscode", "extensions"), { withFileTypes: true })
+        .filter((entry) => entry.isDirectory())
+        .map((entry) => parseExtensionVersion(entry.name))
+        .filter((version): version is number[] => version !== null);
+      if (installed.length === 0) {
+        return;
+      }
+
+      // Fails on the first auto-update past the verified range, which is the
+      // whole point: the bridge emulates one extension's host contract.
+      const root = resolveExtensionWebviewRoot();
+      expect(root).not.toBeNull();
+      expect(existsSync(join(root!, "index.html"))).toBe(true);
+      expect(isSupportedExtensionVersion(parseExtensionVersion(basename(dirname(root!)))!)).toBe(true);
+    } finally {
+      if (previousRoot !== undefined) {
+        process.env.CODEX_EXTENSION_WEBVIEW_ROOT = previousRoot;
+      }
+    }
   });
 
   test("promotes URL token to an HttpOnly cookie for extension traffic", async () => {

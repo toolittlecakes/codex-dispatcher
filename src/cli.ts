@@ -578,12 +578,20 @@ async function runDoctor(options: CliOptions): Promise<boolean> {
   const codexCliPath = resolveCodexCliPath();
   checks.push(await checkExecutable("Codex CLI", codexCliPath, ["--version"]));
 
-  const webviewRoot = resolveExtensionWebviewRoot();
+  // An unsupported installed version is a diagnosis, not a crash: doctor is
+  // exactly where the operator should read that message.
+  let webviewRoot: string | null = null;
+  let unsupportedExtension: string | null = null;
+  try {
+    webviewRoot = resolveExtensionWebviewRoot();
+  } catch (error) {
+    unsupportedExtension = error instanceof Error ? error.message : String(error);
+  }
   const codeCli = await checkExecutable("VS Code CLI", "code", ["--version"]);
   checks.push({
     label: "Codex VS Code extension webview",
-    ok: webviewRoot !== null || (options.installExtension && codeCli.ok),
-    detail: webviewRoot ?? (
+    ok: unsupportedExtension === null && (webviewRoot !== null || (options.installExtension && codeCli.ok)),
+    detail: unsupportedExtension ?? webviewRoot ?? (
       options.installExtension && codeCli.ok
         ? `not installed yet; serve will install ${extensionId}`
         : "not found; install the extension or set CODEX_EXTENSION_WEBVIEW_ROOT"

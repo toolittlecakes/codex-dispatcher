@@ -575,7 +575,7 @@ select,
         if (hostResult.handled) {
           return makeFetchResponse({ requestId, result: hostResult.result });
         }
-        const result = await handleVSCodeRequest(endpoint, body, this.defaultCwd);
+        const result = await handleVSCodeRequest(endpoint, body, this.defaultCwd, this.webviewRoot);
         return makeFetchResponse({ requestId, result });
       }
 
@@ -1217,13 +1217,36 @@ select,
   }
 }
 
+// This bridge hand-implements the host side of one extension's contract: the
+// vscode://codex endpoint set, the follower methods, the IPC method versions.
+// A version it was never checked against is a silent breakage, not an upgrade,
+// so auto-update has to hit an error instead of a half-working webview.
+// min: earliest version the UI parity work was done against; max: newest
+// version verified end to end.
+const supportedExtensionVersions = { min: [26, 422], max: [26, 803] };
+
+export function parseExtensionVersion(directoryName: string): number[] | null {
+  const match = /^openai\.chatgpt-(\d+)\.(\d+)\.(\d+)/.exec(directoryName);
+  return match ? [Number(match[1]), Number(match[2]), Number(match[3])] : null;
+}
+
+export function isSupportedExtensionVersion(version: number[]): boolean {
+  const release = version.slice(0, 2);
+  return compareVersions(release, supportedExtensionVersions.min) >= 0
+    && compareVersions(release, supportedExtensionVersions.max) <= 0;
+}
+
 export function resolveExtensionWebviewRoot(): string | null {
   const configured = process.env.CODEX_EXTENSION_WEBVIEW_ROOT;
   if (configured && existsSync(join(configured, "index.html"))) {
+    // An explicit root is the operator saying which contract to speak to.
     return resolve(configured);
   }
 
-  const extensionsDir = join(homedir(), ".vscode", "extensions");
+  return selectExtensionWebviewRoot(join(homedir(), ".vscode", "extensions"));
+}
+
+export function selectExtensionWebviewRoot(extensionsDir: string): string | null {
   let entries: string[];
   try {
     entries = readdirSync(extensionsDir);
@@ -1231,12 +1254,40 @@ export function resolveExtensionWebviewRoot(): string | null {
     return null;
   }
 
-  const roots = entries
-    .filter((entry) => entry.startsWith("openai.chatgpt-"))
-    .map((entry) => join(extensionsDir, entry, "webview"))
-    .filter((root) => existsSync(join(root, "index.html")));
+  const installed = entries
+    .map((entry) => ({ entry, version: parseExtensionVersion(entry) }))
+    .filter((candidate): candidate is { entry: string; version: number[] } => candidate.version !== null)
+    .filter((candidate) => existsSync(join(extensionsDir, candidate.entry, "webview", "index.html")));
 
-  return roots.sort(compareExtensionRoots).at(-1) ?? null;
+  if (installed.length === 0) {
+    return null;
+  }
+
+  const supported = installed
+    .filter((candidate) => isSupportedExtensionVersion(candidate.version))
+    .sort((left, right) => compareVersions(left.version, right.version));
+
+  const newest = supported.at(-1);
+  if (!newest) {
+    const found = installed.map((candidate) => candidate.version.join(".")).join(", ");
+    throw new Error(
+      `Codex extension ${found} is outside the range this dispatcher emulates `
+      + `(${supportedExtensionVersions.min.join(".")}.x - ${supportedExtensionVersions.max.join(".")}.x). `
+      + "Update the dispatcher, or point CODEX_EXTENSION_WEBVIEW_ROOT at a webview directory you want it to serve.",
+    );
+  }
+
+  return join(extensionsDir, newest.entry, "webview");
+}
+
+function compareVersions(left: number[], right: number[]): number {
+  for (let index = 0; index < Math.max(left.length, right.length); index += 1) {
+    const difference = (left[index] ?? 0) - (right[index] ?? 0);
+    if (difference !== 0) {
+      return difference;
+    }
+  }
+  return 0;
 }
 
 export function resolveWebviewAssetPath(webviewRoot: string, pathname: string): string | null {
@@ -1249,7 +1300,12 @@ export function resolveWebviewAssetPath(webviewRoot: string, pathname: string): 
   return filePath;
 }
 
-export async function handleVSCodeRequest(endpoint: string, body: JsonValue, defaultCwd: string): Promise<JsonValue> {
+export async function handleVSCodeRequest(
+  endpoint: string,
+  body: JsonValue,
+  defaultCwd: string,
+  webviewRoot: string | null,
+): Promise<JsonValue> {
   const params = asObject(body) ?? {};
 
   switch (endpoint) {
@@ -1286,7 +1342,7 @@ export async function handleVSCodeRequest(endpoint: string, body: JsonValue, def
     case "set-pinned-threads-order":
       return { success: false };
     case "extension-info":
-      return { version: extensionVersion(), buildNumber: null, buildFlavor: "prod", appName: "Codex", appIconMedium: null };
+      return { version: extensionVersionOf(webviewRoot), buildNumber: null, buildFlavor: "prod", appName: "Codex", appIconMedium: null };
     case "locale-info":
       return { ideLocale: "en", systemLocale: Intl.DateTimeFormat().resolvedOptions().locale };
     case "os-info":
@@ -1763,18 +1819,9 @@ function sharedObjectValue(key: string): JsonValue {
   }
 }
 
-function extensionVersion(): string {
-  const root = resolveExtensionWebviewRoot();
-  if (!root) {
-    return "0.0.0";
-  }
-
-  const extensionDir = basename(dirname(root));
-  return extensionDir.replace(/^openai\.chatgpt-/, "").replace(/-.+$/, "");
-}
-
-function compareExtensionRoots(left: string, right: string): number {
-  return basename(dirname(left)).localeCompare(basename(dirname(right)), undefined, { numeric: true });
+export function extensionVersionOf(webviewRoot: string | null): string {
+  const version = webviewRoot ? parseExtensionVersion(basename(dirname(webviewRoot))) : null;
+  return version ? version.join(".") : "0.0.0";
 }
 
 export function isRpcId(value: JsonValue | undefined): value is string | number {
