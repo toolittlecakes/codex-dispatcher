@@ -419,12 +419,6 @@ select,
 
   private async handleHostMessage(request: Request): Promise<Response> {
     const client = this.clientFor(clientIdFromRequest(request));
-    if (this.activeClientId !== null && this.activeClientId !== client.id) {
-      // A tab that lost the seat may still be mid-flight with a batch; letting
-      // it through would drive the session from two webviews at once.
-      this.send(client, { type: "dispatcher-webview-superseded" });
-      return jsonResponse({ accepted: false, error: "superseded" }, 409);
-    }
 
     let batch: HostMessage[];
     try {
@@ -432,6 +426,14 @@ select,
     } catch {
       this.send(client, { type: "host-message-error", error: "Malformed host-message batch", sourceType: "unknown" });
       return jsonResponse({ accepted: false }, 400);
+    }
+
+    // Checked after the body is read, not before: another tab can take the seat
+    // while we await it, and a batch dispatched past that point would drive the
+    // session from two webviews at once.
+    if (this.activeClientId !== null && this.activeClientId !== client.id) {
+      this.send(client, { type: "dispatcher-webview-superseded" });
+      return jsonResponse({ accepted: false, error: "superseded" }, 409);
     }
 
     // VS Code invokes the extension's message handler in send order but never
@@ -797,8 +799,15 @@ select,
     // this stream attached to an orphan that broadcasts no longer reach.
     this.pruneDetachedClients();
     const client = this.clientFor(clientIdFromRequest(request));
-    this.makeActive(client);
     const resumeFrom = parseResumePoint(client, request.headers.get("last-event-id"));
+    // Only a page load takes the seat. A browser reconnect continues a stream
+    // this webview already had, and treating it as a new webview would let a
+    // backgrounded tab whose SSE dropped steal the session back from the tab
+    // the user is actually looking at.
+    if (resumeFrom === null) {
+      this.makeActive(client);
+    }
+    const holdsSeat = this.activeClientId === client.id;
 
     let streamController: ReadableStreamDefaultController<Uint8Array> | null = null;
     const stream = new ReadableStream<Uint8Array>({
@@ -815,6 +824,14 @@ select,
         }, 5_000);
         streamController = controller;
         controller.enqueue(encoder.encode(": connected\n\n"));
+
+        if (!holdsSeat) {
+          // Its buffer stopped being the whole story the moment another webview
+          // took over, so there is nothing safe to resume into: say why and let
+          // the tab reload if the user wants it back.
+          this.send(client, { type: "dispatcher-webview-superseded" });
+          return;
+        }
 
         const missed = bufferedAfter(client, resumeFrom);
         for (const event of missed ?? []) {
@@ -900,6 +917,11 @@ select,
     for (const client of this.clients.values()) {
       if (client.detachedAt !== null && client.detachedAt < cutoff) {
         this.clients.delete(client.id);
+        if (this.activeClientId === client.id) {
+          // Leaving the id behind would keep a gone webview holding the seat:
+          // every other tab would be told it was superseded by nobody.
+          this.activeClientId = null;
+        }
       }
     }
   }

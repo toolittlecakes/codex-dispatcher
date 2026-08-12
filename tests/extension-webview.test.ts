@@ -832,6 +832,61 @@ describe("extension webview", () => {
     }
   });
 
+  test("keeps the seat with the newest tab when a backgrounded one reconnects", async () => {
+    const previousRoot = process.env.CODEX_EXTENSION_WEBVIEW_ROOT;
+    const root = mkdtempSync(join(tmpdir(), "codex-webview-reconnect-"));
+    process.env.CODEX_EXTENSION_WEBVIEW_ROOT = root;
+    writeFileSync(join(root, "index.html"), "<html><head></head><body></body></html>");
+
+    try {
+      const webview = new ExtensionWebview({
+        appServer: {} as never,
+        defaultCwd: "/repo",
+        getToken: () => "secret",
+        statePath: join(root, "extension-state.json"),
+      });
+
+      const broadcast = (conversationId: string) => {
+        webview.handleIpcBroadcast({
+          type: "broadcast",
+          method: "thread-stream-state-changed",
+          sourceClientId: "vscode-client",
+          params: { conversationId },
+        });
+      };
+
+      const first = await openEventStream(webview, "tab-1");
+      broadcast("thread-1");
+      await first.waitFor(1);
+      const resumeFrom = first.lastEventId()!;
+      // A phone putting the tab in the background kills the SSE socket; the page
+      // stays alive and its EventSource will reconnect on its own.
+      await first.cancel();
+
+      const second = await openEventStream(webview, "tab-2");
+      const reconnected = await openEventStream(webview, "tab-1", resumeFrom);
+
+      broadcast("thread-2");
+
+      // The reconnect only continues tab-1's old stream, so the session stays
+      // with the tab the user actually opened last.
+      expect((await second.waitFor(1)).map((message) => message.type)).toEqual(["ipc-broadcast"]);
+      expect((await reconnected.waitFor(1)).map((message) => message.type)).toEqual([
+        "dispatcher-webview-superseded",
+      ]);
+
+      await second.cancel();
+      await reconnected.cancel();
+    } finally {
+      if (previousRoot === undefined) {
+        delete process.env.CODEX_EXTENSION_WEBVIEW_ROOT;
+      } else {
+        process.env.CODEX_EXTENSION_WEBVIEW_ROOT = previousRoot;
+      }
+      rmSync(root, { recursive: true, force: true });
+    }
+  });
+
   test("resumes a snapshot that was cut in half instead of dropping its tail", async () => {
     const previousRoot = process.env.CODEX_EXTENSION_WEBVIEW_ROOT;
     const root = mkdtempSync(join(tmpdir(), "codex-webview-snapshot-"));
