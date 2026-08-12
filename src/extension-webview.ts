@@ -36,7 +36,7 @@ type ExtensionWebviewOptions = {
   getThreadRole?: (conversationId: string) => string | Promise<string>;
   handleFollowerRequest?: (method: string, params: JsonValue) => Promise<JsonValue>;
   handleThreadStreamSnapshotRequest?: (hostId: string, conversationId: string) => Promise<void> | void;
-  onThreadActivity?: (conversationId: string, thread?: JsonObject) => void;
+  onThreadActivity?: (method: string, conversationId: string, thread?: JsonObject) => void;
 };
 
 // One ordered delivery channel per webview instance. VS Code hands the webview a
@@ -164,7 +164,7 @@ export class ExtensionWebview {
   private readonly handleThreadStreamSnapshotRequest:
     | ((hostId: string, conversationId: string) => Promise<void> | void)
     | undefined;
-  private readonly onThreadActivity: ((conversationId: string, thread?: JsonObject) => void) | undefined;
+  private readonly onThreadActivity: ((method: string, conversationId: string, thread?: JsonObject) => void) | undefined;
   private readonly clients = new Map<string, StreamClient>();
   private readonly startedAt = new Date().toISOString();
   private readonly messageCounts = new Map<string, number>();
@@ -645,7 +645,7 @@ select,
       const startedThread = asObject(asObject(result)?.thread);
       const threadId = appServerThreadId(params, result);
       if (threadId) {
-        this.onThreadActivity?.(threadId, startedThread ?? undefined);
+        this.onThreadActivity?.(request.method, threadId, startedThread ?? undefined);
       }
       return {
         type: "mcp-response",

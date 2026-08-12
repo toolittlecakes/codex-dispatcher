@@ -775,7 +775,7 @@ describe("extension webview", () => {
         defaultCwd: "/repo",
         getToken: () => "secret",
         statePath: join(root, "extension-state.json"),
-        onThreadActivity: (conversationId) => active.push(conversationId),
+        onThreadActivity: (method, conversationId) => active.push(`${method}:${conversationId}`),
       });
       const postHostMessage = (body: unknown) =>
         webview.fetch(
@@ -793,10 +793,17 @@ describe("extension webview", () => {
         request: { id: 2, method: "turn/start", params: { threadId: "thread-new", input: [] } },
       });
       await postHostMessage({ type: "mcp-request", request: { id: 3, method: "model/list", params: {} } });
+      await postHostMessage({
+        type: "mcp-request",
+        request: { id: 4, method: "thread/read", params: { threadId: "someone-elses" } },
+      });
 
-      // A thread this webview created or acted on runs on our app server, which
-      // is exactly what makes the dispatcher its owner.
-      expect(active).toEqual(["thread-new", "thread-new"]);
+      // The ack does not wait for the app server call, so let the last dispatch land.
+      await Bun.sleep(20);
+
+      // A thread this webview created or ran a turn on lives on our app server,
+      // which is what makes the dispatcher its owner. Reading one does not.
+      expect(active).toEqual(["thread/start:thread-new", "turn/start:thread-new", "thread/read:someone-elses"]);
     } finally {
       if (previousRoot === undefined) {
         delete process.env.CODEX_EXTENSION_WEBVIEW_ROOT;

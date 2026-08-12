@@ -64,8 +64,8 @@ const extensionWebview = new ExtensionWebview({
   handleFollowerRequest: (method, params) => handleExtensionFollowerRequest(method, params),
   handleThreadStreamSnapshotRequest: (hostId, conversationId) =>
     handleExtensionThreadStreamSnapshotRequest(hostId, conversationId),
-  onThreadActivity: (conversationId, thread) => {
-    if (!claimDispatcherOwnership(conversationId)) {
+  onThreadActivity: (method, conversationId, thread) => {
+    if (!threadDrivingMethods.has(method) || !claimDispatcherOwnership(conversationId)) {
       return;
     }
     if (thread) {
@@ -82,6 +82,19 @@ const streamOwners = new Map<string, string>();
 const mirroredConversations = new Map<string, JsonObject>();
 const dispatcherOwnedConversations = new Map<string, JsonObject>();
 const dispatcherOwnedRefreshTimers = new Map<string, ReturnType<typeof setTimeout>>();
+
+// Reading, listing, renaming or archiving a thread is not driving it: only a
+// call that runs or creates a turn makes this dispatcher the owner.
+const threadDrivingMethods = new Set([
+  "thread/start",
+  "thread/resume",
+  "thread/fork",
+  "thread/compact/start",
+  "thread/rollback",
+  "turn/start",
+  "turn/steer",
+  "turn/interrupt",
+]);
 
 const followerRequestMethods = new Set([
   "thread-follower-start-turn",
@@ -550,6 +563,7 @@ function applyIpcBroadcastEffects(broadcastMessage: IpcBroadcastMessage): boolea
     }
 
     streamOwners.set(threadId, broadcastMessage.sourceClientId);
+    releaseDispatcherOwnership(threadId);
     return previousOwner !== broadcastMessage.sourceClientId;
   }
 
@@ -716,6 +730,20 @@ function canHandleDispatcherOwnerRequest(method: string, paramsValue: JsonValue 
 function dispatcherOwnedThreadHasTurns(threadId: string): boolean {
   const turns = dispatcherOwnedConversations.get(threadId)?.turns;
   return Array.isArray(turns) && turns.length > 0;
+}
+
+// A snapshot from another client means that window is now driving the thread.
+// Two owners would race turns on the same rollout and flip followers between
+// two states, so ownership has exactly one holder and we hand it over.
+function releaseDispatcherOwnership(threadId: string): void {
+  if (!dispatcherOwnedConversations.delete(threadId)) {
+    return;
+  }
+  const pending = dispatcherOwnedRefreshTimers.get(threadId);
+  if (pending) {
+    clearTimeout(pending);
+    dispatcherOwnedRefreshTimers.delete(threadId);
+  }
 }
 
 function markDispatcherOwnerFromResult(result: JsonValue): void {
