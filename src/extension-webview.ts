@@ -60,7 +60,12 @@ const routePrefix = "";
 const authCookieName = "codex_dispatcher_session";
 const encoder = new TextEncoder();
 const maxDiagnosticMessages = 200;
-const externalFetchTimeoutMs = 120_000;
+// The webview only settles a pending fetch when a fetch-response arrives, and that
+// response rides back in the /host-message POST body. Relay-proxied requests are
+// given up on after 30s (relay-server startTimeout) and the connection is idle-closed
+// after 60s, so a host fetch that outlives either would leave the webview waiting
+// forever. Stay under the strictest link in that chain.
+const externalFetchTimeoutMs = 25_000;
 const globalState = new Map<string, JsonValue>();
 const persistedAtomState = new Map<string, JsonValue>();
 const sharedObjectState = new Map<string, JsonValue>();
