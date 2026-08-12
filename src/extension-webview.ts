@@ -36,6 +36,7 @@ type ExtensionWebviewOptions = {
   getThreadRole?: (conversationId: string) => string | Promise<string>;
   handleFollowerRequest?: (method: string, params: JsonValue) => Promise<JsonValue>;
   handleThreadStreamSnapshotRequest?: (hostId: string, conversationId: string) => Promise<void> | void;
+  onThreadActivity?: (conversationId: string, thread?: JsonObject) => void;
 };
 
 // One ordered delivery channel per webview instance. VS Code hands the webview a
@@ -163,6 +164,7 @@ export class ExtensionWebview {
   private readonly handleThreadStreamSnapshotRequest:
     | ((hostId: string, conversationId: string) => Promise<void> | void)
     | undefined;
+  private readonly onThreadActivity: ((conversationId: string, thread?: JsonObject) => void) | undefined;
   private readonly clients = new Map<string, StreamClient>();
   private readonly startedAt = new Date().toISOString();
   private readonly messageCounts = new Map<string, number>();
@@ -181,6 +183,7 @@ export class ExtensionWebview {
     this.getThreadRole = options.getThreadRole;
     this.handleFollowerRequest = options.handleFollowerRequest;
     this.handleThreadStreamSnapshotRequest = options.handleThreadStreamSnapshotRequest;
+    this.onThreadActivity = options.onThreadActivity;
     loadPersistentExtensionState(options.statePath ?? extensionStatePath());
     this.webviewRoot = resolveExtensionWebviewRoot();
   }
@@ -639,6 +642,11 @@ select,
       const originalParams = request.params ?? {};
       const params = normalizeAppServerRequestParams(request.method, originalParams);
       const result = await this.handleAppServerRequest(request.method, params, originalParams);
+      const startedThread = asObject(asObject(result)?.thread);
+      const threadId = appServerThreadId(params, result);
+      if (threadId) {
+        this.onThreadActivity?.(threadId, startedThread ?? undefined);
+      }
       return {
         type: "mcp-response",
         hostId: "local",
@@ -1892,6 +1900,17 @@ function bufferedAfter(client: StreamClient, lastEventId: number | null): { id: 
     return null;
   }
   return client.buffer.filter((event) => event.id > lastEventId);
+}
+
+// A thread the webview drives against our app server: either it named one or
+// the call created one.
+function appServerThreadId(params: JsonValue, result: JsonValue): string | null {
+  const fromResult = asObject(asObject(result)?.thread)?.id;
+  if (typeof fromResult === "string") {
+    return fromResult;
+  }
+  const fromParams = asObject(params)?.threadId;
+  return typeof fromParams === "string" ? fromParams : null;
 }
 
 function parseHostMessageBatch(body: unknown): HostMessage[] {

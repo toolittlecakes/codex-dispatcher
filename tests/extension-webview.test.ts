@@ -759,6 +759,54 @@ describe("extension webview", () => {
     }
   });
 
+  test("reports threads the webview drives so the dispatcher can own them", async () => {
+    const previousRoot = process.env.CODEX_EXTENSION_WEBVIEW_ROOT;
+    const root = mkdtempSync(join(tmpdir(), "codex-webview-owner-"));
+    process.env.CODEX_EXTENSION_WEBVIEW_ROOT = root;
+    writeFileSync(join(root, "index.html"), "<html><head></head><body></body></html>");
+    const active: string[] = [];
+
+    try {
+      const webview = new ExtensionWebview({
+        appServer: {
+          request: async (method: string) =>
+            method === "thread/start" ? { thread: { id: "thread-new" } } : { ok: true },
+        } as never,
+        defaultCwd: "/repo",
+        getToken: () => "secret",
+        statePath: join(root, "extension-state.json"),
+        onThreadActivity: (conversationId) => active.push(conversationId),
+      });
+      const postHostMessage = (body: unknown) =>
+        webview.fetch(
+          new Request("http://localhost/host-message", {
+            method: "POST",
+            headers: { cookie: "codex_dispatcher_session=secret", "x-dispatcher-client": "tab-1" },
+            body: JSON.stringify({ messages: [body] }),
+          }),
+          new URL("http://localhost/host-message"),
+        );
+
+      await postHostMessage({ type: "mcp-request", request: { id: 1, method: "thread/start", params: {} } });
+      await postHostMessage({
+        type: "mcp-request",
+        request: { id: 2, method: "turn/start", params: { threadId: "thread-new", input: [] } },
+      });
+      await postHostMessage({ type: "mcp-request", request: { id: 3, method: "model/list", params: {} } });
+
+      // A thread this webview created or acted on runs on our app server, which
+      // is exactly what makes the dispatcher its owner.
+      expect(active).toEqual(["thread-new", "thread-new"]);
+    } finally {
+      if (previousRoot === undefined) {
+        delete process.env.CODEX_EXTENSION_WEBVIEW_ROOT;
+      } else {
+        process.env.CODEX_EXTENSION_WEBVIEW_ROOT = previousRoot;
+      }
+      rmSync(root, { recursive: true, force: true });
+    }
+  });
+
   test("forwards webview mcp-response errors and numeric request ids to the app server", async () => {
     const previousRoot = process.env.CODEX_EXTENSION_WEBVIEW_ROOT;
     const root = mkdtempSync(join(tmpdir(), "codex-webview-mcp-"));

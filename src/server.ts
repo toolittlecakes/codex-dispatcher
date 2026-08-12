@@ -64,6 +64,18 @@ const extensionWebview = new ExtensionWebview({
   handleFollowerRequest: (method, params) => handleExtensionFollowerRequest(method, params),
   handleThreadStreamSnapshotRequest: (hostId, conversationId) =>
     handleExtensionThreadStreamSnapshotRequest(hostId, conversationId),
+  onThreadActivity: (conversationId, thread) => {
+    if (!claimDispatcherOwnership(conversationId)) {
+      return;
+    }
+    if (thread) {
+      // thread/start already handed us the thread; reading it back would fail
+      // anyway until the first user message materialises it.
+      adoptDispatcherOwnedThread(conversationId, thread);
+      return;
+    }
+    scheduleDispatcherOwnedRefresh(conversationId, 0);
+  },
 });
 const clients = new Set<Bun.ServerWebSocket<WsData>>();
 const streamOwners = new Map<string, string>();
@@ -108,7 +120,7 @@ appServer.onEvent((event) => {
   if (event.type === "notification") {
     broadcast({ type: "codexNotification", notification: event.notification });
     const threadId = notificationThreadId(event.notification);
-    if (threadId && dispatcherOwnedConversations.has(threadId)) {
+    if (threadId && claimDispatcherOwnership(threadId) && dispatcherOwnedThreadHasTurns(threadId)) {
       scheduleDispatcherOwnedRefresh(threadId);
     }
     return;
@@ -117,7 +129,7 @@ appServer.onEvent((event) => {
   if (event.type === "serverRequest") {
     broadcast({ type: "serverRequest", request: event.request });
     const threadId = requestThreadId(event.request);
-    if (threadId && dispatcherOwnedConversations.has(threadId)) {
+    if (threadId && claimDispatcherOwnership(threadId)) {
       scheduleDispatcherOwnedRefresh(threadId, 0);
     }
     return;
@@ -698,6 +710,14 @@ function canHandleDispatcherOwnerRequest(method: string, paramsValue: JsonValue 
   return Boolean(conversationId && dispatcherOwnedConversations.has(conversationId));
 }
 
+// The app server refuses to read a thread's turns before its first user
+// message, and a thread with no turns has nothing to refresh anyway. The turn
+// the webview submits refreshes unconditionally, which is what ends this state.
+function dispatcherOwnedThreadHasTurns(threadId: string): boolean {
+  const turns = dispatcherOwnedConversations.get(threadId)?.turns;
+  return Array.isArray(turns) && turns.length > 0;
+}
+
 function markDispatcherOwnerFromResult(result: JsonValue): void {
   const resultObject = asJsonObject(result);
   const thread = asJsonObject(resultObject?.thread);
@@ -705,12 +725,31 @@ function markDispatcherOwnerFromResult(result: JsonValue): void {
     return;
   }
 
-  const threadId = thread.id;
+  adoptDispatcherOwnedThread(thread.id, thread);
+}
+
+function adoptDispatcherOwnedThread(threadId: string, thread: JsonObject): void {
   dispatcherOwnedConversations.set(
     threadId,
     conversationFromThread(threadId, thread, dispatcherOwnedConversations.get(threadId)),
   );
   broadcastDispatcherOwnedSnapshot(threadId);
+}
+
+// Every VS Code window runs its own app server, so a turn streaming on ours is
+// a turn this dispatcher drives — that is what makes the phone the owner and
+// lets VS Code attach to it as a follower. A thread a VS Code window already
+// announced ownership of stays theirs.
+function claimDispatcherOwnership(threadId: string): boolean {
+  if (dispatcherOwnedConversations.has(threadId)) {
+    return true;
+  }
+  if (streamOwners.has(threadId)) {
+    return false;
+  }
+
+  dispatcherOwnedConversations.set(threadId, minimalDispatcherConversation(threadId));
+  return true;
 }
 
 function markDispatcherOwner(threadId: string): void {
@@ -720,15 +759,27 @@ function markDispatcherOwner(threadId: string): void {
   broadcastDispatcherOwnedSnapshot(threadId);
 }
 
+// Trailing throttle, not debounce: a thread streaming faster than the interval
+// would otherwise never refresh until the model paused, and every follower
+// would sit on a frozen snapshot until the turn ended.
 function scheduleDispatcherOwnedRefresh(threadId: string, delayMs = 120): void {
-  const existing = dispatcherOwnedRefreshTimers.get(threadId);
-  if (existing) {
-    clearTimeout(existing);
+  const pending = dispatcherOwnedRefreshTimers.get(threadId);
+  if (pending) {
+    if (delayMs === 0) {
+      clearTimeout(pending);
+      dispatcherOwnedRefreshTimers.delete(threadId);
+    } else {
+      return;
+    }
   }
 
   const timer = setTimeout(() => {
     dispatcherOwnedRefreshTimers.delete(threadId);
-    void refreshDispatcherOwnedConversation(threadId);
+    // Timer callback: this is the boundary that owns the failure, and losing a
+    // snapshot refresh must not take the whole dispatcher down with it.
+    refreshDispatcherOwnedConversation(threadId).catch((error: unknown) => {
+      console.error(`dispatcher-owned refresh failed for ${threadId}:`, error);
+    });
   }, delayMs);
   dispatcherOwnedRefreshTimers.set(threadId, timer);
 }
