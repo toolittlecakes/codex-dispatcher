@@ -1,5 +1,5 @@
 import { randomBytes } from "node:crypto";
-import { buildGitHubAuthorizeRequest, buildGitHubWebTokenBody } from "./github-oauth";
+import { buildGitHubAuthorizeRequest, buildGitHubWebTokenBody, pruneExpiredOAuthStates } from "./github-oauth";
 import { pwaPublicPaths } from "./pwa";
 import { isRelayTlsDomainAllowed, slugFromRelayHostname } from "./relay-host";
 import { decodeRelayFrame, encodeRelayFrame, type RelayFrame } from "./relay-protocol";
@@ -183,6 +183,7 @@ function handleDispatcherConnect(
 }
 
 function handleBrowserLoginStart(url: URL): Response {
+  pruneExpiredOAuthStates(pendingOAuthByState, Date.now());
   const returnTo = safeReturnPath(url.searchParams.get("returnTo") ?? "/");
   const auth = buildGitHubAuthorizeRequest({
     clientId: githubClientId,
@@ -199,6 +200,9 @@ function handleBrowserLoginStart(url: URL): Response {
 }
 
 async function handleBrowserLoginCallback(request: Request, url: URL): Promise<Response> {
+  // Pruning before the lookup is what expires an abandoned login: a state that
+  // outlived its TTL is gone by the time the callback asks for it.
+  pruneExpiredOAuthStates(pendingOAuthByState, Date.now());
   const stateParam = url.searchParams.get("state") ?? "";
   const code = url.searchParams.get("code") ?? "";
   const cookieState = cookieValue(request.headers.get("cookie"), "codex_dispatcher_oauth_state");
@@ -296,12 +300,17 @@ async function proxyThroughDispatcher(
   });
   request.signal.addEventListener("abort", () => cancelPendingRequest(requestId), { once: true });
 
+  // TLS ends here; the dispatcher only learns the browser's scheme from this
+  // header, and a client-supplied one must not be able to lie about it.
+  const forwardedHeaders = new Headers(request.headers);
+  forwardedHeaders.set("x-forwarded-proto", publicBase.protocol === "https:" ? "https" : "http");
+
   ws.send(encodeRelayFrame({
     type: "http-request",
     requestId,
     method: request.method,
     path: `${url.pathname}${url.search}`,
-    headers: Array.from(request.headers.entries()),
+    headers: Array.from(forwardedHeaders.entries()),
     bodyBase64,
   }));
 

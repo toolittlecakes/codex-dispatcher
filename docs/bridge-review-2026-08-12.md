@@ -104,15 +104,19 @@ PWA сделан на поверхности вебвью (`src/pwa.ts`): `/mani
 
 Фикс: в `handleDispatcherFrame` проверять `pending.dispatcherSessionId === ws.data.session.id` (сделано через `pendingRequestForDispatcher`). Заодно закрыт сопутствующий риск: `decodeRelayFrame` кидал на битом фрейме прямо в ws-обработчике — теперь такой фрейм закрывает сокет нарушителя, а не всплывает наружу.
 
-### C2. `pendingOAuthByState` без TTL-очистки
+### C2. `pendingOAuthByState` без TTL-очистки — DONE
 
-`relay-server.ts:39`: `createdAt` пишется, но не проверяется; записи брошенных логинов копятся вечно. Фикс: TTL-чистка (например, при каждом start/callback выкидывать записи старше 15 минут).
+`relay-server.ts:39`: `createdAt` пишется, но не проверяется; записи брошенных логинов копятся вечно.
 
-### C3. Мелочи
+Сделано: `pruneExpiredOAuthStates(states, now)` в `github-oauth.ts` (чистая функция, тест там же), вызывается на входе в `/auth/github/start` и `/auth/github/callback`. Чистка до lookup'а — это и есть истечение: state старше 15 минут просто не находится, брошенный логин доиграть нельзя.
+
+### C3. Мелочи — DONE
 
 - Сравнение dispatcher-токена не constant-time (`extension-webview.ts:240-247`, а также `/ws` в `server.ts:199`) — заменить на `crypto.timingSafeEqual`.
 - Кука дispatcher'а без `Secure`/`Max-Age` (`authCookie`, `extension-webview.ts:1658`). Нюанс: локальный сценарий — http по LAN, `Secure` там сломает вход; ставить флаг только когда запрос пришёл через relay/https.
 - **Коллизия имён кук — повышена по итогам ревью, достижима.** Имя `codex_dispatcher_session` совпадает у relay (Domain-кука на `.codex-dispatcher.app`, `relay-server.ts:496`) и дispatcher'а (`extension-webview.ts:54`). Если пользователь откроет через relay URL с `?token=` (dispatcher отдаст свой `set-cookie` в `serveIndex`, `extension-webview.ts:263-265`), браузер получит две одноимённые куки, и `cookieValue` relay (`relay-server.ts:507`) возьмёт первую попавшуюся → ломается relay-авторизация. Переименовать одну из кук.
+
+Сделано: все три сравнения токена (query, `x-dispatcher-token`, кука) идут через `timingSafeEqual` с проверкой длины; `/ws` уехал вместе с B1. Кука диспетчера переименована в `codex_dispatcher_webview` (переименован именно диспетчер, а не relay: смена имени relay-куки разлогинила бы всех). `Secure` ставится, когда запрос пришёл по https — relay терминирует TLS и форвардит по loopback, поэтому он теперь проставляет `x-forwarded-proto` сам, перезаписывая клиентский. `Max-Age` добавлен ещё в B1/PWA. Проверено живьём: по http куки без `Secure`, с `x-forwarded-proto: https` — с `Secure`, обрезанный токен даёт 401, кука с новым именем — 200.
 
 ### C4. Токен диспетчера не переживает рестарт (найдено ревью B1)
 

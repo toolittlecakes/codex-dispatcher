@@ -1,3 +1,4 @@
+import { timingSafeEqual } from "node:crypto";
 import { existsSync, mkdirSync, readFileSync, readdirSync, writeFileSync } from "node:fs";
 import { homedir, platform, release } from "node:os";
 import { basename, dirname, join, resolve, sep } from "node:path";
@@ -74,7 +75,10 @@ type PersistentExtensionState = {
 };
 
 const routePrefix = "";
-const authCookieName = "codex_dispatcher_session";
+// Distinct from the relay's own `codex_dispatcher_session`: the relay sets that
+// one on `.<relay domain>`, so a same-named cookie from us would be sent
+// alongside it and the relay would read whichever the browser listed first.
+const authCookieName = "codex_dispatcher_webview";
 const encoder = new TextEncoder();
 const maxDiagnosticMessages = 200;
 // The webview only settles a pending fetch when a fetch-response arrives, and that
@@ -237,7 +241,7 @@ export class ExtensionWebview {
     }
 
     if (url.pathname === routePrefix || url.pathname === `${routePrefix}/` || url.pathname === `${routePrefix}/index.html`) {
-      return this.serveIndex(url);
+      return this.serveIndex(request, url);
     }
 
     return this.serveAsset(url.pathname);
@@ -287,13 +291,13 @@ export class ExtensionWebview {
   private isAuthorized(request: Request, url: URL): boolean {
     const token = this.getToken();
     return (
-      url.searchParams.get("token") === token ||
-      request.headers.get("x-dispatcher-token") === token ||
-      cookieValue(request.headers.get("cookie"), authCookieName) === token
+      secretEquals(url.searchParams.get("token"), token) ||
+      secretEquals(request.headers.get("x-dispatcher-token"), token) ||
+      secretEquals(cookieValue(request.headers.get("cookie"), authCookieName), token)
     );
   }
 
-  private async serveIndex(url: URL): Promise<Response> {
+  private async serveIndex(request: Request, url: URL): Promise<Response> {
     const indexPath = join(this.webviewRoot!, "index.html");
     let html = await Bun.file(indexPath).text();
     html = html.replace("<!-- PROD_BASE_TAG_HERE -->", `<base href="${routePrefix}/">`);
@@ -310,8 +314,8 @@ export class ExtensionWebview {
     );
 
     const headers = new Headers({ "content-type": "text/html; charset=utf-8" });
-    if (url.searchParams.get("token") === this.getToken()) {
-      headers.append("set-cookie", authCookie(this.getToken()));
+    if (secretEquals(url.searchParams.get("token"), this.getToken())) {
+      headers.append("set-cookie", authCookie(this.getToken(), isSecureRequest(request, url)));
     }
 
     return new Response(html, { headers });
@@ -1958,8 +1962,23 @@ function parseResumePoint(client: StreamClient, header: string | null): number |
 // the session has to outlive the browser process that first opened the link.
 const authCookieMaxAgeSeconds = 90 * 24 * 60 * 60;
 
-function authCookie(token: string): string {
-  return `${authCookieName}=${encodeURIComponent(token)}; HttpOnly; SameSite=Lax; Max-Age=${authCookieMaxAgeSeconds}; Path=${routePrefix || "/"}`;
+function authCookie(token: string, secure: boolean): string {
+  // Secure is conditional on purpose: the LAN entry point is plain http, and an
+  // unconditional flag would make the cookie unusable exactly there.
+  return `${authCookieName}=${encodeURIComponent(token)}; HttpOnly; SameSite=Lax; Max-Age=${authCookieMaxAgeSeconds}; Path=${routePrefix || "/"}${secure ? "; Secure" : ""}`;
+}
+
+// The relay terminates TLS and forwards over plain http on loopback, so the
+// original scheme only survives in the header it sets.
+function isSecureRequest(request: Request, url: URL): boolean {
+  return url.protocol === "https:" || request.headers.get("x-forwarded-proto") === "https";
+}
+
+function secretEquals(candidate: string | null, secret: string): boolean {
+  if (candidate === null || candidate.length !== secret.length) {
+    return false;
+  }
+  return timingSafeEqual(Buffer.from(candidate), Buffer.from(secret));
 }
 
 function cookieValue(header: string | null, name: string): string | null {

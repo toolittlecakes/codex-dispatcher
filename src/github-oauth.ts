@@ -59,3 +59,15 @@ export function buildGitHubWebTokenBody(input: {
   body.set("code_verifier", input.codeVerifier);
   return body;
 }
+
+export const oauthStateTtlMs = 15 * 60_000;
+
+// A login the user walked away from leaves its state behind; without this the
+// map is a slow leak that only grows for the lifetime of the relay process.
+export function pruneExpiredOAuthStates(states: Map<string, { createdAt: number }>, now: number): void {
+  for (const [state, pending] of states.entries()) {
+    if (now - pending.createdAt >= oauthStateTtlMs) {
+      states.delete(state);
+    }
+  }
+}

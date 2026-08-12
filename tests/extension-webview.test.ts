@@ -24,7 +24,7 @@ type JsonRecord = Record<string, unknown>;
 
 async function openEventStream(webview: ExtensionWebview, clientId: string, lastEventId?: string): Promise<StreamCollector> {
   const target = `http://localhost/events?client=${clientId}`;
-  const headers: Record<string, string> = { cookie: "codex_dispatcher_session=secret" };
+  const headers: Record<string, string> = { cookie: "codex_dispatcher_webview=secret" };
   if (lastEventId !== undefined) {
     headers["last-event-id"] = lastEventId;
   }
@@ -280,9 +280,26 @@ describe("extension webview", () => {
       );
       const html = await response.text();
 
-      expect(response.headers.get("set-cookie")).toContain("codex_dispatcher_session=secret");
+      expect(response.headers.get("set-cookie")).toContain("codex_dispatcher_webview=secret");
       expect(response.headers.get("set-cookie")).toContain("HttpOnly");
       expect(response.headers.get("set-cookie")).toContain("Max-Age=7776000");
+      // Plain http on the LAN is a first-class entry point, so Secure here
+      // would hand out a cookie the browser refuses to send back.
+      expect(response.headers.get("set-cookie")).not.toContain("Secure");
+
+      const relayed = await webview.fetch(
+        new Request("http://localhost/?token=secret", { headers: { "x-forwarded-proto": "https" } }),
+        new URL("http://localhost/?token=secret"),
+      );
+      expect(relayed.headers.get("set-cookie")).toContain("Secure");
+
+      // A truncated token must not pass: the comparison checks length before
+      // the constant-time compare.
+      const truncated = await webview.fetch(
+        new Request("http://localhost/debug", { headers: { "x-dispatcher-token": "secre" } }),
+        new URL("http://localhost/debug"),
+      );
+      expect(truncated.status).toBe(401);
       expect(html).toContain("history.replaceState");
       expect(html).toContain('name="viewport"');
       expect(html).toContain("maximum-scale=1");
@@ -312,7 +329,7 @@ describe("extension webview", () => {
 
       const debug = await webview.fetch(
         new Request("http://localhost/debug", {
-          headers: { cookie: "codex_dispatcher_session=secret" },
+          headers: { cookie: "codex_dispatcher_webview=secret" },
         }),
         new URL("http://localhost/debug"),
       );
@@ -368,7 +385,7 @@ describe("extension webview", () => {
       const roleResponse = await webview.fetch(
         new Request("http://localhost/host-message", {
           method: "POST",
-          headers: { cookie: "codex_dispatcher_session=secret", "x-dispatcher-client": "tab-1" },
+          headers: { cookie: "codex_dispatcher_webview=secret", "x-dispatcher-client": "tab-1" },
           body: JSON.stringify({ messages: [{
             type: "thread-role-request",
             requestId: "role-1",
@@ -382,7 +399,7 @@ describe("extension webview", () => {
       const hostRoleResponse = await webview.fetch(
         new Request("http://localhost/host-message", {
           method: "POST",
-          headers: { cookie: "codex_dispatcher_session=secret", "x-dispatcher-client": "tab-1" },
+          headers: { cookie: "codex_dispatcher_webview=secret", "x-dispatcher-client": "tab-1" },
           body: JSON.stringify({ messages: [{
             type: "fetch",
             requestId: "host-role-1",
@@ -398,7 +415,7 @@ describe("extension webview", () => {
       const followerResponse = await webview.fetch(
         new Request("http://localhost/host-message", {
           method: "POST",
-          headers: { cookie: "codex_dispatcher_session=secret", "x-dispatcher-client": "tab-1" },
+          headers: { cookie: "codex_dispatcher_webview=secret", "x-dispatcher-client": "tab-1" },
           body: JSON.stringify({ messages: [{
             type: "thread-follower-start-turn-request",
             requestId: "follower-1",
@@ -415,7 +432,7 @@ describe("extension webview", () => {
       const hostFollowerResponse = await webview.fetch(
         new Request("http://localhost/host-message", {
           method: "POST",
-          headers: { cookie: "codex_dispatcher_session=secret", "x-dispatcher-client": "tab-1" },
+          headers: { cookie: "codex_dispatcher_webview=secret", "x-dispatcher-client": "tab-1" },
           body: JSON.stringify({ messages: [{
             type: "fetch",
             requestId: "host-follower-1",
@@ -445,7 +462,7 @@ describe("extension webview", () => {
       const hostAssertResponse = await webview.fetch(
         new Request("http://localhost/host-message", {
           method: "POST",
-          headers: { cookie: "codex_dispatcher_session=secret", "x-dispatcher-client": "tab-1" },
+          headers: { cookie: "codex_dispatcher_webview=secret", "x-dispatcher-client": "tab-1" },
           body: JSON.stringify({ messages: [{
             type: "fetch",
             requestId: "host-assert-1",
@@ -461,7 +478,7 @@ describe("extension webview", () => {
       const ipcResponse = await webview.fetch(
         new Request("http://localhost/host-message", {
           method: "POST",
-          headers: { cookie: "codex_dispatcher_session=secret", "x-dispatcher-client": "tab-1" },
+          headers: { cookie: "codex_dispatcher_webview=secret", "x-dispatcher-client": "tab-1" },
           body: JSON.stringify({ messages: [{
             type: "fetch",
             requestId: "ipc-1",
@@ -503,7 +520,7 @@ describe("extension webview", () => {
 
       const debug = await webview.fetch(
         new Request("http://localhost/debug", {
-          headers: { cookie: "codex_dispatcher_session=secret" },
+          headers: { cookie: "codex_dispatcher_webview=secret" },
         }),
         new URL("http://localhost/debug"),
       );
@@ -554,7 +571,7 @@ describe("extension webview", () => {
 
       const response = await webview.fetch(
         new Request("http://localhost/events", {
-          headers: { cookie: "codex_dispatcher_session=secret" },
+          headers: { cookie: "codex_dispatcher_webview=secret" },
         }),
         new URL("http://localhost/events"),
       );
@@ -602,7 +619,7 @@ describe("extension webview", () => {
         },
       });
       const openStream = async (lastEventId?: string) => {
-        const headers: Record<string, string> = { cookie: "codex_dispatcher_session=secret" };
+        const headers: Record<string, string> = { cookie: "codex_dispatcher_webview=secret" };
         if (lastEventId !== undefined) {
           headers["last-event-id"] = lastEventId;
         }
@@ -690,7 +707,7 @@ describe("extension webview", () => {
       const accepted = await webview.fetch(
         new Request("http://localhost/host-message", {
           method: "POST",
-          headers: { cookie: "codex_dispatcher_session=secret", "x-dispatcher-client": "tab-1" },
+          headers: { cookie: "codex_dispatcher_webview=secret", "x-dispatcher-client": "tab-1" },
           body: JSON.stringify({ messages: [{ type: "persisted-atom-sync-request" }] }),
         }),
         new URL("http://localhost/host-message"),
@@ -813,7 +830,7 @@ describe("extension webview", () => {
       await webview.fetch(
         new Request("http://localhost/host-message", {
           method: "POST",
-          headers: { cookie: "codex_dispatcher_session=secret", "x-dispatcher-client": "tab-1" },
+          headers: { cookie: "codex_dispatcher_webview=secret", "x-dispatcher-client": "tab-1" },
           body: JSON.stringify({ messages: [{ type: "persisted-atom-sync-request" }] }),
         }),
         new URL("http://localhost/host-message"),
@@ -857,7 +874,7 @@ describe("extension webview", () => {
         webview.fetch(
           new Request("http://localhost/host-message", {
             method: "POST",
-            headers: { cookie: "codex_dispatcher_session=secret", "x-dispatcher-client": "tab-1" },
+            headers: { cookie: "codex_dispatcher_webview=secret", "x-dispatcher-client": "tab-1" },
             body: JSON.stringify({ messages: [body] }),
           }),
           new URL("http://localhost/host-message"),
@@ -911,7 +928,7 @@ describe("extension webview", () => {
         webview.fetch(
           new Request("http://localhost/host-message", {
             method: "POST",
-            headers: { cookie: "codex_dispatcher_session=secret", "x-dispatcher-client": "tab-1" },
+            headers: { cookie: "codex_dispatcher_webview=secret", "x-dispatcher-client": "tab-1" },
             body: JSON.stringify({ messages: [body] }),
           }),
           new URL("http://localhost/host-message"),
@@ -970,7 +987,7 @@ describe("extension webview", () => {
       const accepted = await webview.fetch(
         new Request("http://localhost/host-message", {
           method: "POST",
-          headers: { cookie: "codex_dispatcher_session=secret", "x-dispatcher-client": "tab-1" },
+          headers: { cookie: "codex_dispatcher_webview=secret", "x-dispatcher-client": "tab-1" },
           body: JSON.stringify({
             messages: [
               { type: "fetch", requestId: "slow", url: `${origin.url.origin}/slow`, method: "GET" },
@@ -987,7 +1004,7 @@ describe("extension webview", () => {
       await webview.fetch(
         new Request("http://localhost/host-message", {
           method: "POST",
-          headers: { cookie: "codex_dispatcher_session=secret", "x-dispatcher-client": "tab-1" },
+          headers: { cookie: "codex_dispatcher_webview=secret", "x-dispatcher-client": "tab-1" },
           body: JSON.stringify({
             messages: [
               { type: "shared-object-subscribe", key: "workspace" },
@@ -1047,7 +1064,7 @@ describe("extension webview", () => {
         await webview.fetch(
           new Request("http://localhost/host-message", {
             method: "POST",
-            headers: { cookie: "codex_dispatcher_session=secret", "x-dispatcher-client": "tab-1" },
+            headers: { cookie: "codex_dispatcher_webview=secret", "x-dispatcher-client": "tab-1" },
             body: JSON.stringify({ messages: [{
               type: "fetch",
               requestId: `req-${path}`,
@@ -1100,7 +1117,7 @@ describe("extension webview", () => {
       const atomUpdate = await firstHost.fetch(
         new Request("http://localhost/host-message", {
           method: "POST",
-          headers: { cookie: "codex_dispatcher_session=secret", "x-dispatcher-client": "tab-1" },
+          headers: { cookie: "codex_dispatcher_webview=secret", "x-dispatcher-client": "tab-1" },
           body: JSON.stringify({ messages: [{
             type: "persisted-atom-update",
             key: "onboarding.complete",
@@ -1114,7 +1131,7 @@ describe("extension webview", () => {
       const globalUpdate = await firstHost.fetch(
         new Request("http://localhost/host-message", {
           method: "POST",
-          headers: { cookie: "codex_dispatcher_session=secret", "x-dispatcher-client": "tab-1" },
+          headers: { cookie: "codex_dispatcher_webview=secret", "x-dispatcher-client": "tab-1" },
           body: JSON.stringify({ messages: [{
             type: "fetch",
             requestId: "set-global",
@@ -1161,7 +1178,7 @@ describe("extension webview", () => {
       const readyResponse = await restartedHost.fetch(
         new Request("http://localhost/host-message", {
           method: "POST",
-          headers: { cookie: "codex_dispatcher_session=secret", "x-dispatcher-client": "tab-1" },
+          headers: { cookie: "codex_dispatcher_webview=secret", "x-dispatcher-client": "tab-1" },
           body: JSON.stringify({ messages: [{ type: "ready" }] }),
         }),
         new URL("http://localhost/host-message"),
@@ -1176,7 +1193,7 @@ describe("extension webview", () => {
       const globalRead = await restartedHost.fetch(
         new Request("http://localhost/host-message", {
           method: "POST",
-          headers: { cookie: "codex_dispatcher_session=secret", "x-dispatcher-client": "tab-1" },
+          headers: { cookie: "codex_dispatcher_webview=secret", "x-dispatcher-client": "tab-1" },
           body: JSON.stringify({ messages: [{
             type: "fetch",
             requestId: "get-global",
