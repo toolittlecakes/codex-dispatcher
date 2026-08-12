@@ -24,6 +24,10 @@ export function buildFollowingStatusRequestParams(conversationId: string): JsonO
   return { conversationId, hostId: dispatcherIpcHostId };
 }
 
+export function buildFollowingChangeParams(conversationId: string, following: boolean): JsonObject {
+  return { conversationId, hostId: dispatcherIpcHostId, following };
+}
+
 export type StreamFollowingChange = {
   conversationId: string;
   clientId: string;

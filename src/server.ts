@@ -5,6 +5,7 @@ import { CodexIpcBridge, type IpcBroadcastMessage } from "./codex-ipc";
 import {
   buildDispatcherSnapshotParams,
   buildDispatcherTurnStartRequest,
+  buildFollowingChangeParams,
   buildFollowingStatusRequestParams,
   buildQueuedFollowUpsBroadcastParams,
   dispatcherIpcHostId,
@@ -55,6 +56,7 @@ const dispatcherOwnedRefreshRequested = new Set<string>();
 // Who asked to be kept up to date on which thread. A thread nobody follows is
 // still ours to drive, it just costs no traffic.
 const streamFollowersByConversation = new Map<string, Set<string>>();
+let announcedIpcClientId: string | null = null;
 
 // Reading, listing, renaming or archiving a thread is not driving it: only a
 // call that runs or creates a turn makes this dispatcher the owner.
@@ -128,6 +130,7 @@ ipcBridge.onEvent((event) => {
   }
 
   clearIpcMirrorsIfDisconnected(event.snapshot.status);
+  announceStreamInterestOnRegistration(event.snapshot.clientId);
 });
 
 for (const method of dispatcherOwnerRequestMethods) {
@@ -204,17 +207,44 @@ function applyIpcBroadcastEffects(broadcastMessage: IpcBroadcastMessage): void {
     return;
   }
 
+  if (broadcastMessage.method === "thread-stream-following-status-requested") {
+    // Another client just took a thread over and is looking for followers. We
+    // keep every thread we have open, so answer for the ones we hold: their
+    // snapshot is how we learn we are no longer the one driving it.
+    const params = asJsonObject(broadcastMessage.params);
+    const conversationId = typeof params?.conversationId === "string" ? params.conversationId : null;
+    if (params?.hostId === dispatcherIpcHostId && conversationId && hasConversationOpen(conversationId)) {
+      announceFollowing(conversationId, [broadcastMessage.sourceClientId]);
+    }
+    return;
+  }
+
   if (broadcastMessage.method !== "client-status-changed") {
     return;
   }
 
   const params = asJsonObject(broadcastMessage.params);
-  if (params?.status !== "disconnected" || typeof params.clientId !== "string") {
+  if (typeof params?.clientId !== "string") {
     return;
   }
 
-  for (const followers of streamFollowersByConversation.values()) {
-    followers.delete(params.clientId);
+  if (params.status === "connected") {
+    // A client that just arrived does not know our id yet, so it cannot address
+    // us. Tell it what we watch, the way every other window does.
+    for (const conversationId of openConversationIds()) {
+      announceFollowing(conversationId, [params.clientId]);
+    }
+    return;
+  }
+
+  if (params.status !== "disconnected") {
+    return;
+  }
+
+  for (const [threadId, followers] of streamFollowersByConversation.entries()) {
+    if (followers.delete(params.clientId) && followers.size === 0) {
+      streamFollowersByConversation.delete(threadId);
+    }
   }
 
   for (const [threadId, ownerClientId] of streamOwners.entries()) {
@@ -224,6 +254,41 @@ function applyIpcBroadcastEffects(broadcastMessage: IpcBroadcastMessage): void {
 
     streamOwners.delete(threadId);
     mirroredConversations.delete(threadId);
+  }
+}
+
+// Everything this dispatcher has state for: the threads it drives and the ones
+// it mirrors from another window. This is its equivalent of the threads a VS
+// Code window has open, and it follows all of them.
+function openConversationIds(): string[] {
+  return [...new Set([...dispatcherOwnedConversations.keys(), ...mirroredConversations.keys()])];
+}
+
+function hasConversationOpen(conversationId: string): boolean {
+  return dispatcherOwnedConversations.has(conversationId) || mirroredConversations.has(conversationId);
+}
+
+function announceFollowing(conversationId: string, targetClientIds?: string[]): void {
+  ipcBridge.broadcast(
+    "thread-stream-following-changed",
+    buildFollowingChangeParams(conversationId, true),
+    targetClientIds ? { targetClientIds } : {},
+  );
+}
+
+// Our client id is new after every reconnect, so nobody can address us until we
+// speak first: say what we follow, and ask who follows the threads we drive.
+function announceStreamInterestOnRegistration(clientId: string | null): void {
+  if (clientId === null || clientId === announcedIpcClientId) {
+    return;
+  }
+
+  announcedIpcClientId = clientId;
+  for (const conversationId of openConversationIds()) {
+    announceFollowing(conversationId);
+  }
+  for (const conversationId of dispatcherOwnedConversations.keys()) {
+    ipcBridge.broadcast("thread-stream-following-status-requested", buildFollowingStatusRequestParams(conversationId));
   }
 }
 
