@@ -447,6 +447,65 @@ describe("extension webview", () => {
     }
   });
 
+  test("reports completed non-2xx fetches as success so the webview keeps the error body", async () => {
+    const previousRoot = process.env.CODEX_EXTENSION_WEBVIEW_ROOT;
+    const root = mkdtempSync(join(tmpdir(), "codex-webview-fetch-"));
+    process.env.CODEX_EXTENSION_WEBVIEW_ROOT = root;
+    writeFileSync(join(root, "index.html"), "<html><head></head><body></body></html>");
+    const origin = Bun.serve({
+      port: 0,
+      fetch(request) {
+        if (new URL(request.url).pathname === "/rate-limited") {
+          return new Response(JSON.stringify({ detail: "slow down", retry_after: 30 }), {
+            status: 429,
+            headers: { "content-type": "application/json" },
+          });
+        }
+        return new Response(JSON.stringify({ ok: true }), { headers: { "content-type": "application/json" } });
+      },
+    });
+
+    try {
+      const webview = new ExtensionWebview({
+        appServer: {} as never,
+        defaultCwd: "/repo",
+        getToken: () => "secret",
+      });
+      const postFetch = async (path: string) => {
+        const response = await webview.fetch(
+          new Request("http://localhost/host-message", {
+            method: "POST",
+            headers: { cookie: "codex_dispatcher_session=secret" },
+            body: JSON.stringify({
+              type: "fetch",
+              requestId: `req-${path}`,
+              url: `${origin.url.origin}${path}`,
+              method: "GET",
+            }),
+          }),
+          new URL("http://localhost/host-message"),
+        );
+        return (await response.json()).messages[0];
+      };
+
+      const failed = await postFetch("/rate-limited");
+      expect(failed).toMatchObject({ responseType: "success", status: 429 });
+      expect(JSON.parse(failed.bodyJsonString)).toEqual({ detail: "slow down", retry_after: 30 });
+
+      const succeeded = await postFetch("/ok");
+      expect(succeeded).toMatchObject({ responseType: "success", status: 200 });
+      expect(JSON.parse(succeeded.bodyJsonString)).toEqual({ ok: true });
+    } finally {
+      await origin.stop(true);
+      if (previousRoot === undefined) {
+        delete process.env.CODEX_EXTENSION_WEBVIEW_ROOT;
+      } else {
+        process.env.CODEX_EXTENSION_WEBVIEW_ROOT = previousRoot;
+      }
+      rmSync(root, { recursive: true, force: true });
+    }
+  });
+
   test("persists extension host state across webview host restarts", async () => {
     const previousRoot = process.env.CODEX_EXTENSION_WEBVIEW_ROOT;
     const root = mkdtempSync(join(tmpdir(), "codex-webview-state-"));

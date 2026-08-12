@@ -60,6 +60,7 @@ const routePrefix = "";
 const authCookieName = "codex_dispatcher_session";
 const encoder = new TextEncoder();
 const maxDiagnosticMessages = 200;
+const externalFetchTimeoutMs = 120_000;
 const globalState = new Map<string, JsonValue>();
 const persistedAtomState = new Map<string, JsonValue>();
 const sharedObjectState = new Map<string, JsonValue>();
@@ -1257,21 +1258,13 @@ async function handleExternalFetch(message: HostMessage, requestId: string | und
   const init: RequestInit = {
     method: typeof message.method === "string" ? message.method : "GET",
     headers,
-    signal: AbortSignal.timeout(10_000),
+    signal: AbortSignal.timeout(externalFetchTimeoutMs),
   };
   if (body !== undefined) {
     init.body = body;
   }
 
   const response = await fetch(url, init);
-
-  if (!response.ok) {
-    return makeFetchResponse({
-      requestId,
-      status: response.status,
-      error: response.statusText || `HTTP ${response.status}`,
-    });
-  }
 
   const responseHeaders: JsonObject = {};
   response.headers.forEach((value, key) => {
@@ -1280,23 +1273,33 @@ async function handleExternalFetch(message: HostMessage, requestId: string | und
     }
   });
 
-  const contentTypeHeader = response.headers.get("content-type") ?? "";
-  let bodyJsonString: string;
-  if (contentTypeHeader.includes("application/json")) {
-    bodyJsonString = JSON.stringify(await response.json());
-  } else {
-    const bytes = Buffer.from(await response.arrayBuffer());
-    bodyJsonString = JSON.stringify({ base64: bytes.toString("base64"), contentType: contentTypeHeader });
-  }
-
   return {
     type: "fetch-response",
     responseType: "success",
     requestId,
     status: response.status,
     headers: responseHeaders,
-    bodyJsonString,
+    bodyJsonString: await readExternalFetchBody(response),
   };
+}
+
+// The webview resolves 2xx with JSON.parse(bodyJsonString) and rejects any other
+// status with bodyJsonString as the error message, so every completed exchange is
+// reported as `success` and the body carries the failure detail. `error` responses
+// are reserved for exchanges that never completed.
+export async function readExternalFetchBody(response: Response): Promise<string> {
+  const contentTypeHeader = response.headers.get("content-type") ?? "";
+  if (!response.ok) {
+    return response.text();
+  }
+
+  if (contentTypeHeader.includes("application/json")) {
+    const text = await response.text();
+    return text.length > 0 ? text : "null";
+  }
+
+  const bytes = Buffer.from(await response.arrayBuffer());
+  return JSON.stringify({ base64: bytes.toString("base64"), contentType: contentTypeHeader });
 }
 
 function makeWhamFetchResponse(url: string, requestId: string | undefined): JsonObject | null {
