@@ -32,7 +32,6 @@ const extensionWebview = new ExtensionWebview({
   getToken: () => dispatcherToken,
   getEventReplayMessages: () => buildExtensionEventReplayMessages(),
   assertThreadFollowerOwner: (conversationId) => assertExtensionFollowerOwner(conversationId),
-  handleIpcRequest: (method, params, targetClientId) => handleExtensionIpcRequest(method, params, targetClientId),
   getThreadRole: (conversationId) => extensionThreadRole(conversationId),
   handleFollowerRequest: (method, params) => handleExtensionFollowerRequest(method, params),
   ipcCoordination: {
@@ -786,23 +785,6 @@ function assertExtensionFollowerOwner(threadId: string): void {
   if (!streamOwners.has(threadId)) {
     throw new Error(`No IPC owner for thread ${threadId}`);
   }
-}
-
-async function handleExtensionIpcRequest(
-  method: string,
-  params: JsonValue,
-  targetClientId: string | undefined,
-): Promise<JsonValue> {
-  if (dispatcherOwnerRequestMethods.has(method) && canHandleDispatcherOwnerRequest(method, params)) {
-    return handleDispatcherOwnerRequest(method, params);
-  }
-
-  const response = await ipcBridge.request(method, params, targetClientId ? { targetClientId } : {});
-  if (response.resultType === "error") {
-    throw new Error(response.error ?? `${method} failed`);
-  }
-
-  return response.result ?? { ok: true };
 }
 
 // The webview's own IPC calls, arriving over its RPC session. Unlike the

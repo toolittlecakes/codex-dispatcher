@@ -359,7 +359,6 @@ describe("extension webview", () => {
     process.env.CODEX_EXTENSION_WEBVIEW_ROOT = root;
     writeFileSync(join(root, "index.html"), "<html><head></head><body></body></html>");
     const followerRequests: Array<{ method: string; params: unknown }> = [];
-    const ipcRequests: Array<{ method: string; params: unknown; targetClientId: string | undefined }> = [];
 
     try {
       const webview = new ExtensionWebview({
@@ -370,10 +369,6 @@ describe("extension webview", () => {
           if (conversationId !== "thread-1") {
             throw new Error(`No IPC owner for thread ${conversationId}`);
           }
-        },
-        handleIpcRequest: async (method, params, targetClientId) => {
-          ipcRequests.push({ method, params, targetClientId });
-          return { mirrored: true };
         },
         getThreadRole: (conversationId) => (conversationId === "owned-thread" ? "owner" : "follower"),
         handleFollowerRequest: async (method, params) => {
@@ -445,44 +440,16 @@ describe("extension webview", () => {
       );
       await expect(hostAssertResponse.json()).resolves.toEqual({ accepted: true });
 
-      const ipcResponse = await webview.fetch(
-        new Request("http://localhost/host-message", {
-          method: "POST",
-          headers: { cookie: "codex_dispatcher_webview=secret", "x-dispatcher-client": "tab-1" },
-          body: JSON.stringify({ messages: [{
-            type: "fetch",
-            requestId: "ipc-1",
-            url: "vscode://codex/ipc-request",
-            method: "POST",
-            body: JSON.stringify({
-              method: "thread-follower-steer-turn",
-              targetClientId: "vscode-client",
-              params: { conversationId: "thread-1", input: [] },
-            }),
-          }] }),
-        }),
-        new URL("http://localhost/host-message"),
-      );
-      await expect(ipcResponse.json()).resolves.toEqual({ accepted: true });
-      expect(ipcRequests).toEqual([
-        {
-          method: "thread-follower-steer-turn",
-          params: { conversationId: "thread-1", input: [] },
-          targetClientId: "vscode-client",
-        },
-      ]);
-
       // Every reply arrives on one ordered channel, in causal order.
-      const delivered = await stream.waitFor(4);
+      const delivered = await stream.waitFor(3);
       await stream.cancel();
       expect(delivered.map((message) => message.type)).toEqual([
         "fetch-response",
         "fetch-response",
         "fetch-response",
-        "fetch-response",
       ]);
       expect(delivered[0]).toMatchObject({ requestId: "host-role-1", bodyJsonString: "\"follower\"" });
-      expect(delivered[3]).toMatchObject({ requestId: "ipc-1", bodyJsonString: "{\"mirrored\":true}" });
+      expect(delivered[2]).toMatchObject({ requestId: "host-assert-1" });
 
       const debug = await webview.fetch(
         new Request("http://localhost/debug", {
@@ -492,7 +459,7 @@ describe("extension webview", () => {
       );
       const snapshot = await debug.json();
       expect(snapshot.messageCounts).toMatchObject({
-        "outbound:fetch-response": 4,
+        "outbound:fetch-response": 3,
       });
     } finally {
       if (previousRoot === undefined) {

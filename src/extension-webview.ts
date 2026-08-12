@@ -46,7 +46,6 @@ type ExtensionWebviewOptions = {
   getEventReplayMessages?: () => JsonObject[];
   statePath?: string;
   assertThreadFollowerOwner?: (conversationId: string) => Promise<void> | void;
-  handleIpcRequest?: (method: string, params: JsonValue, targetClientId?: string) => Promise<JsonValue>;
   getThreadRole?: (conversationId: string) => string | Promise<string>;
   handleFollowerRequest?: (method: string, params: JsonValue) => Promise<JsonValue>;
   ipcCoordination?: WebviewIpcCoordination;
@@ -111,9 +110,6 @@ export class ExtensionWebview {
   private readonly getToken: () => string;
   private readonly getEventReplayMessages: (() => JsonObject[]) | undefined;
   private readonly assertThreadFollowerOwner: ((conversationId: string) => Promise<void> | void) | undefined;
-  private readonly handleIpcRequest:
-    | ((method: string, params: JsonValue, targetClientId?: string) => Promise<JsonValue>)
-    | undefined;
   private readonly getThreadRole: ((conversationId: string) => string | Promise<string>) | undefined;
   private readonly handleFollowerRequest: ((method: string, params: JsonValue) => Promise<JsonValue>) | undefined;
   private readonly ipcCoordination: WebviewIpcCoordination | undefined;
@@ -139,7 +135,6 @@ export class ExtensionWebview {
     this.getToken = options.getToken;
     this.getEventReplayMessages = options.getEventReplayMessages;
     this.assertThreadFollowerOwner = options.assertThreadFollowerOwner;
-    this.handleIpcRequest = options.handleIpcRequest;
     this.getThreadRole = options.getThreadRole;
     this.handleFollowerRequest = options.handleFollowerRequest;
     this.ipcCoordination = options.ipcCoordination;
@@ -525,10 +520,6 @@ select,
       if (typeof message.url === "string" && message.url.startsWith("vscode://codex/")) {
         const endpoint = parseVSCodeCodexEndpoint(message.url);
         const body = parseOptionalBody(message.body);
-        if (endpoint === "ipc-request") {
-          const result = await this.handleVSCodeIpcRequest(body);
-          return makeFetchResponse({ requestId, result });
-        }
         const hostResult = await this.handleVSCodeHostRequest(endpoint, body);
         if (hostResult.handled) {
           return makeFetchResponse({ requestId, result: hostResult.result });
@@ -658,17 +649,6 @@ select,
     };
     this.experimentalEnablementSetResults.set(key, result);
     return result;
-  }
-
-  private async handleVSCodeIpcRequest(body: JsonValue): Promise<JsonValue> {
-    if (!this.handleIpcRequest) {
-      throw new Error("IPC request bridge is unavailable");
-    }
-
-    const params = requireObject(body, "ipc-request params");
-    const method = requireString(params.method, "method");
-    const targetClientId = typeof params.targetClientId === "string" ? params.targetClientId : undefined;
-    return this.handleIpcRequest(method, params.params ?? {}, targetClientId);
   }
 
   private handleMcpNotification(message: HostMessage): void {

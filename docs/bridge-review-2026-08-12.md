@@ -336,3 +336,5 @@ VS Code гарантирует один webview-инстанс; в бридже 
 - **IPC-путь.** `thread-follower-steer-turn` пробрасывал `AppServerError` на шину, follower получал `turn/steer: no active turn to steer` и вместо штатного превращения стира в обычное сообщение показывал ошибку.
 
 Сделано: `AppServerError` несёт ещё и `payload` — сырой JSON-RPC error app-server'а, который мост отдаёт вебвью без изменений; на IPC-границе ответ владельца отдаёт `reason`. Префикс остаётся там, где он и был полезен, — в `message` для логов и `host-message-error`.
+
+Хвост, найденный тем же ревью: эндпоинт `vscode://codex/ipc-request` (и вся проводка `handleIpcRequest`/`handleExtensionIpcRequest`) — наша выдумка того же класса, что удалённое в E8: литерала `ipc-request` нет ни в `out/extension.js`, ни в `webview/assets` 26.803, вебвью ходит на шину только через capnweb-сессию. Удалён вместе с тестом на него, а не завёрнут «для симметрии».
