@@ -295,3 +295,11 @@ VS Code гарантирует один webview-инстанс; в бридже 
 Сделано: `expectedTurnId` учитывается (несовпадение с текущим in-progress турном → `interruptedTurnId: null`, как в `Lze`), ответ несёт `interruptedTurnId`.
 
 Осознанно не сделано: `mode` (`system`/`user-stop`/`descendant-cleanup`) диспетчер игнорирует — в расширении он управляет только зачисткой subagent-потомков (`interruptSubagentDescendants`), которой у нас нет вообще. Это отдельная фича, а не половина текущей правки.
+
+### E12. Мерж `threadSettings` терял модель и effort, приехавшие внутри collaboration mode — DONE
+
+Найдено ревьюером по итогам E9. Наш мерж брал `model`/`effort` только с верхнего уровня payload'а, а вебвью меняет модель **исключительно** через пикер режима: он шлёт `threadSettings: {collaborationMode: {...settings: {model, reasoning_effort}}}` и больше ничего. Эталон — `Cb` в вебвью: `model = t.model ?? t.collaborationMode?.settings.model ?? prev.model ?? latestModel`, аналогично effort (`bIe`), плюс резолв `permissions`/`sandboxPolicy` в `activePermissionProfile` (`vIe`), `cwd` и отметка `previousTurnModel` (`xIe`).
+
+Следствия были двойные: (1) follower уже применил `Cb` у себя правильно, а наш снапшот перезаписывает его состояние целиком — выбранная модель откатывалась в UI; (2) следующий частичный апдейт пересобирал `settings.model` режима из протухшего `latestModel`, и `turn/start`, который берёт модель именно из режима, уезжал на старой модели. Дополнительно `permissions` оседали в `latestThreadSettings`, не превращаясь в `activePermissionProfile`, с которым стартует турн.
+
+Сделано: `applyThreadSettingsUpdate` переписан построчно по `Cb` (`yIe`/`bIe`/`vIe`/`xIe` — отдельными функциями с теми же именами в комментариях). Прежний `updateCollaborationModeSettings` удалён: он был нашей приблизительной версией того же мержа и, в частности, затирал `reasoning_effort` режима в `null`, когда effort не менялся.

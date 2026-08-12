@@ -27,35 +27,126 @@ export function buildDispatcherSnapshotParams(
 }
 
 // The 26.803 replacement for the old per-setting follower calls: one payload
-// carrying whatever the follower changed, merged over what the thread already
-// had. Model, effort and collaboration mode stay mirrored onto the `latest*`
-// fields because that is where the rest of the conversation state reads them.
+// carrying whatever the follower changed. The merge is a line-by-line copy of
+// the webview's own (`Cb` in the webview bundle), because the follower ran
+// exactly that over its local state before asking us — and our snapshot then
+// overwrites that state wholesale, so anything we merge differently is a
+// silent rollback of what the user just picked.
 export function applyThreadSettingsUpdate(conversation: JsonObject, threadSettingsValue: JsonValue): void {
-  const threadSettings = asJsonObject(threadSettingsValue);
-  if (!threadSettings) {
+  const update = asJsonObject(threadSettingsValue);
+  if (!update) {
     throw new Error("threadSettings must be an object");
   }
 
   const previous = asJsonObject(conversation.latestThreadSettings) ?? {};
-  const merged: JsonObject = { ...previous, ...threadSettings };
-  conversation.latestThreadSettings = merged;
+  const previousModeModel = collaborationModeModel(conversation.latestCollaborationMode);
+  const collaborationMode = mergeCollaborationMode(conversation.latestCollaborationMode, update);
 
-  if (merged.model !== undefined) {
-    conversation.latestModel = merged.model;
+  // Picking a collaboration mode is how the webview changes the model: it sends
+  // the mode alone, with the model and effort inside its settings.
+  const model =
+    update.model ?? collaborationModeModel(update.collaborationMode) ?? previous.model ?? conversation.latestModel;
+  const effort = mergeEffort(previous.effort === undefined ? conversation.latestReasoningEffort : previous.effort, update);
+
+  conversation.latestThreadSettings = {
+    ...previous,
+    ...update,
+    ...permissionProfileUpdate(update),
+    ...(update.sandboxPolicy !== undefined && update.permissions === undefined ? { permissions: null } : {}),
+    model,
+    effort,
+    collaborationMode,
+  };
+  conversation.latestModel = model ?? conversation.latestModel;
+  conversation.latestReasoningEffort = effort === undefined ? conversation.latestReasoningEffort : effort;
+  conversation.latestCollaborationMode = collaborationMode;
+  conversation.cwd = update.cwd ?? conversation.cwd;
+  rememberPreviousTurnModel(conversation, previousModeModel, collaborationModeModel(collaborationMode));
+}
+
+// `yIe`: a mode sent by the follower replaces ours as given; otherwise a model
+// or effort change is folded into the mode we already have, since that is what
+// the next turn is started from.
+function mergeCollaborationMode(collaborationModeValue: JsonValue | undefined, update: JsonObject): JsonValue | undefined {
+  if (update.collaborationMode != null) {
+    return update.collaborationMode;
   }
-  if (merged.effort !== undefined) {
-    conversation.latestReasoningEffort = merged.effort;
+  if (update.model == null && update.effort === undefined) {
+    return collaborationModeValue;
   }
-  if (threadSettings.collaborationMode !== undefined) {
-    conversation.latestCollaborationMode = threadSettings.collaborationMode;
+
+  const collaborationMode = asJsonObject(collaborationModeValue);
+  const settings = asJsonObject(collaborationMode?.settings);
+  if (!collaborationMode || !settings) {
+    return collaborationModeValue;
+  }
+
+  return {
+    ...collaborationMode,
+    settings: {
+      ...settings,
+      model: update.model ?? settings.model,
+      reasoning_effort: update.effort === undefined ? settings.reasoning_effort : update.effort,
+    },
+  };
+}
+
+// `bIe`: an explicit effort wins, a new mode carries its own, and anything else
+// leaves the thread's effort alone.
+function mergeEffort(previousEffort: JsonValue | undefined, update: JsonObject): JsonValue | undefined {
+  if (update.effort !== undefined) {
+    return update.effort;
+  }
+  if (update.collaborationMode == null) {
+    return previousEffort;
+  }
+
+  return asJsonObject(asJsonObject(update.collaborationMode)?.settings)?.reasoning_effort;
+}
+
+// `vIe`: the permission profile is the resolved form of three different ways the
+// webview can express the same change.
+function permissionProfileUpdate(update: JsonObject): JsonObject {
+  if (update.activePermissionProfile !== undefined) {
+    return { activePermissionProfile: update.activePermissionProfile };
+  }
+  if (update.sandboxPolicy !== undefined) {
+    return { activePermissionProfile: null };
+  }
+  if (update.permissions === undefined) {
+    return {};
+  }
+
+  return {
+    activePermissionProfile: update.permissions == null ? null : { id: update.permissions, extends: null },
+  };
+}
+
+// `xIe`: the UI marks that the model changed since the last turn ran, and drops
+// the mark once the model is switched back.
+function rememberPreviousTurnModel(
+  conversation: JsonObject,
+  previousModeModel: JsonValue | undefined,
+  nextModeModel: JsonValue | undefined,
+): void {
+  const turns = Array.isArray(conversation.turns) ? conversation.turns : [];
+  if (turns.length === 0 || typeof previousModeModel !== "string" || previousModeModel.length === 0) {
     return;
   }
+  if (nextModeModel === previousModeModel) {
+    return;
+  }
+  if (conversation.previousTurnModel == null) {
+    conversation.previousTurnModel = previousModeModel;
+    return;
+  }
+  if (nextModeModel === conversation.previousTurnModel) {
+    conversation.previousTurnModel = null;
+  }
+}
 
-  conversation.latestCollaborationMode = updateCollaborationModeSettings(
-    conversation.latestCollaborationMode,
-    typeof conversation.latestModel === "string" ? conversation.latestModel : null,
-    conversation.latestReasoningEffort,
-  );
+function collaborationModeModel(collaborationModeValue: JsonValue | undefined): JsonValue | undefined {
+  return asJsonObject(asJsonObject(collaborationModeValue)?.settings)?.model;
 }
 
 // Asked once, when this dispatcher takes a thread over: every client with that
@@ -125,27 +216,6 @@ export function buildDispatcherTurnStartRequest(
     model,
     effort,
     collaborationMode,
-  };
-}
-
-export function updateCollaborationModeSettings(
-  collaborationModeValue: JsonValue | undefined,
-  model: string | null,
-  reasoningEffort: JsonValue | undefined,
-): JsonValue | undefined {
-  const collaborationMode = asJsonObject(collaborationModeValue);
-  const settings = asJsonObject(collaborationMode?.settings);
-  if (!collaborationMode || !settings) {
-    return collaborationModeValue;
-  }
-
-  return {
-    ...collaborationMode,
-    settings: {
-      ...settings,
-      model,
-      reasoning_effort: reasoningEffort ?? null,
-    },
   };
 }
 

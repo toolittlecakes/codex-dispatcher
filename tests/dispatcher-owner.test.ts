@@ -6,8 +6,8 @@ import {
   buildQueuedFollowUpsBroadcastParams,
   dispatcherIpcHostId,
   parseStreamFollowingChange,
-  updateCollaborationModeSettings,
 } from "../src/dispatcher-owner";
+import { asJsonObject } from "../src/shared";
 
 describe("dispatcher owner IPC helpers", () => {
   test("uses the local host id expected by VS Code for stream snapshots", () => {
@@ -87,28 +87,6 @@ describe("dispatcher owner IPC helpers", () => {
     ).toBeNull();
   });
 
-  test("keeps model and effort inside collaboration mode settings", () => {
-    expect(
-      updateCollaborationModeSettings(
-        {
-          mode: "collaborative",
-          settings: {
-            model: "old-model",
-            reasoning_effort: "medium",
-          },
-        },
-        "gpt-5.4",
-        "high",
-      ),
-    ).toEqual({
-      mode: "collaborative",
-      settings: {
-        model: "gpt-5.4",
-        reasoning_effort: "high",
-      },
-    });
-  });
-
   test("merges a follower's thread settings over the ones the thread already had", () => {
     const conversation = {
       id: "thread-1",
@@ -124,6 +102,7 @@ describe("dispatcher owner IPC helpers", () => {
       model: "gpt-5-codex",
       effort: "high",
       cwd: "/repo",
+      collaborationMode: { id: "pair", settings: { model: "gpt-5-codex", reasoning_effort: "high" } },
     });
     // The rest of the conversation state reads the model and effort from the
     // `latest*` fields, so a settings update that only lands in the settings
@@ -136,9 +115,53 @@ describe("dispatcher owner IPC helpers", () => {
     });
   });
 
-  test("takes a collaboration mode from the follower as given", () => {
-    const conversation = { id: "thread-1", latestCollaborationMode: { id: "pair", settings: {} } };
+  // The mode picker is the only way the webview changes the model, and it sends
+  // the mode alone — the model and effort ride inside its settings.
+  test("takes the model and effort out of a collaboration mode the follower picked", () => {
+    const conversation = {
+      id: "thread-1",
+      latestModel: "gpt-5",
+      latestReasoningEffort: "medium",
+      latestThreadSettings: { model: "gpt-5", effort: "medium" },
+      latestCollaborationMode: { mode: "default", settings: { model: "gpt-5", reasoning_effort: "medium" } },
+    };
+
+    applyThreadSettingsUpdate(conversation, {
+      collaborationMode: { mode: "plan", settings: { model: "gpt-5-codex", reasoning_effort: "high" } },
+    });
+
+    expect(conversation.latestModel).toBe("gpt-5-codex");
+    expect(conversation.latestReasoningEffort).toBe("high");
+    expect(conversation.latestCollaborationMode).toEqual({
+      mode: "plan",
+      settings: { model: "gpt-5-codex", reasoning_effort: "high" },
+    });
+  });
+
+  // A mode is only replaced by another mode: a payload without one keeps the
+  // thread's, so an unrelated setting cannot silently drop the user's mode.
+  test("keeps the collaboration mode when the update carries none", () => {
+    const conversation = {
+      id: "thread-1",
+      latestCollaborationMode: { mode: "plan", settings: { model: "gpt-5", reasoning_effort: "high" } },
+    };
+
     applyThreadSettingsUpdate(conversation, { collaborationMode: null });
-    expect(conversation.latestCollaborationMode).toBeNull();
+
+    expect(conversation.latestCollaborationMode).toEqual({
+      mode: "plan",
+      settings: { model: "gpt-5", reasoning_effort: "high" },
+    });
+  });
+
+  test("resolves a permissions change into the profile the next turn runs with", () => {
+    const conversation = { id: "thread-1", activePermissionProfile: { id: "old", extends: null } };
+
+    applyThreadSettingsUpdate(conversation, { permissions: "read-only" });
+
+    expect(asJsonObject(conversation.latestThreadSettings)?.activePermissionProfile).toEqual({
+      id: "read-only",
+      extends: null,
+    });
   });
 });
