@@ -50,6 +50,8 @@ const streamOwners = new Map<string, string>();
 const mirroredConversations = new Map<string, JsonObject>();
 const dispatcherOwnedConversations = new Map<string, JsonObject>();
 const dispatcherOwnedRefreshTimers = new Map<string, ReturnType<typeof setTimeout>>();
+const dispatcherOwnedRefreshesInFlight = new Set<string>();
+const dispatcherOwnedRefreshRequested = new Set<string>();
 // Who asked to be kept up to date on which thread. A thread nobody follows is
 // still ours to drive, it just costs no traffic.
 const streamFollowersByConversation = new Map<string, Set<string>>();
@@ -448,6 +450,7 @@ function releaseDispatcherOwnership(threadId: string): void {
     return;
   }
   streamFollowersByConversation.delete(threadId);
+  dispatcherOwnedRefreshRequested.delete(threadId);
   const pending = dispatcherOwnedRefreshTimers.get(threadId);
   if (pending) {
     clearTimeout(pending);
@@ -507,7 +510,29 @@ function scheduleDispatcherOwnedRefresh(threadId: string, delayMs = 120): void {
   dispatcherOwnedRefreshTimers.set(threadId, timer);
 }
 
+// One read per thread at a time. Two thread/read calls can finish in either
+// order, and the older answer landing last would publish a snapshot the
+// followers already moved past.
 async function refreshDispatcherOwnedConversation(threadId: string): Promise<void> {
+  if (dispatcherOwnedRefreshesInFlight.has(threadId)) {
+    dispatcherOwnedRefreshRequested.add(threadId);
+    return;
+  }
+
+  dispatcherOwnedRefreshesInFlight.add(threadId);
+  try {
+    await readDispatcherOwnedConversation(threadId);
+  } finally {
+    dispatcherOwnedRefreshesInFlight.delete(threadId);
+    if (dispatcherOwnedRefreshRequested.delete(threadId)) {
+      // Back through the timer so a failed read is still reported at the one
+      // boundary that handles it instead of chaining onto this call.
+      scheduleDispatcherOwnedRefresh(threadId, 0);
+    }
+  }
+}
+
+async function readDispatcherOwnedConversation(threadId: string): Promise<void> {
   if (!dispatcherOwnedConversations.has(threadId)) {
     return;
   }
