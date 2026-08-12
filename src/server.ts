@@ -608,7 +608,10 @@ async function readDispatcherOwnedConversation(threadId: string): Promise<void> 
   });
   const resultObject = asJsonObject(result);
   const thread = asJsonObject(resultObject?.thread);
-  if (!thread) {
+  // Checked again after the read: a VS Code window can take the thread over
+  // while it is in flight, and writing the answer back would make us its owner
+  // again behind the handover.
+  if (!thread || !dispatcherOwnedConversations.has(threadId)) {
     return;
   }
 
