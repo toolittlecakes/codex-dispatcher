@@ -351,7 +351,10 @@ async function handleDispatcherOwnerRequest(method: string, paramsValue: JsonVal
       );
 
     case "thread-follower-interrupt-turn":
-      return handleDispatcherOwnerInterruptTurn(conversationId);
+      return handleDispatcherOwnerInterruptTurn(
+        conversationId,
+        typeof params.expectedTurnId === "string" ? params.expectedTurnId : null,
+      );
 
     case "thread-follower-compact-thread": {
       const result = await appServer.request("thread/compact/start", { threadId: conversationId });
@@ -484,18 +487,27 @@ async function handleDispatcherOwnerSteerTurn(conversationId: string, params: Js
   return { result };
 }
 
-async function handleDispatcherOwnerInterruptTurn(conversationId: string): Promise<JsonValue> {
+// The follower asks for the turn it can see, and reads back which turn actually
+// stopped: the buffered-turn flow compares `interruptedTurnId` with its own and
+// aborts the whole flow when they differ, so answering without it broke every
+// interrupt that goes through it. `null` means «nothing was running» — either no
+// turn at all, or a newer one than the follower knew about, which the extension
+// deliberately leaves alone.
+async function handleDispatcherOwnerInterruptTurn(
+  conversationId: string,
+  expectedTurnId: string | null,
+): Promise<JsonValue> {
   const turnId = findInProgressTurnId(dispatcherOwnedConversations.get(conversationId));
-  if (!turnId) {
-    return { ok: true };
+  if (!turnId || (expectedTurnId !== null && expectedTurnId !== turnId)) {
+    return { interruptedTurnId: null, ok: true };
   }
 
-  const result = await appServer.request("turn/interrupt", {
+  await appServer.request("turn/interrupt", {
     threadId: conversationId,
     turnId,
   });
   scheduleDispatcherOwnedRefresh(conversationId, 0);
-  return result ?? { ok: true };
+  return { interruptedTurnId: turnId, ok: true };
 }
 
 function canHandleDispatcherOwnerRequest(method: string, paramsValue: JsonValue | undefined): boolean {
