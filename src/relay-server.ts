@@ -91,8 +91,8 @@ const relayServer = Bun.serve<DispatcherWsData>({
       state.disconnectDispatcher(session.userId, session.id);
       closePendingRequestsForDispatcher(session.id);
     },
-    message(_ws, raw) {
-      handleDispatcherFrame(raw.toString());
+    message(ws, raw) {
+      handleDispatcherFrame(ws, raw.toString());
     },
   },
 });
@@ -316,11 +316,18 @@ function cancelPendingRequest(requestId: string): void {
   pendingRequestsById.delete(requestId);
 }
 
-function handleDispatcherFrame(raw: string): void {
-  const frame = decodeRelayFrame(raw);
+function handleDispatcherFrame(ws: Bun.ServerWebSocket<DispatcherWsData>, raw: string): void {
+  let frame: RelayFrame;
+  try {
+    frame = decodeRelayFrame(raw);
+  } catch {
+    ws.close();
+    return;
+  }
+
   switch (frame.type) {
     case "http-response-start": {
-      const pending = pendingRequestsById.get(frame.requestId);
+      const pending = pendingRequestForDispatcher(ws, frame.requestId);
       if (!pending) {
         return;
       }
@@ -343,7 +350,7 @@ function handleDispatcherFrame(raw: string): void {
       return;
     }
     case "http-response-chunk": {
-      const pending = pendingRequestsById.get(frame.requestId);
+      const pending = pendingRequestForDispatcher(ws, frame.requestId);
       if (!pending?.controller || pending.closed) {
         return;
       }
@@ -357,7 +364,7 @@ function handleDispatcherFrame(raw: string): void {
       return;
     }
     case "http-response-end": {
-      const pending = pendingRequestsById.get(frame.requestId);
+      const pending = pendingRequestForDispatcher(ws, frame.requestId);
       if (!pending?.controller || pending.closed) {
         return;
       }
@@ -371,12 +378,20 @@ function handleDispatcherFrame(raw: string): void {
       return;
     }
     case "http-response-error": {
-      const pending = pendingRequestsById.get(frame.requestId);
-      if (!pending) {
+      const pending = pendingRequestForDispatcher(ws, frame.requestId);
+      if (!pending || pending.closed) {
         return;
       }
       pendingRequestsById.delete(frame.requestId);
       pending.closed = true;
+      if (pending.controller) {
+        try {
+          pending.controller.error(new Error(frame.error));
+        } catch {
+          // The browser side may already have closed the stream.
+        }
+        return;
+      }
       pending.reject(new Error(frame.error));
       return;
     }
@@ -385,6 +400,18 @@ function handleDispatcherFrame(raw: string): void {
     default:
       return;
   }
+}
+
+function pendingRequestForDispatcher(
+  ws: Bun.ServerWebSocket<DispatcherWsData>,
+  requestId: string,
+): PendingRequest | null {
+  const session = ws.data.session;
+  const pending = pendingRequestsById.get(requestId);
+  if (!session || !pending || pending.dispatcherSessionId !== session.id) {
+    return null;
+  }
+  return pending;
 }
 
 function closePendingRequestsForDispatcher(sessionId: string): void {

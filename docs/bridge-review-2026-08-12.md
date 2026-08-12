@@ -60,11 +60,11 @@ EventSource авто-реконнектится, но нет Last-Event-ID/бу�
 
 ## C. Security
 
-### C1. Relay: response-фреймы не привязаны к сессии отправителя
+### C1. Relay: response-фреймы не привязаны к сессии отправителя — DONE
 
 `relay-server.ts:94-96`: `message(_ws, raw)` игнорирует, от какого сокета пришёл фрейм. Любой авторизованный dispatcher может слать `http-response-*` с чужим requestId (cross-tenant response injection). Сдерживается только энтропией `req_<24 bytes>`.
 
-Фикс: в `handleDispatcherFrame` проверять `pending.dispatcherSessionId === ws.data.session.id`.
+Фикс: в `handleDispatcherFrame` проверять `pending.dispatcherSessionId === ws.data.session.id` (сделано через `pendingRequestForDispatcher`). Заодно закрыт сопутствующий риск: `decodeRelayFrame` кидал на битом фрейме прямо в ws-обработчике — теперь такой фрейм закрывает сокет нарушителя, а не всплывает наружу.
 
 ### C2. `pendingOAuthByState` без TTL-очистки
 
@@ -96,7 +96,7 @@ EventSource авто-реконнектится, но нет Last-Event-ID/бу�
 
 ## E. Добавлено по итогам ревью субагентом (пропущено в первом проходе)
 
-### E1. Relay: `http-response-error` после `http-response-start` вешает браузерный стрим
+### E1. Relay: `http-response-error` после `http-response-start` вешает браузерный стрим — DONE
 
 `relay-server.ts:373-381`: при error-фрейме вызывается `pending.reject`, но если ответ уже отдан стримом (после `http-response-start`), промис resolved и reject — no-op; `controller.error()` не вызывается, entry удаляется из map → браузерный ответ висит вечно (пост-start таймаута нет, `startTimeout` очищен при resolve). relay-client реально шлёт error-фрейм посреди стрима, если чтение локального body упало (`relay-client.ts:241-249`). Для сравнения: `closePendingRequestsForDispatcher` (`relay-server.ts:398-406`) делает это правильно через `controller.error()`.
 
