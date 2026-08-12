@@ -1,3 +1,5 @@
+import { isRecord } from "./shared";
+
 export type RelayHttpRequestFrame = {
   type: "http-request";
   requestId: string;
@@ -174,8 +176,4 @@ function requiredHeaders(value: unknown): [string, string][] {
     }
     return [entry[0], entry[1]];
   });
-}
-
-function isRecord(value: unknown): value is Record<string, unknown> {
-  return typeof value === "object" && value !== null && !Array.isArray(value);
 }

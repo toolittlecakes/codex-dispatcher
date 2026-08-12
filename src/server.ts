@@ -11,6 +11,7 @@ import {
 } from "./dispatcher-owner";
 import { ExtensionWebview } from "./extension-webview";
 import { applyJsonPatches, cloneJson } from "./json-patch";
+import { asJsonObject, isJsonObject } from "./shared";
 
 const port = Number(process.env.PORT ?? "8787");
 const host = process.env.HOST ?? "0.0.0.0";
@@ -779,18 +780,6 @@ function applyConversationMirror(threadId: string, params: JsonObject): boolean 
 
   mirroredConversations.delete(threadId);
   return false;
-}
-
-function asJsonObject(value: JsonValue | undefined): JsonObject | null {
-  return isJsonObject(value) ? value : null;
-}
-
-function isJsonObject(value: JsonValue | undefined): value is JsonObject {
-  if (typeof value !== "object" || value === null || Array.isArray(value)) {
-    return false;
-  }
-
-  return true;
 }
 
 function cloneJsonObject(value: JsonObject): JsonObject {

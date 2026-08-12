@@ -5,6 +5,7 @@ import { isRelayTlsDomainAllowed, slugFromRelayHostname } from "./relay-host";
 import { decodeRelayFrame, encodeRelayFrame, type RelayFrame } from "./relay-protocol";
 import { readRelayState, writeRelayState } from "./relay-store";
 import type { GitHubIdentity, RelayDispatcherSession } from "./relay-state";
+import { cookieValues, isRecord, jsonResponse } from "./shared";
 
 type DispatcherWsData = {
   kind: "dispatcher";
@@ -513,13 +514,6 @@ function safeReturnPath(value: string): string {
   return value.startsWith("/") && !value.startsWith("//") ? value : "/";
 }
 
-function jsonResponse(value: unknown, status = 200): Response {
-  return new Response(JSON.stringify(value), {
-    status,
-    headers: { "content-type": "application/json" },
-  });
-}
-
 function redirectResponse(location: string, headers?: Record<string, string | string[]>): Response {
   const responseHeaders = new Headers({ location });
   for (const [key, value] of Object.entries(headers ?? {})) {
@@ -550,22 +544,6 @@ function expiredCookie(name: string): string {
 // on the parent domain, so a host-only cookie of the same name from a
 // dispatcher sits next to it — and it sends them in an order we do not control.
 // Reading only the first one would authenticate against the wrong cookie.
-function cookieValues(header: string | null, name: string): string[] {
-  const values: string[] = [];
-  for (const part of header?.split(";") ?? []) {
-    const [rawKey, ...rawValue] = part.trim().split("=");
-    if (rawKey !== name) {
-      continue;
-    }
-    try {
-      values.push(decodeURIComponent(rawValue.join("=")));
-    } catch {
-      // Not a value we ever wrote; a malformed escape must not fail the request.
-    }
-  }
-  return values;
-}
-
 function requiredEnv(name: string): string {
   const value = process.env[name];
   if (!value) {
@@ -580,8 +558,4 @@ function persistRelayState(): void {
 
 function secureToken(): string {
   return randomBytes(24).toString("base64url");
-}
-
-function isRecord(value: unknown): value is Record<string, unknown> {
-  return typeof value === "object" && value !== null && !Array.isArray(value);
 }

@@ -1,4 +1,5 @@
 import type { JsonObject, JsonValue } from "./codex-app-server";
+import { asJsonObject } from "./shared";
 
 export const dispatcherIpcHostId = "local";
 
@@ -88,12 +89,4 @@ function normalizeJsonString(value: JsonValue | undefined): string | null {
 
   const trimmed = value.trim();
   return trimmed.length > 0 ? trimmed : null;
-}
-
-function asJsonObject(value: JsonValue | undefined): JsonObject | null {
-  if (typeof value !== "object" || value === null || Array.isArray(value)) {
-    return null;
-  }
-
-  return value;
 }

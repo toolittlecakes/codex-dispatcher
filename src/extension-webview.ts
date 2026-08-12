@@ -19,6 +19,7 @@ import {
   pwaServiceWorkerPath,
   pwaServiceWorkerSource,
 } from "./pwa";
+import { cookieValues, isRecord, jsonResponse } from "./shared";
 
 type HostMessage = JsonObject & {
   type?: string;
@@ -293,7 +294,7 @@ export class ExtensionWebview {
     return (
       secretEquals(url.searchParams.get("token"), token) ||
       secretEquals(request.headers.get("x-dispatcher-token"), token) ||
-      secretEquals(cookieValue(request.headers.get("cookie"), authCookieName), token)
+      cookieValues(request.headers.get("cookie"), authCookieName).some((value) => secretEquals(value, token))
     );
   }
 
@@ -1812,10 +1813,6 @@ function optionalStateObject(value: unknown, key: string): JsonObject {
   return value as JsonObject;
 }
 
-function isRecord(value: unknown): value is Record<string, unknown> {
-  return typeof value === "object" && value !== null && !Array.isArray(value);
-}
-
 function updatePersistedAtomState(message: JsonObject): void {
   if (typeof message.key !== "string") {
     throw new Error("Invalid persisted atom update");
@@ -1892,13 +1889,6 @@ function requireString(value: JsonValue | undefined, name: string): string {
     throw new Error(`Invalid ${name}: expected non-empty string`);
   }
   return value;
-}
-
-function jsonResponse(value: JsonValue, status = 200): Response {
-  return new Response(JSON.stringify(value), {
-    status,
-    headers: { "content-type": "application/json; charset=utf-8" },
-  });
 }
 
 function encodeSseMessage(client: StreamClient, message: JsonObject, eventId: number): Uint8Array {
@@ -1984,20 +1974,6 @@ function secretEquals(candidate: string | null, secret: string): boolean {
   const candidateBytes = Buffer.from(candidate);
   const secretBytes = Buffer.from(secret);
   return candidateBytes.length === secretBytes.length && timingSafeEqual(candidateBytes, secretBytes);
-}
-
-function cookieValue(header: string | null, name: string): string | null {
-  for (const part of header?.split(";") ?? []) {
-    const [rawKey, ...rawValue] = part.trim().split("=");
-    if (rawKey === name) {
-      try {
-        return decodeURIComponent(rawValue.join("="));
-      } catch {
-        return null;
-      }
-    }
-  }
-  return null;
 }
 
 function jsonValuesEqual(left: JsonValue, right: JsonValue): boolean {

@@ -1,6 +1,8 @@
 import { spawn, type ChildProcessWithoutNullStreams } from "node:child_process";
 import { existsSync } from "node:fs";
 import { createInterface } from "node:readline";
+import packageJson from "../package.json" with { type: "json" };
+import { toError } from "./shared";
 
 export type JsonValue =
   | string
@@ -120,7 +122,7 @@ export class CodexAppServer {
       clientInfo: {
         name: "codex_mobile_dispatcher",
         title: "Codex Mobile Dispatcher",
-        version: "0.0.1",
+        version: packageJson.version,
       },
       capabilities: {
         experimentalApi: true,
@@ -255,8 +257,4 @@ function formatAppServerError(method: string, error: JsonValue): string {
   }
 
   return `${method}: ${JSON.stringify(error)}`;
-}
-
-function toError(error: unknown): Error {
-  return error instanceof Error ? error : new Error(String(error));
 }

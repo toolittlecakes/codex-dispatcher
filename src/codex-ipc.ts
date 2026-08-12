@@ -4,6 +4,7 @@ import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { connect, createServer, type Server, type Socket } from "node:net";
 import type { JsonObject, JsonValue } from "./codex-app-server";
+import { isJsonObject, toError } from "./shared";
 
 type IpcRequestMessage = {
   type: "request";
@@ -964,12 +965,4 @@ function makeFrame(message: IpcMessage): Buffer {
   frame.writeUInt32LE(payloadBytes, 0);
   frame.write(payload, 4, "utf8");
   return frame;
-}
-
-function isJsonObject(value: JsonValue | undefined): value is JsonObject {
-  return typeof value === "object" && value !== null && !Array.isArray(value);
-}
-
-function toError(error: unknown): Error {
-  return error instanceof Error ? error : new Error(String(error));
 }

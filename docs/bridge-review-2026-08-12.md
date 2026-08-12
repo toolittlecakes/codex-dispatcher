@@ -134,13 +134,15 @@ PWA сделан на поверхности вебвью (`src/pwa.ts`): `/mani
 
 `server.ts:4`: `import ... from "../public/json-patch.js"`. Закрыто вместе с B1: модуль переехал в `src/json-patch.ts` с типами, тест — в `tests/json-patch.test.ts`, `public/` больше нет.
 
-### D3. Дублирование helpers
+### D3. Дублирование helpers — DONE
 
-`cookieValue`, `contentType`, `isRecord`/`isJsonObject`, `jsonResponse`, `toError` продублированы в 2-3 файлах. Вынести в общий модуль.
+`cookieValue`, `contentType`, `isRecord`/`isJsonObject`, `jsonResponse`, `toError` продублированы в 2-3 файлах.
 
-### D4. Захардкоженная версия clientInfo
+Сделано: `src/shared.ts` — `isRecord` (было 6 копий), `isJsonObject`/`asJsonObject`, `jsonResponse`, `toError`, `cookieValues`. Куки читаются одной реализацией, той самой, что умеет несколько значений под одним именем (см. C3), так что webview получил это свойство заодно. `contentType` дублирования больше не имел — вторая копия уехала с `serveStatic` в B1.
 
-`codex-app-server.ts:126`: `version: "0.0.1"` при пакете 0.0.2. Брать из package.json / build-константы.
+### D4. Захардкоженная версия clientInfo — DONE
+
+`codex-app-server.ts:126`: `version: "0.0.1"` при пакете 0.0.2. Теперь `packageJson.version` — тем же импортом, что уже использует `cli.ts`.
 
 ## E. Добавлено по итогам ревью субагентом (пропущено в первом проходе)
 

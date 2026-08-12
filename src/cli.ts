@@ -11,6 +11,7 @@ import { readDispatcherConfig, writeDispatcherConfig, type DispatcherConfig } fr
 import { resolveExtensionWebviewRoot, verifiedExtensionVersion } from "./extension-webview";
 import { buildGitHubDeviceCodeBody, buildGitHubDeviceTokenBody } from "./github-oauth";
 import { startRelayClient, type RelayClient } from "./relay-client";
+import { isRecord } from "./shared";
 
 type CliCommand = "serve" | "doctor" | "login" | "update";
 
@@ -884,10 +885,6 @@ function requiredString(value: unknown, key: string): string {
     throw new Error(`${key} must be a non-empty string.`);
   }
   return value;
-}
-
-function isRecord(value: unknown): value is Record<string, unknown> {
-  return typeof value === "object" && value !== null && !Array.isArray(value);
 }
 
 function sleep(ms: number): Promise<void> {
