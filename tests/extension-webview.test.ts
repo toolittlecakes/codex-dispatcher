@@ -13,6 +13,7 @@ import {
   resolveWebviewAssetPath,
   selectExtensionWebviewRoot,
 } from "../src/extension-webview";
+import { AppServerError } from "../src/codex-app-server";
 
 type StreamCollector = {
   waitFor: (expected: number, timeoutMs?: number) => Promise<JsonRecord[]>;
@@ -1007,6 +1008,56 @@ describe("extension webview", () => {
         type: "mcp-response",
         hostId: "local",
         message: { id: 11, result: { echoed: "thread/read" } },
+      });
+    } finally {
+      if (previousRoot === undefined) {
+        delete process.env.CODEX_EXTENSION_WEBVIEW_ROOT;
+      } else {
+        process.env.CODEX_EXTENSION_WEBVIEW_ROOT = previousRoot;
+      }
+      rmSync(root, { recursive: true, force: true });
+    }
+  });
+
+  // The webview matches on the app server's exact wording to tell a stop that
+  // lost a race from a stop that failed, so the error reaches it unedited.
+  test("hands the app server's own error to the webview", async () => {
+    const previousRoot = process.env.CODEX_EXTENSION_WEBVIEW_ROOT;
+    const root = mkdtempSync(join(tmpdir(), "codex-webview-mcp-error-"));
+    process.env.CODEX_EXTENSION_WEBVIEW_ROOT = root;
+    writeFileSync(join(root, "index.html"), "<html><head></head><body></body></html>");
+
+    try {
+      const webview = new ExtensionWebview({
+        appServer: {
+          request: async (method: string) => {
+            throw new AppServerError(method, "no active turn to interrupt", {
+              code: -32603,
+              message: "no active turn to interrupt",
+            });
+          },
+        } as never,
+        defaultCwd: "/repo",
+        getToken: () => "secret",
+      });
+      const stream = await openEventStream(webview, "tab-1");
+      await webview.fetch(
+        new Request("http://localhost/host-message", {
+          method: "POST",
+          headers: { cookie: "codex_dispatcher_webview=secret", "x-dispatcher-client": "tab-1" },
+          body: JSON.stringify({
+            messages: [{ type: "mcp-request", request: { id: 3, method: "turn/interrupt", params: {} } }],
+          }),
+        }),
+        new URL("http://localhost/host-message"),
+      );
+
+      const [reply] = await stream.waitFor(1);
+      await stream.cancel();
+      expect(reply).toEqual({
+        type: "mcp-response",
+        hostId: "local",
+        message: { id: 3, error: { code: -32603, message: "no active turn to interrupt" } },
       });
     } finally {
       if (previousRoot === undefined) {

@@ -147,8 +147,20 @@ for (const method of dispatcherOwnerRequestMethods) {
   ipcBridge.addRequestHandler(
     method,
     (requestMessage) => canHandleDispatcherOwnerRequest(requestMessage.method, requestMessage.params),
-    (requestMessage) => handleDispatcherOwnerRequest(requestMessage.method, requestMessage.params),
+    (requestMessage) => answerAsThreadOwner(requestMessage.method, requestMessage.params),
   );
+}
+
+// A follower reads its owner's failures literally — «no active turn to steer»
+// is how it recognises a turn that ended and turns the steer into an ordinary
+// message. The real owner puts the app server's own words on the wire, so our
+// method prefix comes off before the answer leaves this process.
+async function answerAsThreadOwner(method: string, params: JsonValue | undefined): Promise<JsonValue> {
+  try {
+    return await handleDispatcherOwnerRequest(method, params);
+  } catch (error) {
+    throw error instanceof AppServerError ? new Error(error.reason) : error;
+  }
 }
 
 // The one owner call that is not a follower request: before resuming a thread a

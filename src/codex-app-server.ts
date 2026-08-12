@@ -66,6 +66,10 @@ export class AppServerError extends Error {
   constructor(
     readonly method: string,
     readonly reason: string,
+    // What the app server actually sent. VS Code forwards this object to the
+    // webview untouched, so anything we synthesise instead is a different
+    // error than the one the webview is written against.
+    readonly payload: JsonValue,
   ) {
     super(`${method}: ${reason}`);
     this.name = "AppServerError";
@@ -240,7 +244,7 @@ export class CodexAppServer {
 
     this.pending.delete(key);
     if ("error" in message && message.error !== undefined && message.error !== null) {
-      pending.reject(new AppServerError(pending.method, appServerErrorReason(message.error)));
+      pending.reject(new AppServerError(pending.method, appServerErrorReason(message.error), message.error));
       return;
     }
 

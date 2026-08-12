@@ -2,6 +2,7 @@ import { timingSafeEqual } from "node:crypto";
 import { existsSync, readFileSync, readdirSync } from "node:fs";
 import { homedir, platform, release } from "node:os";
 import { basename, dirname, join, resolve, sep } from "node:path";
+import { AppServerError } from "./codex-app-server";
 import type {
   CodexAppServer,
   CodexAppServerEvent,
@@ -622,12 +623,19 @@ select,
         message: { id: request.id, result },
       };
     } catch (error) {
+      // The app server's error goes to the webview exactly as it arrived, the
+      // way VS Code forwards it: the webview matches on its wording — «no
+      // active turn to interrupt» is how it recognises a turn that ended
+      // before the stop reached it — and our method prefix hides that.
       return {
         type: "mcp-response",
         hostId: "local",
         message: {
           id: request.id,
-          error: { message: error instanceof Error ? error.message : String(error) },
+          error:
+            error instanceof AppServerError
+              ? error.payload
+              : { message: error instanceof Error ? error.message : String(error) },
         },
       };
     }
