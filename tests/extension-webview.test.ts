@@ -1342,4 +1342,57 @@ describe("extension webview", () => {
       rmSync(root, { recursive: true, force: true });
     }
   });
+
+  test("keeps two hosts in one process on their own state", async () => {
+    const previousRoot = process.env.CODEX_EXTENSION_WEBVIEW_ROOT;
+    const root = mkdtempSync(join(tmpdir(), "codex-webview-two-hosts-"));
+    process.env.CODEX_EXTENSION_WEBVIEW_ROOT = root;
+    writeFileSync(join(root, "index.html"), "<html><head></head><body></body></html>");
+
+    const host = (statePath: string) =>
+      new ExtensionWebview({
+        appServer: {} as never,
+        defaultCwd: "/repo",
+        getToken: () => "secret",
+        statePath,
+      });
+    const post = (webview: ExtensionWebview, message: JsonRecord) =>
+      webview.fetch(
+        new Request("http://localhost/host-message", {
+          method: "POST",
+          headers: { cookie: "codex_dispatcher_webview=secret", "x-dispatcher-client": "tab-1" },
+          body: JSON.stringify({ messages: [message] }),
+        }),
+        new URL("http://localhost/host-message"),
+      );
+
+    try {
+      const firstPath = join(root, "first", "extension-state.json");
+      const secondPath = join(root, "second", "extension-state.json");
+      const first = host(firstPath);
+      const second = host(secondPath);
+      const secondStream = await openEventStream(second, "tab-1");
+
+      await post(first, { type: "persisted-atom-update", key: "onboarding.complete", value: { done: true } });
+      await post(second, { type: "ready" });
+
+      // The second host was constructed first-come-last-served under the old
+      // module-level state: it would answer with the other host's atoms.
+      expect((await secondStream.waitFor(3))[2]).toEqual({ type: "persisted-atom-sync", state: {} });
+      expect(existsSync(secondPath)).toBe(false);
+      expect(JSON.parse(readFileSync(firstPath, "utf8"))).toEqual({
+        globalState: {},
+        persistedAtomState: { "onboarding.complete": { done: true } },
+      });
+
+      await secondStream.cancel();
+    } finally {
+      if (previousRoot === undefined) {
+        delete process.env.CODEX_EXTENSION_WEBVIEW_ROOT;
+      } else {
+        process.env.CODEX_EXTENSION_WEBVIEW_ROOT = previousRoot;
+      }
+      rmSync(root, { recursive: true, force: true });
+    }
+  });
 });

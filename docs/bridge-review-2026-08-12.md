@@ -146,9 +146,13 @@ PWA сделан на поверхности вебвью (`src/pwa.ts`): `/mani
 
 ## D. Архитектура / стиль
 
-### D1. Module-level mutable state в `extension-webview.ts`
+### D1. Module-level mutable state в `extension-webview.ts` — DONE
 
 `globalState`/`persistedAtomState`/`sharedObjectState`/`activeExtensionStatePath` (`extension-webview.ts:57-60`) — глобальные синглтоны вне класса. Второй инстанс `ExtensionWebview` (тесты) клобает первый; конструктор молча перезагружает глобальное состояние. Фикс: перенести в поля класса / отдельный state-объект, инжектируемый в конструктор.
+
+Сделано: `src/extension-state.ts` — класс `ExtensionState` (memento-хранилище, persisted atoms, shared objects, чтение/запись файла), создаётся в конструкторе `ExtensionWebview` от переданного `statePath`. Модульные Map'ы и функции `loadPersistentExtensionState`/`writePersistentExtensionState`/`updatePersistedAtomState`/`persistedStateObject`/`sharedObjectValue` удалены. Заодно `get-global-state`/`set-global-state` уехали из stateless-таблицы `handleVSCodeRequest` в `handleVSCodeHostRequest` — теперь эндпоинты, трогающие состояние, принадлежат инстансу, а таблица осталась чистой функцией от (endpoint, body, cwd, root). Поведение на кривом `key` сохранено намеренно (null / `success: true`), чтобы рефакторинг не менял контракт.
+
+Регрессионный тест: два хоста в одном процессе с разными `statePath` — атом, записанный первым, не виден второму, и файл второго не создаётся (на старом коде тест падает, проверено). Живьём: диспетчер стартует, `vscode://codex/set-global-state` пишет `extension-state.json` в `CODEX_DISPATCHER_HOME`.
 
 ### D2. Server импортирует untyped `.js` из `public/` — DONE
 

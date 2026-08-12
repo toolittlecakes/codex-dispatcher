@@ -19,6 +19,7 @@ import {
   pwaServiceWorkerPath,
   pwaServiceWorkerSource,
 } from "./pwa";
+import { ExtensionState, extensionStatePath } from "./extension-state";
 import { cookieValues, isRecord, jsonResponse } from "./shared";
 
 type HostMessage = JsonObject & {
@@ -70,11 +71,6 @@ type FetchResponseOptions = {
   status?: number;
 };
 
-type PersistentExtensionState = {
-  globalState: JsonObject;
-  persistedAtomState: JsonObject;
-};
-
 const routePrefix = "";
 // Distinct from the relay's own `codex_dispatcher_session`: the relay sets that
 // one on `.<relay domain>`, so a same-named cookie from us would be sent
@@ -90,10 +86,6 @@ const maxDiagnosticMessages = 200;
 const externalFetchTimeoutMs = 25_000;
 const maxReplayEvents = 500;
 const detachedClientRetentionMs = 5 * 60_000;
-const globalState = new Map<string, JsonValue>();
-const persistedAtomState = new Map<string, JsonValue>();
-const sharedObjectState = new Map<string, JsonValue>();
-let activeExtensionStatePath = extensionStatePath();
 const hostFollowerEndpointMethods: Record<string, string> = {
   "thread-follower-start-turn-for-host": "thread-follower-start-turn",
   "thread-follower-steer-turn-for-host": "thread-follower-steer-turn",
@@ -190,6 +182,7 @@ export class ExtensionWebview {
   private readonly hostErrors: JsonObject[] = [];
   private readonly experimentalEnablementSetResults = new Map<string, JsonValue>();
   private readonly webviewRoot: string | null;
+  private readonly state: ExtensionState;
 
   constructor(options: ExtensionWebviewOptions) {
     this.appServer = options.appServer;
@@ -202,7 +195,7 @@ export class ExtensionWebview {
     this.handleFollowerRequest = options.handleFollowerRequest;
     this.handleThreadStreamSnapshotRequest = options.handleThreadStreamSnapshotRequest;
     this.onThreadActivity = options.onThreadActivity;
-    loadPersistentExtensionState(options.statePath ?? extensionStatePath());
+    this.state = new ExtensionState(options.statePath ?? extensionStatePath());
     this.webviewRoot = resolveExtensionWebviewRoot();
   }
 
@@ -469,14 +462,14 @@ select,
         return [
           { type: "chat-font-settings", chatFontSize: null, chatCodeFontSize: null },
           { type: "custom-prompts-updated", prompts: [] },
-          { type: "persisted-atom-sync", state: persistedStateObject() },
+          { type: "persisted-atom-sync", state: this.state.persistedAtoms() },
         ];
 
       case "persisted-atom-sync-request":
-        return [{ type: "persisted-atom-sync", state: persistedStateObject() }];
+        return [{ type: "persisted-atom-sync", state: this.state.persistedAtoms() }];
 
       case "persisted-atom-update":
-        updatePersistedAtomState(message);
+        this.state.applyAtomUpdate(message);
         this.broadcast({
           type: "persisted-atom-updated",
           key: typeof message.key === "string" ? message.key : "",
@@ -486,8 +479,7 @@ select,
         return [];
 
       case "persisted-atom-reset":
-        persistedAtomState.clear();
-        writePersistentExtensionState();
+        this.state.resetAtoms();
         this.broadcast({ type: "persisted-atom-sync", state: {} });
         return [];
 
@@ -518,8 +510,8 @@ select,
       case "shared-object-set":
         if (typeof message.key === "string") {
           const nextValue = message.value ?? null;
-          if (!jsonValuesEqual(sharedObjectValue(message.key), nextValue)) {
-            sharedObjectState.set(message.key, nextValue);
+          if (!jsonValuesEqual(this.state.sharedObjectValue(message.key), nextValue)) {
+            this.state.setSharedObject(message.key, nextValue);
             this.broadcast(this.sharedObjectUpdateMessage(message.key));
           }
         }
@@ -631,6 +623,21 @@ select,
     endpoint: string,
     body: JsonValue,
   ): Promise<{ handled: true; result: JsonValue } | { handled: false }> {
+    // Memento storage belongs to this host's state, not to the stateless
+    // endpoint table below it.
+    if (endpoint === "get-global-state") {
+      const key = asObject(body)?.key;
+      return { handled: true, result: { value: typeof key === "string" ? this.state.globalValue(key) : null } };
+    }
+
+    if (endpoint === "set-global-state") {
+      const params = asObject(body);
+      if (typeof params?.key === "string") {
+        this.state.setGlobalValue(params.key, params.value ?? null);
+      }
+      return { handled: true, result: { success: true } };
+    }
+
     if (endpoint === "thread-role-for-host") {
       const params = requireObject(body, "thread-role-for-host params");
       const conversationId = requireString(params.conversationId, "conversationId");
@@ -790,7 +797,7 @@ select,
     return {
       type: "shared-object-updated",
       key: objectKey,
-      value: sharedObjectValue(objectKey),
+      value: this.state.sharedObjectValue(objectKey),
     };
   }
 
@@ -1435,14 +1442,6 @@ export async function handleVSCodeRequest(
     case "projectless-thread-cwd":
     case "projectless-workspace-root":
       return { path: defaultCwd };
-    case "get-global-state":
-      return { value: typeof params.key === "string" ? globalState.get(params.key) ?? null : null };
-    case "set-global-state":
-      if (typeof params.key === "string") {
-        globalState.set(params.key, params.value ?? null);
-        writePersistentExtensionState();
-      }
-      return { success: true };
     case "get-configuration":
       return { value: null };
     case "set-configuration":
@@ -1836,96 +1835,6 @@ function parseOptionalBody(body: JsonValue | undefined): JsonValue {
 function stripHostId(params: JsonObject): JsonObject {
   const { hostId: _hostId, ...rest } = params;
   return rest;
-}
-
-export function extensionStatePath(): string {
-  return join(process.env.CODEX_DISPATCHER_HOME ?? join(homedir(), ".codex-dispatcher"), "extension-state.json");
-}
-
-function loadPersistentExtensionState(path: string): void {
-  activeExtensionStatePath = path;
-  globalState.clear();
-  persistedAtomState.clear();
-  if (!existsSync(path)) {
-    return;
-  }
-
-  const state = parsePersistentExtensionState(JSON.parse(readFileSync(path, "utf8")) as unknown);
-  for (const [key, value] of Object.entries(state.globalState)) {
-    globalState.set(key, value ?? null);
-  }
-  for (const [key, value] of Object.entries(state.persistedAtomState)) {
-    persistedAtomState.set(key, value ?? null);
-  }
-}
-
-function writePersistentExtensionState(path = activeExtensionStatePath): void {
-  const state: PersistentExtensionState = {
-    globalState: Object.fromEntries(globalState.entries()) as JsonObject,
-    persistedAtomState: Object.fromEntries(persistedAtomState.entries()) as JsonObject,
-  };
-  mkdirSync(dirname(path), { recursive: true });
-  writeFileSync(path, `${JSON.stringify(state, null, 2)}\n`, { mode: 0o600 });
-}
-
-function parsePersistentExtensionState(value: unknown): PersistentExtensionState {
-  if (!isRecord(value)) {
-    throw new Error("Invalid codex-dispatcher extension state: expected object.");
-  }
-  return {
-    globalState: optionalStateObject(value.globalState, "globalState"),
-    persistedAtomState: optionalStateObject(value.persistedAtomState, "persistedAtomState"),
-  };
-}
-
-function optionalStateObject(value: unknown, key: string): JsonObject {
-  if (value === undefined) {
-    return {};
-  }
-  if (!isRecord(value)) {
-    throw new Error(`Invalid codex-dispatcher extension state: ${key} must be an object.`);
-  }
-  return value as JsonObject;
-}
-
-function updatePersistedAtomState(message: JsonObject): void {
-  if (typeof message.key !== "string") {
-    throw new Error("Invalid persisted atom update");
-  }
-  if (message.deleted === true) {
-    persistedAtomState.delete(message.key);
-    writePersistentExtensionState();
-    return;
-  }
-  persistedAtomState.set(message.key, message.value ?? null);
-  writePersistentExtensionState();
-}
-
-function persistedStateObject(): JsonObject {
-  return Object.fromEntries(persistedAtomState.entries()) as JsonObject;
-}
-
-function sharedObjectValue(key: string): JsonValue {
-  if (sharedObjectState.has(key)) {
-    return sharedObjectState.get(key) ?? null;
-  }
-
-  switch (key) {
-    case "host_config":
-      return { id: "local", display_name: "Local", kind: "local" };
-    case "remote_connections":
-    case "remote_control_connections":
-      return [];
-    case "statsig_default_enable_features":
-      return {};
-    case "pending_worktrees":
-    case "diff_comments":
-    case "diff_comments_from_model":
-    case "composer_prefill":
-      return null;
-    default:
-      return null;
-  }
 }
 
 export function extensionVersionOf(webviewRoot: string | null): string {
