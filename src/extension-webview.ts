@@ -87,20 +87,21 @@ const maxDiagnosticMessages = 200;
 const externalFetchTimeoutMs = 25_000;
 const maxReplayEvents = 500;
 const detachedClientRetentionMs = 5 * 60_000;
+// The follower endpoints the webview actually calls (its `requestThreadFollower`
+// switch). Names it no longer knows would sit here answering nobody.
 const hostFollowerEndpointMethods: Record<string, string> = {
   "thread-follower-start-turn-for-host": "thread-follower-start-turn",
+  "thread-follower-load-complete-history-for-host": "thread-follower-load-complete-history",
   "thread-follower-steer-turn-for-host": "thread-follower-steer-turn",
   "thread-follower-interrupt-turn-for-host": "thread-follower-interrupt-turn",
   "thread-follower-compact-thread-for-host": "thread-follower-compact-thread",
-  "thread-follower-set-model-and-reasoning-for-host": "thread-follower-set-model-and-reasoning",
-  "thread-follower-set-collaboration-mode-for-host": "thread-follower-set-collaboration-mode",
+  "thread-follower-update-thread-settings-for-host": "thread-follower-update-thread-settings",
   "thread-follower-edit-last-user-turn-for-host": "thread-follower-edit-last-user-turn",
   "thread-follower-command-approval-decision-for-host": "thread-follower-command-approval-decision",
   "thread-follower-file-approval-decision-for-host": "thread-follower-file-approval-decision",
   "thread-follower-permissions-request-approval-response-for-host": "thread-follower-permissions-request-approval-response",
   "thread-follower-submit-user-input-for-host": "thread-follower-submit-user-input",
   "thread-follower-submit-mcp-server-elicitation-response-for-host": "thread-follower-submit-mcp-server-elicitation-response",
-  "thread-follower-set-queued-follow-ups-state-for-host": "thread-follower-set-queued-follow-ups-state",
 };
 
 export class ExtensionWebview {

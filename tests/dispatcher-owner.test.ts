@@ -1,5 +1,6 @@
 import { describe, expect, test } from "bun:test";
 import {
+  applyThreadSettingsUpdate,
   buildDispatcherSnapshotParams,
   buildDispatcherTurnStartRequest,
   buildQueuedFollowUpsBroadcastParams,
@@ -14,12 +15,14 @@ describe("dispatcher owner IPC helpers", () => {
       buildDispatcherSnapshotParams("thread-1", {
         id: "thread-1",
         turns: [],
-      }),
+      }, 7),
     ).toEqual({
       conversationId: "thread-1",
       hostId: dispatcherIpcHostId,
       change: {
         type: "snapshot",
+        // Followers store this and refuse anything that does not build on it.
+        revision: 7,
         conversationState: {
           id: "thread-1",
           hostId: dispatcherIpcHostId,
@@ -104,5 +107,38 @@ describe("dispatcher owner IPC helpers", () => {
         reasoning_effort: "high",
       },
     });
+  });
+
+  test("merges a follower's thread settings over the ones the thread already had", () => {
+    const conversation = {
+      id: "thread-1",
+      latestModel: "gpt-5",
+      latestReasoningEffort: "medium",
+      latestThreadSettings: { model: "gpt-5", effort: "medium", cwd: "/repo" },
+      latestCollaborationMode: { id: "pair", settings: { model: "gpt-5", reasoning_effort: "medium" } },
+    };
+
+    applyThreadSettingsUpdate(conversation, { model: "gpt-5-codex", effort: "high" });
+
+    expect(conversation.latestThreadSettings).toEqual({
+      model: "gpt-5-codex",
+      effort: "high",
+      cwd: "/repo",
+    });
+    // The rest of the conversation state reads the model and effort from the
+    // `latest*` fields, so a settings update that only lands in the settings
+    // object leaves the thread running on the old model.
+    expect(conversation.latestModel).toBe("gpt-5-codex");
+    expect(conversation.latestReasoningEffort).toBe("high");
+    expect(conversation.latestCollaborationMode).toEqual({
+      id: "pair",
+      settings: { model: "gpt-5-codex", reasoning_effort: "high" },
+    });
+  });
+
+  test("takes a collaboration mode from the follower as given", () => {
+    const conversation = { id: "thread-1", latestCollaborationMode: { id: "pair", settings: {} } };
+    applyThreadSettingsUpdate(conversation, { collaborationMode: null });
+    expect(conversation.latestCollaborationMode).toBeNull();
   });
 });

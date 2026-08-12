@@ -1,9 +1,11 @@
 import { describe, expect, test } from "bun:test";
-import { mkdtempSync, rmSync } from "node:fs";
-import { tmpdir } from "node:os";
+import { mkdtempSync, readFileSync, rmSync } from "node:fs";
+import { homedir, tmpdir } from "node:os";
+import { dirname } from "node:path";
 import { Socket } from "node:net";
 import { join } from "node:path";
-import { CodexIpcBridge, type IpcBroadcastMessage } from "../src/codex-ipc";
+import { CodexIpcBridge, ipcMethodVersion, type IpcBroadcastMessage } from "../src/codex-ipc";
+import { selectExtensionWebviewRoot } from "../src/extension-webview";
 
 type Collected = { method: string; params: unknown }[];
 
@@ -189,6 +191,24 @@ describe("codex ipc", () => {
     } finally {
       bridge.stop();
       rmSync(root, { recursive: true, force: true });
+    }
+  });
+
+  // The one check that catches drift: every peer silently drops a broadcast or
+  // request whose version is not the one it expects, so these numbers are only
+  // ever right relative to the extension we are hosting.
+  test("carries the method versions of the extension it hosts", () => {
+    const webviewRoot = selectExtensionWebviewRoot(join(homedir(), ".vscode", "extensions"));
+    if (!webviewRoot) {
+      throw new Error("Install the Codex VS Code extension: this bridge is defined against its wire contract");
+    }
+
+    const bundle = readFileSync(join(dirname(webviewRoot), "out", "extension.js"), "utf8");
+    const table = /\{"thread-stream-state-changed":\d+[^}]*\}/.exec(bundle);
+    expect(table).not.toBeNull();
+
+    for (const [method, version] of Object.entries(JSON.parse(table![0]) as Record<string, number>)) {
+      expect([method, ipcMethodVersion(method)]).toEqual([method, version]);
     }
   });
 });

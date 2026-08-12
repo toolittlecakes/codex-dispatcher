@@ -3,18 +3,59 @@ import { asJsonObject } from "./shared";
 
 export const dispatcherIpcHostId = "local";
 
-export function buildDispatcherSnapshotParams(conversationId: string, conversation: JsonObject): JsonObject {
+// Followers key their state off the revision: they store the one that came with
+// the snapshot, refuse patches that do not build on it, and wait for a revision
+// to pass before treating a request as applied. A snapshot without one leaves
+// every follower stuck at `undefined`.
+export function buildDispatcherSnapshotParams(
+  conversationId: string,
+  conversation: JsonObject,
+  revision: number,
+): JsonObject {
   return {
     conversationId,
     hostId: dispatcherIpcHostId,
     change: {
       type: "snapshot",
+      revision,
       conversationState: {
         ...conversation,
         hostId: dispatcherIpcHostId,
       },
     },
   };
+}
+
+// The 26.803 replacement for the old per-setting follower calls: one payload
+// carrying whatever the follower changed, merged over what the thread already
+// had. Model, effort and collaboration mode stay mirrored onto the `latest*`
+// fields because that is where the rest of the conversation state reads them.
+export function applyThreadSettingsUpdate(conversation: JsonObject, threadSettingsValue: JsonValue): void {
+  const threadSettings = asJsonObject(threadSettingsValue);
+  if (!threadSettings) {
+    throw new Error("threadSettings must be an object");
+  }
+
+  const previous = asJsonObject(conversation.latestThreadSettings) ?? {};
+  const merged: JsonObject = { ...previous, ...threadSettings };
+  conversation.latestThreadSettings = merged;
+
+  if (merged.model !== undefined) {
+    conversation.latestModel = merged.model;
+  }
+  if (merged.effort !== undefined) {
+    conversation.latestReasoningEffort = merged.effort;
+  }
+  if (threadSettings.collaborationMode !== undefined) {
+    conversation.latestCollaborationMode = threadSettings.collaborationMode;
+    return;
+  }
+
+  conversation.latestCollaborationMode = updateCollaborationModeSettings(
+    conversation.latestCollaborationMode,
+    typeof conversation.latestModel === "string" ? conversation.latestModel : null,
+    conversation.latestReasoningEffort,
+  );
 }
 
 // Asked once, when this dispatcher takes a thread over: every client with that

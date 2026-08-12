@@ -3,6 +3,7 @@ import { networkInterfaces } from "node:os";
 import { CodexAppServer, type JsonObject, type JsonValue } from "./codex-app-server";
 import { CodexIpcBridge, type IpcBroadcastMessage } from "./codex-ipc";
 import {
+  applyThreadSettingsUpdate,
   buildDispatcherSnapshotParams,
   buildDispatcherTurnStartRequest,
   buildFollowingChangeParams,
@@ -10,7 +11,6 @@ import {
   buildQueuedFollowUpsBroadcastParams,
   dispatcherIpcHostId,
   parseStreamFollowingChange,
-  updateCollaborationModeSettings,
 } from "./dispatcher-owner";
 import { ExtensionWebview } from "./extension-webview";
 import { applyJsonPatches, cloneJson } from "./json-patch";
@@ -56,6 +56,7 @@ const streamOwners = new Map<string, string>();
 const mirroredConversations = new Map<string, JsonObject>();
 const dispatcherOwnedConversations = new Map<string, JsonObject>();
 const dispatcherOwnedRefreshTimers = new Map<string, ReturnType<typeof setTimeout>>();
+const dispatcherOwnedRevisions = new Map<string, number>();
 const dispatcherOwnedRefreshesInFlight = new Set<string>();
 const dispatcherOwnedRefreshRequested = new Set<string>();
 // Who asked to be kept up to date on which thread. A thread nobody follows is
@@ -77,14 +78,16 @@ const threadDrivingMethods = new Set([
 ]);
 
 
+// The follower calls a thread owner has to answer, straight from the
+// extension's own registration list (`wq` in out/extension.js).
 const dispatcherOwnerRequestMethods = new Set([
   "thread-follower-start-turn",
+  "thread-follower-load-complete-history",
   "thread-follower-edit-last-user-turn",
   "thread-follower-steer-turn",
   "thread-follower-interrupt-turn",
   "thread-follower-compact-thread",
-  "thread-follower-set-model-and-reasoning",
-  "thread-follower-set-collaboration-mode",
+  "thread-follower-update-thread-settings",
   "thread-follower-command-approval-decision",
   "thread-follower-file-approval-decision",
   "thread-follower-permissions-request-approval-response",
@@ -363,30 +366,20 @@ async function handleDispatcherOwnerRequest(method: string, paramsValue: JsonVal
       return { ok: true };
     }
 
-    case "thread-follower-set-model-and-reasoning":
+    case "thread-follower-update-thread-settings":
       updateDispatcherOwnedConversation(conversationId, (conversation) => {
-        const model = nullableJsonString(params.model, "model");
-        conversation.latestModel = model;
-        if (typeof params.reasoningEffort === "string" || params.reasoningEffort === null) {
-          conversation.latestReasoningEffort = params.reasoningEffort;
-        }
-        const reasoningEffort =
-          params.reasoningEffort === undefined ? conversation.latestReasoningEffort : params.reasoningEffort;
-        conversation.latestCollaborationMode = updateCollaborationModeSettings(
-          conversation.latestCollaborationMode,
-          model,
-          reasoningEffort,
-        );
+        applyThreadSettingsUpdate(conversation, params.threadSettings ?? null);
       });
       broadcastDispatcherOwnedSnapshot(conversationId);
       return { ok: true };
 
-    case "thread-follower-set-collaboration-mode":
-      updateDispatcherOwnedConversation(conversationId, (conversation) => {
-        conversation.latestCollaborationMode = params.collaborationMode ?? null;
-      });
+    // We keep the whole conversation as the app server hands it to us, so there
+    // is no older history to fetch: re-read it, publish it, and answer with the
+    // revision the follower has to wait for.
+    case "thread-follower-load-complete-history":
+      await refreshDispatcherOwnedConversation(conversationId);
       broadcastDispatcherOwnedSnapshot(conversationId);
-      return { ok: true };
+      return { revision: dispatcherOwnedRevision(conversationId) };
 
     case "thread-follower-set-queued-follow-ups-state":
       updateDispatcherOwnedConversation(conversationId, (conversation) => {
@@ -520,6 +513,7 @@ function releaseDispatcherOwnership(threadId: string): void {
     return;
   }
   streamFollowersByConversation.delete(threadId);
+  dispatcherOwnedRevisions.delete(threadId);
   dispatcherOwnedRefreshRequested.delete(threadId);
   const pending = dispatcherOwnedRefreshTimers.get(threadId);
   if (pending) {
@@ -628,6 +622,11 @@ async function readDispatcherOwnedConversation(threadId: string): Promise<void> 
 }
 
 function broadcastDispatcherOwnedSnapshot(threadId: string): void {
+  // The thread moved, so the revision moves with it even when nobody is
+  // listening: a follower arriving later must not be handed a revision that
+  // stands for older state than it names.
+  dispatcherOwnedRevisions.set(threadId, dispatcherOwnedRevision(threadId) + 1);
+
   const followers = streamFollowersByConversation.get(threadId);
   if (!followers || followers.size === 0) {
     return;
@@ -636,15 +635,21 @@ function broadcastDispatcherOwnedSnapshot(threadId: string): void {
   sendDispatcherOwnedSnapshot(threadId, [...followers]);
 }
 
+function dispatcherOwnedRevision(threadId: string): number {
+  return dispatcherOwnedRevisions.get(threadId) ?? 0;
+}
+
 function sendDispatcherOwnedSnapshot(threadId: string, targetClientIds: string[]): void {
   const conversation = dispatcherOwnedConversations.get(threadId);
   if (!conversation) {
     return;
   }
 
-  ipcBridge.broadcast("thread-stream-state-changed", buildDispatcherSnapshotParams(threadId, conversation), {
-    targetClientIds,
-  });
+  ipcBridge.broadcast(
+    "thread-stream-state-changed",
+    buildDispatcherSnapshotParams(threadId, conversation, dispatcherOwnedRevision(threadId)),
+    { targetClientIds },
+  );
 }
 
 function buildExtensionEventReplayMessages(): JsonObject[] {
@@ -906,18 +911,6 @@ function requireJsonString(value: JsonValue | undefined, name: string): string {
   }
 
   return value;
-}
-
-function nullableJsonString(value: JsonValue | undefined, name: string): string | null {
-  if (value === null) {
-    return null;
-  }
-  if (typeof value !== "string") {
-    throw new Error(`Missing ${name}`);
-  }
-
-  const trimmed = value.trim();
-  return trimmed.length > 0 ? trimmed : null;
 }
 
 function clientUrl(baseUrl: string): string {

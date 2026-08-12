@@ -116,20 +116,25 @@ const routedRequestTimeoutMs = 10_000;
 const maxFrameBytes = 256 * 1024 * 1024;
 const maxBufferBytes = 512 * 1024 * 1024;
 
+// Copied from the verified extension (`B9` in out/extension.js). Every peer
+// checks the version of what it receives and drops a mismatch without a word,
+// so a number invented here is a message nobody ever sees.
 const methodVersions: Record<string, number> = {
-  "thread-stream-state-changed": 6,
+  "thread-stream-state-changed": 11,
   "thread-stream-following-changed": 1,
   "thread-stream-following-status-requested": 1,
-  "thread-read-state-changed": 1,
+  "ipc-connection-reset": 1,
+  "thread-read-state-changed": 2,
   "thread-archived": 2,
   "thread-unarchived": 1,
+  "thread-owner-discovery": 1,
   "thread-follower-start-turn": 1,
+  "thread-follower-load-complete-history": 1,
   "thread-follower-compact-thread": 1,
   "thread-follower-steer-turn": 1,
-  "thread-follower-interrupt-turn": 1,
-  "thread-follower-set-model-and-reasoning": 1,
-  "thread-follower-set-collaboration-mode": 1,
-  "thread-follower-edit-last-user-turn": 1,
+  "thread-follower-interrupt-turn": 4,
+  "thread-follower-update-thread-settings": 1,
+  "thread-follower-edit-last-user-turn": 2,
   "thread-follower-command-approval-decision": 1,
   "thread-follower-file-approval-decision": 1,
   "thread-follower-permissions-request-approval-response": 1,
