@@ -32,15 +32,36 @@ async function waitForClientId(bridge: CodexIpcBridge): Promise<string> {
   throw new Error("bridge never registered with the router");
 }
 
+type RawMessage = {
+  type: string;
+  method?: string;
+  requestId?: string;
+  resultType?: string;
+  error?: string;
+  timeoutMs?: number;
+  request?: { method?: string; timeoutMs?: number };
+};
+
 type RawIpcClient = {
   waitForBroadcasts(expected: number, timeoutMs?: number): Promise<{ method: string }[]>;
+  waitForMessage(match: (message: RawMessage) => boolean, timeoutMs?: number): Promise<RawMessage>;
+  send(message: unknown): void;
   close(): void;
 };
 
 async function rawIpcClient(socketPath: string): Promise<RawIpcClient> {
   const socket = new Socket();
   const broadcasts: { method: string }[] = [];
+  const messages: RawMessage[] = [];
   let pending = Buffer.alloc(0);
+
+  const writeMessage = (message: unknown): void => {
+    const payload = JSON.stringify(message);
+    const frame = Buffer.alloc(4 + Buffer.byteLength(payload, "utf8"));
+    frame.writeUInt32LE(Buffer.byteLength(payload, "utf8"), 0);
+    frame.write(payload, 4, "utf8");
+    socket.write(frame);
+  };
 
   socket.on("data", (chunk) => {
     pending = Buffer.concat([pending, chunk]);
@@ -49,11 +70,9 @@ async function rawIpcClient(socketPath: string): Promise<RawIpcClient> {
       if (pending.length < 4 + size) {
         return;
       }
-      const message = JSON.parse(pending.subarray(4, 4 + size).toString("utf8")) as {
-        type: string;
-        method?: string;
-      };
+      const message = JSON.parse(pending.subarray(4, 4 + size).toString("utf8")) as RawMessage;
       pending = pending.subarray(4 + size);
+      messages.push(message);
       if (message.type === "broadcast" && message.method && message.method !== "client-status-changed") {
         broadcasts.push({ method: message.method });
       }
@@ -65,16 +84,12 @@ async function rawIpcClient(socketPath: string): Promise<RawIpcClient> {
     socket.connect(socketPath, () => resolve());
   });
 
-  const initialize = JSON.stringify({
+  writeMessage({
     type: "request",
     requestId: "raw-1",
     method: "initialize",
     params: { clientType: "raw-test-client" },
   });
-  const frame = Buffer.alloc(4 + Buffer.byteLength(initialize, "utf8"));
-  frame.writeUInt32LE(Buffer.byteLength(initialize, "utf8"), 0);
-  frame.write(initialize, 4, "utf8");
-  socket.write(frame);
 
   return {
     async waitForBroadcasts(expected, timeoutMs = 1_000) {
@@ -86,6 +101,18 @@ async function rawIpcClient(socketPath: string): Promise<RawIpcClient> {
       await Bun.sleep(50);
       return broadcasts;
     },
+    async waitForMessage(match, timeoutMs = 1_000) {
+      const deadline = Date.now() + timeoutMs;
+      while (Date.now() < deadline) {
+        const found = messages.find(match);
+        if (found) {
+          return found;
+        }
+        await Bun.sleep(10);
+      }
+      throw new Error("the expected frame never arrived");
+    },
+    send: writeMessage,
     close: () => socket.destroy(),
   };
 }
@@ -190,6 +217,67 @@ describe("codex ipc", () => {
       expect(received).toEqual([]);
     } finally {
       bridge.stop();
+      rmSync(root, { recursive: true, force: true });
+    }
+  });
+
+  // Loading a long thread's history is a five-minute call. The router runs its
+  // own timer over every forwarded request, so a deadline that stays in the
+  // caller's process is a deadline the router overrules.
+  test("carries the caller's deadline to the client that has to answer", async () => {
+    const root = mkdtempSync(join(tmpdir(), "codex-ipc-deadline-"));
+    const socketPath = join(root, "ipc.sock");
+
+    const sender = await connectedBridge(socketPath, []);
+    const peer = await rawIpcClient(socketPath);
+    try {
+      await waitForClientId(sender);
+      // Nothing answers it; the frame on the wire is the whole point.
+      sender
+        .request("thread-follower-load-complete-history", { conversationId: "thread-1" }, { timeoutMs: 300_000 })
+        .catch(() => {});
+
+      const asked = await peer.waitForMessage((message) => message.type === "client-discovery-request");
+      expect(asked.request?.method).toBe("thread-follower-load-complete-history");
+      expect(asked.request?.timeoutMs).toBe(300_000);
+    } finally {
+      peer.close();
+      sender.stop();
+      rmSync(root, { recursive: true, force: true });
+    }
+  });
+
+  test("times a forwarded request out on the deadline the caller sent", async () => {
+    const root = mkdtempSync(join(tmpdir(), "codex-ipc-router-deadline-"));
+    const socketPath = join(root, "ipc.sock");
+
+    const target = await connectedBridge(socketPath, []);
+    const caller = await rawIpcClient(socketPath);
+    try {
+      const targetId = await waitForClientId(target);
+      target.addRequestHandler("thread-follower-start-turn", () => true, () => new Promise<never>(() => {}));
+
+      caller.send({
+        type: "request",
+        requestId: "raw-slow-1",
+        method: "thread-follower-start-turn",
+        params: { conversationId: "thread-1" },
+        targetClientId: targetId,
+        version: ipcMethodVersion("thread-follower-start-turn"),
+        timeoutMs: 60,
+      });
+
+      // Well inside the router's own 10s default: the answer can only be this
+      // early if the router used the deadline that came in on the wire.
+      const response = await caller.waitForMessage(
+        (message) => message.type === "response" && message.requestId === "raw-slow-1",
+        2_000,
+      );
+      expect(response.resultType).toBe("error");
+      expect(response.error).toBe("request-timeout");
+    } finally {
+      caller.close();
+      target.stop();
       rmSync(root, { recursive: true, force: true });
     }
   });

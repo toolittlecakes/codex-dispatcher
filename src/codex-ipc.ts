@@ -14,6 +14,10 @@ type IpcRequestMessage = {
   version?: number;
   method: string;
   params?: JsonValue;
+  // The caller's deadline rides on the wire: the router runs its own timer over
+  // the forwarded request, and without this it would give up long before the
+  // caller does.
+  timeoutMs?: number;
 };
 
 export type IpcResponseMessage = {
@@ -378,6 +382,9 @@ export class CodexIpcBridge {
     };
     if (options.targetClientId) {
       request.targetClientId = options.targetClientId;
+    }
+    if (options.timeoutMs !== undefined) {
+      request.timeoutMs = options.timeoutMs;
     }
 
     return new Promise((resolve, reject) => {
@@ -919,7 +926,7 @@ class IpcRouter {
           error: "request-timeout",
         });
       }
-    }, routedRequestTimeoutMs);
+    }, message.timeoutMs ?? routedRequestTimeoutMs);
 
     this.pendingRequests.set(message.requestId, {
       sourceClientId,
