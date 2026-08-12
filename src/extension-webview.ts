@@ -1975,10 +1975,15 @@ function isSecureRequest(request: Request, url: URL): boolean {
 }
 
 function secretEquals(candidate: string | null, secret: string): boolean {
-  if (candidate === null || candidate.length !== secret.length) {
+  if (candidate === null) {
     return false;
   }
-  return timingSafeEqual(Buffer.from(candidate), Buffer.from(secret));
+  // Lengths are compared in bytes, not code units: timingSafeEqual throws on a
+  // byte-length mismatch, so a multibyte candidate of the right character
+  // length would turn a plain 401 into an unhandled exception.
+  const candidateBytes = Buffer.from(candidate);
+  const secretBytes = Buffer.from(secret);
+  return candidateBytes.length === secretBytes.length && timingSafeEqual(candidateBytes, secretBytes);
 }
 
 function cookieValue(header: string | null, name: string): string | null {

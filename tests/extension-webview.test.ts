@@ -300,6 +300,14 @@ describe("extension webview", () => {
         new URL("http://localhost/debug"),
       );
       expect(truncated.status).toBe(401);
+
+      // Same character count, twice the bytes: comparing code units would let
+      // this reach timingSafeEqual, which throws instead of refusing.
+      const multibyte = await webview.fetch(
+        new Request("http://localhost/debug", { headers: { "x-dispatcher-token": "ééééét" } }),
+        new URL("http://localhost/debug"),
+      );
+      expect(multibyte.status).toBe(401);
       expect(html).toContain("history.replaceState");
       expect(html).toContain('name="viewport"');
       expect(html).toContain("maximum-scale=1");

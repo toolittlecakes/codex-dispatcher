@@ -336,6 +336,17 @@ describe("relay server", () => {
       expect(page.status).toBe(302);
       expect(page.headers.get("location")).toContain("/auth/github/start");
 
+      // A dispatcher that once set a same-named host-only cookie leaves the
+      // browser sending two: reading only the first one locks the user out.
+      const shadowed = await fetch(new URL("/", relayUrl), {
+        headers: {
+          host: `toolittlecakes.${baseHostname}`,
+          cookie: `codex_dispatcher_session=stale-dispatcher-token; codex_dispatcher_session=${browserSessionToken}`,
+        },
+        redirect: "manual",
+      });
+      expect(shadowed.status).toBe(200);
+
       dispatcher.close();
     } finally {
       relay.kill();

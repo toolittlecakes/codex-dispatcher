@@ -205,11 +205,11 @@ async function handleBrowserLoginCallback(request: Request, url: URL): Promise<R
   pruneExpiredOAuthStates(pendingOAuthByState, Date.now());
   const stateParam = url.searchParams.get("state") ?? "";
   const code = url.searchParams.get("code") ?? "";
-  const cookieState = cookieValue(request.headers.get("cookie"), "codex_dispatcher_oauth_state");
+  const cookieStates = cookieValues(request.headers.get("cookie"), "codex_dispatcher_oauth_state");
   const pending = pendingOAuthByState.get(stateParam);
   pendingOAuthByState.delete(stateParam);
 
-  if (!pending || !code || cookieState !== stateParam) {
+  if (!pending || !code || !cookieStates.includes(stateParam)) {
     return new Response("Invalid GitHub login state.", { status: 400 });
   }
 
@@ -238,12 +238,15 @@ async function proxyBrowserRequest(request: Request, url: URL): Promise<Response
   }
 
   if (!pwaPublicPaths.has(url.pathname)) {
-    const browserToken = cookieValue(request.headers.get("cookie"), "codex_dispatcher_session");
-    const browserUser = browserToken ? state.authenticateBrowserSession(browserToken, Date.now()) : null;
-    if (browserToken && !browserUser) {
+    const browserTokens = cookieValues(request.headers.get("cookie"), "codex_dispatcher_session");
+    const now = Date.now();
+    const browserUser = browserTokens
+      .map((token) => state.authenticateBrowserSession(token, now))
+      .find((session) => session?.id === user.id) ?? null;
+    if (browserTokens.length > 0 && !browserUser) {
       persistRelayState();
     }
-    if (!browserToken || browserUser?.id !== user.id) {
+    if (browserUser?.id !== user.id) {
       const loginUrl = new URL("/auth/github/start", publicBaseUrl);
       loginUrl.searchParams.set("returnTo", `${url.pathname}${url.search}`);
       return redirectResponse(loginUrl.toString());
@@ -543,17 +546,24 @@ function expiredCookie(name: string): string {
   return `${name}=; Max-Age=0; Path=/; HttpOnly; SameSite=Lax${secure}${domain}`;
 }
 
-function cookieValue(header: string | null, name: string): string | null {
-  if (!header) {
-    return null;
-  }
-  for (const part of header.split(";")) {
+// A browser can legitimately send several cookies under one name — ours is set
+// on the parent domain, so a host-only cookie of the same name from a
+// dispatcher sits next to it — and it sends them in an order we do not control.
+// Reading only the first one would authenticate against the wrong cookie.
+function cookieValues(header: string | null, name: string): string[] {
+  const values: string[] = [];
+  for (const part of header?.split(";") ?? []) {
     const [rawKey, ...rawValue] = part.trim().split("=");
-    if (rawKey === name) {
-      return decodeURIComponent(rawValue.join("="));
+    if (rawKey !== name) {
+      continue;
+    }
+    try {
+      values.push(decodeURIComponent(rawValue.join("=")));
+    } catch {
+      // Not a value we ever wrote; a malformed escape must not fail the request.
     }
   }
-  return null;
+  return values;
 }
 
 function requiredEnv(name: string): string {
