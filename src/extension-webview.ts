@@ -1,5 +1,5 @@
 import { timingSafeEqual } from "node:crypto";
-import { existsSync, mkdirSync, readFileSync, readdirSync, writeFileSync } from "node:fs";
+import { existsSync, readFileSync, readdirSync } from "node:fs";
 import { homedir, platform, release } from "node:os";
 import { basename, dirname, join, resolve, sep } from "node:path";
 import type {
