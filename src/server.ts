@@ -451,7 +451,7 @@ async function routeClientMessage(message: ClientMessage, connectionId?: string)
       scheduleRefreshForServerRequest(requireString(message.appServerRequestId, "appServerRequestId"));
       appServer.respondToServerRequest(
         requireString(message.appServerRequestId, "appServerRequestId"),
-        message.result ?? null,
+        { result: message.result ?? null },
       );
       return { ok: true };
 
@@ -590,7 +590,7 @@ async function handleDispatcherOwnerRequest(method: string, paramsValue: JsonVal
     case "thread-follower-file-approval-decision": {
       const requestId = requireJsonString(params.requestId, "requestId");
       const decision = requireJsonString(params.decision, "decision");
-      appServer.respondToServerRequest(requestId, { decision });
+      appServer.respondToServerRequest(requestId, { result: { decision } });
       scheduleDispatcherOwnedRefresh(conversationId, 0);
       return { ok: true };
     }
@@ -599,7 +599,7 @@ async function handleDispatcherOwnerRequest(method: string, paramsValue: JsonVal
     case "thread-follower-submit-user-input":
     case "thread-follower-submit-mcp-server-elicitation-response": {
       const requestId = requireJsonString(params.requestId, "requestId");
-      appServer.respondToServerRequest(requestId, params.response ?? null);
+      appServer.respondToServerRequest(requestId, { result: params.response ?? null });
       scheduleDispatcherOwnedRefresh(conversationId, 0);
       return { ok: true };
     }

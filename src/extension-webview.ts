@@ -1,7 +1,13 @@
 import { existsSync, mkdirSync, readFileSync, readdirSync, writeFileSync } from "node:fs";
 import { homedir, platform, release } from "node:os";
 import { basename, dirname, join, resolve, sep } from "node:path";
-import type { CodexAppServer, CodexAppServerEvent, JsonObject, JsonValue } from "./codex-app-server";
+import type {
+  CodexAppServer,
+  CodexAppServerEvent,
+  JsonObject,
+  JsonValue,
+  ServerRequestResponse,
+} from "./codex-app-server";
 import type { IpcBroadcastMessage } from "./codex-ipc";
 
 type HostMessage = JsonObject & {
@@ -592,7 +598,7 @@ select,
 
   private async handleMcpRequest(message: HostMessage): Promise<JsonObject> {
     const request = asObject(message.request);
-    if (!request || typeof request.id !== "string" || typeof request.method !== "string") {
+    if (!request || !isRpcId(request.id) || typeof request.method !== "string") {
       return {
         type: "mcp-response",
         hostId: "local",
@@ -664,10 +670,10 @@ select,
 
   private handleMcpResponse(message: HostMessage): void {
     const response = asObject(message.response);
-    if (!response || (typeof response.id !== "string" && typeof response.id !== "number")) {
+    if (!response || !isRpcId(response.id)) {
       throw new Error("Invalid mcp-response payload");
     }
-    this.appServer.respondToServerRequest(String(response.id), response.result ?? null);
+    this.appServer.respondToServerRequest(String(response.id), serverRequestResponse(response));
   }
 
   private handleWorkerRequest(message: HostMessage): JsonObject {
@@ -1620,6 +1626,17 @@ function extensionVersion(): string {
 
 function compareExtensionRoots(left: string, right: string): number {
   return basename(dirname(left)).localeCompare(basename(dirname(right)), undefined, { numeric: true });
+}
+
+export function isRpcId(value: JsonValue | undefined): value is string | number {
+  return typeof value === "string" || typeof value === "number";
+}
+
+export function serverRequestResponse(response: JsonObject): ServerRequestResponse {
+  if (response.error !== undefined && response.error !== null) {
+    return { error: response.error };
+  }
+  return { result: response.result ?? null };
 }
 
 function asObject(value: JsonValue | undefined): JsonObject | null {

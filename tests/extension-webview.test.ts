@@ -391,6 +391,62 @@ describe("extension webview", () => {
     }
   });
 
+  test("forwards webview mcp-response errors and numeric request ids to the app server", async () => {
+    const previousRoot = process.env.CODEX_EXTENSION_WEBVIEW_ROOT;
+    const root = mkdtempSync(join(tmpdir(), "codex-webview-mcp-"));
+    process.env.CODEX_EXTENSION_WEBVIEW_ROOT = root;
+    writeFileSync(join(root, "index.html"), "<html><head></head><body></body></html>");
+    const answered: Array<{ id: string; response: unknown }> = [];
+
+    try {
+      const webview = new ExtensionWebview({
+        appServer: {
+          request: async (method: string) => ({ echoed: method }),
+          respondToServerRequest: (id: string, response: unknown) => answered.push({ id, response }),
+        } as never,
+        defaultCwd: "/repo",
+        getToken: () => "secret",
+      });
+      const postHostMessage = (body: unknown) =>
+        webview.fetch(
+          new Request("http://localhost/host-message", {
+            method: "POST",
+            headers: { cookie: "codex_dispatcher_session=secret" },
+            body: JSON.stringify(body),
+          }),
+          new URL("http://localhost/host-message"),
+        );
+
+      await postHostMessage({ type: "mcp-response", response: { id: 7, error: { message: "denied" } } });
+      await postHostMessage({ type: "mcp-response", response: { id: "8", result: { decision: "approved" } } });
+      expect(answered).toEqual([
+        { id: "7", response: { error: { message: "denied" } } },
+        { id: "8", response: { result: { decision: "approved" } } },
+      ]);
+
+      const numericRequest = await postHostMessage({
+        type: "mcp-request",
+        request: { id: 11, method: "thread/read", params: {} },
+      });
+      await expect(numericRequest.json()).resolves.toEqual({
+        messages: [
+          {
+            type: "mcp-response",
+            hostId: "local",
+            message: { id: 11, result: { echoed: "thread/read" } },
+          },
+        ],
+      });
+    } finally {
+      if (previousRoot === undefined) {
+        delete process.env.CODEX_EXTENSION_WEBVIEW_ROOT;
+      } else {
+        process.env.CODEX_EXTENSION_WEBVIEW_ROOT = previousRoot;
+      }
+      rmSync(root, { recursive: true, force: true });
+    }
+  });
+
   test("persists extension host state across webview host restarts", async () => {
     const previousRoot = process.env.CODEX_EXTENSION_WEBVIEW_ROOT;
     const root = mkdtempSync(join(tmpdir(), "codex-webview-state-"));

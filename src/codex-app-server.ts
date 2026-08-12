@@ -28,6 +28,8 @@ export type AppServerRequest = {
   params: JsonValue;
 };
 
+export type ServerRequestResponse = { result: JsonValue } | { error: JsonValue };
+
 export type CodexAppServerEvent =
   | { type: "status"; status: "starting" | "ready" | "exited"; detail?: string }
   | { type: "stderr"; text: string }
@@ -154,13 +156,13 @@ export class CodexAppServer {
     this.write({ method, params });
   }
 
-  respondToServerRequest(id: string, result: JsonValue): void {
+  respondToServerRequest(id: string, response: ServerRequestResponse): void {
     const request = this.serverRequests.get(id);
     if (!request) {
       throw new Error(`No pending app-server request with id ${id}`);
     }
 
-    this.write({ id: request.id, result });
+    this.write("error" in response ? { id: request.id, error: response.error } : { id: request.id, result: response.result });
     this.serverRequests.delete(id);
     this.emit({ type: "serverRequestResolved", id });
   }
