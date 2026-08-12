@@ -390,10 +390,19 @@ async function handleDispatcherOwnerRequest(method: string, paramsValue: JsonVal
     // We keep the whole conversation as the app server hands it to us, so there
     // is no older history to fetch: re-read it, publish it, and answer with the
     // revision the follower has to wait for.
-    case "thread-follower-load-complete-history":
+    case "thread-follower-load-complete-history": {
       await refreshDispatcherOwnedConversation(conversationId);
+      // Ownership can move while we read: another window's snapshot hands the
+      // thread over, and then we have no revision to promise — the follower
+      // would sit out its five minutes waiting for one. This is the error the
+      // real owner raises in the same spot.
+      if (!dispatcherOwnedConversations.has(conversationId)) {
+        throw new Error("no-client-found: thread stream owner became unavailable");
+      }
+
       broadcastDispatcherOwnedSnapshot(conversationId);
       return { revision: dispatcherOwnedRevision(conversationId) };
+    }
 
     case "thread-follower-set-queued-follow-ups-state":
       updateDispatcherOwnedConversation(conversationId, (conversation) => {
@@ -657,6 +666,13 @@ async function readDispatcherOwnedConversation(threadId: string): Promise<void> 
 }
 
 function broadcastDispatcherOwnedSnapshot(threadId: string): void {
+  // Revisions belong to the owner. Numbering a thread we have handed over would
+  // leave an entry nothing ever deletes, and hand the new owner's followers a
+  // revision that means nothing to them.
+  if (!dispatcherOwnedConversations.has(threadId)) {
+    return;
+  }
+
   // The thread moved, so the revision moves with it even when nobody is
   // listening: a follower arriving later must not be handed a revision that
   // stands for older state than it names.
