@@ -540,10 +540,6 @@ function expiredCookie(name: string): string {
   return `${name}=; Max-Age=0; Path=/; HttpOnly; SameSite=Lax${secure}${domain}`;
 }
 
-// A browser can legitimately send several cookies under one name — ours is set
-// on the parent domain, so a host-only cookie of the same name from a
-// dispatcher sits next to it — and it sends them in an order we do not control.
-// Reading only the first one would authenticate against the wrong cookie.
 function requiredEnv(name: string): string {
   const value = process.env[name];
   if (!value) {
