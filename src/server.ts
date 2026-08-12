@@ -114,6 +114,7 @@ const followerRequestMethods = new Set([
 
 const dispatcherOwnerRequestMethods = new Set([
   "thread-follower-start-turn",
+  "thread-follower-edit-last-user-turn",
   "thread-follower-steer-turn",
   "thread-follower-interrupt-turn",
   "thread-follower-compact-thread",
@@ -603,6 +604,13 @@ async function handleDispatcherOwnerRequest(method: string, paramsValue: JsonVal
     case "thread-follower-steer-turn":
       return handleDispatcherOwnerSteerTurn(conversationId, params);
 
+    case "thread-follower-edit-last-user-turn":
+      return handleDispatcherOwnerEditLastUserTurn(
+        conversationId,
+        requireJsonString(params.turnId, "turnId"),
+        requireJsonString(params.message, "message"),
+      );
+
     case "thread-follower-interrupt-turn":
       return handleDispatcherOwnerInterruptTurn(conversationId);
 
@@ -669,6 +677,53 @@ async function handleDispatcherOwnerRequest(method: string, paramsValue: JsonVal
     default:
       throw new Error(`Unsupported dispatcher owner method: ${method}`);
   }
+}
+
+// What the real owner does for this follower request: roll the last turn back
+// and run it again with the edited message.
+async function handleDispatcherOwnerEditLastUserTurn(
+  conversationId: string,
+  turnId: string,
+  message: string,
+): Promise<JsonValue> {
+  const conversation = dispatcherOwnedConversations.get(conversationId);
+  const turns = Array.isArray(conversation?.turns) ? conversation.turns : [];
+  const lastTurn = asJsonObject(turns.at(-1));
+  if (!lastTurn || lastTurn.id !== turnId) {
+    throw new Error("Only the most recent message can be edited.");
+  }
+  if (lastTurn.status === "inProgress") {
+    throw new Error("Cannot edit a message while a turn is in progress.");
+  }
+
+  const input = editedUserMessageInput(lastTurn, message);
+  const rollback = await appServer.request("thread/rollback", { threadId: conversationId, numTurns: 1 });
+  const cwd = asJsonObject(asJsonObject(rollback)?.thread)?.cwd ?? conversation?.cwd;
+  const result = await appServer.request(
+    "turn/start",
+    buildDispatcherTurnStartRequest(conversationId, conversation, { input, cwd: cwd ?? null }),
+  );
+  scheduleDispatcherOwnedRefresh(conversationId, 0);
+  return result ?? { ok: true };
+}
+
+// thread/read gives us the turn as items, not as the start params the extension
+// keeps in memory, so the edited turn is rebuilt from the user message itself.
+function editedUserMessageInput(turn: JsonObject, message: string): JsonValue[] {
+  const items = Array.isArray(turn.items) ? turn.items : [];
+  const userMessage = items.map((item) => asJsonObject(item)).find((item) => item?.type === "userMessage");
+  const parts = (Array.isArray(userMessage?.content) ? userMessage.content : []).map((part) => asJsonObject(part));
+  const textIndex = parts.findIndex((part) => part?.type === "text");
+  if (textIndex === -1) {
+    throw new Error("The last user message has no text to edit.");
+  }
+  if (parts.some((part) => part?.type !== "text")) {
+    throw new Error("Editing a message with attachments is not supported on a dispatcher-owned thread.");
+  }
+
+  return parts.map((part, index) =>
+    index === textIndex ? { ...part, text: message, text_elements: [] } : (part as JsonValue),
+  );
 }
 
 async function handleDispatcherOwnerStartTurn(conversationId: string, params: JsonObject): Promise<JsonValue> {
