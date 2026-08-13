@@ -1972,6 +1972,97 @@ describe("extension webview", () => {
     }
   });
 
+  // A setting the webview writes has to come back on the next read and reach the
+  // running view, and it has to land where a webview that reads the atom store
+  // itself will see it — that is the half of the extension's three-way storage a
+  // webview can tell apart.
+  test("stores a setting where the webview can read it back and see it change", async () => {
+    const previousRoot = process.env.CODEX_EXTENSION_WEBVIEW_ROOT;
+    const root = mkdtempSync(join(tmpdir(), "codex-webview-settings-"));
+    process.env.CODEX_EXTENSION_WEBVIEW_ROOT = root;
+    writeFileSync(join(root, "index.html"), "<html><head></head><body></body></html>");
+
+    const appServer = { request: () => Promise.resolve({}), onEvent: () => () => {} };
+
+    try {
+      const webview = new ExtensionWebview({
+        appServer: appServer as never,
+        defaultCwd: "/repo",
+        getToken: () => "secret",
+        statePath: join(root, "state.json"),
+      });
+      const stream = await openEventStream(webview, "tab-1");
+      const post = (message: JsonValue) =>
+        webview.fetch(
+          new Request("http://localhost/host-message", {
+            method: "POST",
+            headers: { cookie: "codex_dispatcher_webview=secret", "x-dispatcher-client": "tab-1" },
+            body: JSON.stringify({ messages: [message] }),
+          }),
+          new URL("http://localhost/host-message"),
+        );
+
+      await post({
+        type: "fetch",
+        requestId: "write-1",
+        url: "vscode://codex/set-setting",
+        method: "POST",
+        body: JSON.stringify({ key: "notifications-turn-mode", value: "always" }),
+      });
+      await post({
+        type: "fetch",
+        requestId: "read-1",
+        url: "vscode://codex/get-setting",
+        method: "POST",
+        body: JSON.stringify({ key: "notifications-turn-mode" }),
+      });
+      await post({
+        type: "fetch",
+        requestId: "read-all",
+        url: "vscode://codex/get-settings",
+        method: "POST",
+      });
+
+      const messages = await stream.waitFor(4, 5_000);
+      // The running view hears about it the same way it would about an atom it
+      // wrote itself, before the write is even answered.
+      expect(messages[0]).toEqual({
+        type: "persisted-atom-updated",
+        key: "notifications-turn-mode",
+        value: "always",
+        deleted: false,
+      });
+      expect(messages[1]).toMatchObject({ requestId: "write-1", bodyJsonString: JSON.stringify({ success: true }) });
+      expect(messages[2]).toMatchObject({ requestId: "read-1", bodyJsonString: JSON.stringify({ value: "always" }) });
+      expect(messages[3]).toMatchObject({
+        requestId: "read-all",
+        bodyJsonString: JSON.stringify({ values: { "notifications-turn-mode": "always" } }),
+      });
+
+      // A setting nobody has written is absent, not null: the webview answers it
+      // from its own copy of the definition's default.
+      await post({
+        type: "fetch",
+        requestId: "read-2",
+        url: "vscode://codex/get-setting",
+        method: "POST",
+        body: JSON.stringify({ key: "conversationDetailMode" }),
+      });
+      expect((await stream.waitFor(5, 5_000))[4]).toMatchObject({
+        requestId: "read-2",
+        bodyJsonString: JSON.stringify({ value: null }),
+      });
+      await stream.cancel();
+    } finally {
+      if (previousRoot === undefined) {
+        delete process.env.CODEX_EXTENSION_WEBVIEW_ROOT;
+      } else {
+        process.env.CODEX_EXTENSION_WEBVIEW_ROOT = previousRoot;
+      }
+      rmSync(root, { recursive: true, force: true });
+    }
+  });
+
   test("persists extension host state across webview host restarts", async () => {
     const previousRoot = process.env.CODEX_EXTENSION_WEBVIEW_ROOT;
     const root = mkdtempSync(join(tmpdir(), "codex-webview-state-"));

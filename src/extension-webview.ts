@@ -678,6 +678,32 @@ select,
       return { handled: true, result: { success: true } };
     }
 
+    // The extension keeps each setting in whichever of VS Code's three stores its
+    // definition names — settings file, memento, persisted atom — and for the
+    // persisted-atom ones the webview reads the store itself, not the endpoint.
+    // We have one store, so every setting lives in that one: the split exists to
+    // serve VS Code's stores, and the only half of it a webview can see is the
+    // half we keep. Defaults are not ours to send — the webview carries the same
+    // table and falls back to `definition.default` on anything we do not answer.
+    if (endpoint === "get-settings") {
+      return { handled: true, result: { values: this.state.persistedAtoms() } };
+    }
+
+    if (endpoint === "get-setting") {
+      const key = requireString(requireObject(body, "get-setting params").key, "key");
+      return { handled: true, result: { value: this.state.persistedAtoms()[key] ?? null } };
+    }
+
+    if (endpoint === "set-setting") {
+      const params = requireObject(body, "set-setting params");
+      const key = requireString(params.key, "key");
+      const value = params.value ?? null;
+      this.state.applyAtomUpdate({ key, value });
+      // Same word the webview would hear had it written the atom itself.
+      this.broadcast({ type: "persisted-atom-updated", key, value, deleted: false });
+      return { handled: true, result: { success: true } };
+    }
+
     if (endpoint === "thread-role-for-host") {
       const params = requireObject(body, "thread-role-for-host params");
       const conversationId = requireString(params.conversationId, "conversationId");
