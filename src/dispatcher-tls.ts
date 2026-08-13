@@ -31,6 +31,10 @@ export function ensureDispatcherCertificate(directory: string, hosts: string[]):
     mkdirSync(directory, { recursive: true });
     generateCertificate(certPath, keyPath, required);
   }
+  // LibreSSL leaves the key's mode to the umask, and unconditionally rather
+  // than only for one we just wrote: a key issued before we started doing this
+  // is still lying there readable by everyone.
+  chmodSync(keyPath, 0o600);
 
   return {
     cert: readFileSync(certPath, "utf8"),
@@ -69,18 +73,17 @@ export function parseSubjectAltNames(printedExtension: string): string[] {
   return names;
 }
 
-// Anything the certificate on disk cannot do — missing key, expired, truncated
-// by an interrupted first run, unreadable by this openssl — means the same
-// thing here: it is not what we serve, so issue one that is.
+// Anything the pair on disk cannot do — missing, expired, truncated by an
+// interrupted first run, unreadable by this openssl — means the same thing
+// here: it is not what we serve, so issue one that is. A certificate without a
+// key that matches it would otherwise fail inside `Bun.serve` on every start,
+// which is the wall this is here to avoid.
 function certificateIsUsable(certPath: string, keyPath: string, required: string[]): boolean {
-  try {
-    readFileSync(certPath);
-    readFileSync(keyPath);
-  } catch {
+  if (opensslStatus(["x509", "-noout", "-checkend", "0", "-in", certPath]) !== 0) {
     return false;
   }
 
-  if (opensslStatus(["x509", "-noout", "-checkend", "0", "-in", certPath]) !== 0) {
+  if (opensslStatus(["pkey", "-noout", "-in", keyPath]) !== 0) {
     return false;
   }
 
@@ -112,8 +115,6 @@ function generateCertificate(certPath: string, keyPath: string, names: string[])
     "-out",
     certPath,
   ]);
-  // OpenSSL writes the key 0600, LibreSSL writes it with the process umask.
-  chmodSync(keyPath, 0o600);
 }
 
 function certificateFingerprint(certPath: string): string {
