@@ -1,5 +1,5 @@
 import { describe, expect, test } from "bun:test";
-import { chmodSync, existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, statSync } from "node:fs";
+import { chmodSync, existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, statSync, unlinkSync } from "node:fs";
 import { homedir, tmpdir } from "node:os";
 import { Socket } from "node:net";
 import { dirname, join } from "node:path";
@@ -59,6 +59,7 @@ type RawMessage = {
 };
 
 type RawIpcClient = {
+  waitForClose(timeoutMs?: number): Promise<boolean>;
   waitForBroadcasts(expected: number, timeoutMs?: number): Promise<{ method: string }[]>;
   waitForMessage(match: (message: RawMessage) => boolean, timeoutMs?: number): Promise<RawMessage>;
   send(message: unknown): void;
@@ -67,6 +68,10 @@ type RawIpcClient = {
 
 async function rawIpcClient(socketPath: string): Promise<RawIpcClient> {
   const socket = new Socket();
+  let closed = false;
+  socket.on("close", () => {
+    closed = true;
+  });
   const broadcasts: { method: string }[] = [];
   const messages: RawMessage[] = [];
   let pending = Buffer.alloc(0);
@@ -108,6 +113,13 @@ async function rawIpcClient(socketPath: string): Promise<RawIpcClient> {
   });
 
   return {
+    async waitForClose(timeoutMs = 5_000) {
+      const deadline = Date.now() + timeoutMs;
+      while (!closed && Date.now() < deadline) {
+        await Bun.sleep(25);
+      }
+      return closed;
+    },
     async waitForBroadcasts(expected, timeoutMs = 1_000) {
       const deadline = Date.now() + timeoutMs;
       while (broadcasts.length < expected && Date.now() < deadline) {
@@ -285,8 +297,12 @@ describe("codex ipc", () => {
         const guest = new CodexIpcBridge();
         try {
           await host.start("host-client");
+          const hosted = statSync(join(home, "ipc", "ipc.sock")).ino;
           await guest.start("guest-client");
           expect(guest.socketPath).toBe(join(home, "ipc", "ipc.sock"));
+          // Joining means leaving the socket alone: replacing it would put the
+          // host on a bus of one, with no way back until it restarts.
+          expect(statSync(guest.socketPath).ino).toBe(hosted);
           const guestId = await waitForClientId(guest);
           await waitFor(() => host.getSnapshot().peers.some((peer) => peer.clientId === guestId));
         } finally {
@@ -348,6 +364,58 @@ describe("codex ipc", () => {
         }
       });
     });
+
+    // The extension removes whatever sits at the endpoint the moment its probe
+    // misses it (`Fye`), and it can only ever host once: `routerStarted` is a
+    // latch it never resets. So our socket file does get replaced under us, and
+    // sitting on the orphan is invisible — we keep answering ourselves while
+    // every VS Code window is on the other bus.
+    test("rejoins the bus after its socket file is replaced under it", async () => {
+      await withCodexHome(async (home) => {
+        const socketPath = join(home, "ipc", "ipc.sock");
+        const received: Collected = [];
+        const orphaned = new CodexIpcBridge();
+        orphaned.onEvent((event) => {
+          if (event.type === "broadcast" && event.broadcast.method !== "client-status-changed") {
+            received.push({ method: event.broadcast.method, params: event.broadcast.params });
+          }
+        });
+        const stranded = new CodexIpcBridge();
+        const usurper = new CodexIpcBridge();
+        let extensionLike: RawIpcClient | null = null;
+        try {
+          await orphaned.start("orphaned-client");
+          await stranded.start("stranded-client");
+          // The extension reconnects when its socket closes and never otherwise,
+          // so walking away from the router without hanging up strands it for
+          // good — it cannot even host a replacement (`routerStarted`).
+          extensionLike = await rawIpcClient(socketPath);
+          unlinkSync(socketPath);
+          await usurper.start("usurper-client");
+
+          const deadline = Date.now() + 6_000;
+          while (usurper.getSnapshot().peers.length < 2 && Date.now() < deadline) {
+            await Bun.sleep(50);
+          }
+          // Both sides of the abandoned bus have to notice: the router that lost
+          // the endpoint, and the client that was talking to it.
+          expect(usurper.getSnapshot().peers.map((peer) => peer.clientType).sort()).toEqual([
+            "orphaned-client",
+            "stranded-client",
+          ]);
+
+          expect(await extensionLike.waitForClose()).toBe(true);
+
+          usurper.broadcast("thread-read-state-changed", { threadId: "t-1" });
+          await waitFor(() => received.some((message) => message.method === "thread-read-state-changed"));
+        } finally {
+          extensionLike?.close();
+          usurper.stop();
+          stranded.stop();
+          orphaned.stop();
+        }
+      });
+    }, 15_000);
   });
 
   // Loading a long thread's history is a five-minute call. The router runs its

@@ -115,6 +115,10 @@ export type CodexIpcEvent =
 
 const initializingClientId = "initializing-client";
 const connectRetryMs = 1_000;
+// How often we check that the endpoint still points at the bus we are on. A
+// stat once a second costs nothing next to a bus that stays dead until someone
+// reloads a window.
+const busEndpointCheckMs = 1_000;
 const requestTimeoutMs = 5_000;
 const routedRequestTimeoutMs = 10_000;
 const maxFrameBytes = 256 * 1024 * 1024;
@@ -222,6 +226,18 @@ function secureRouterSocket(path: string): void {
   chmodSync(path, 0o600);
 }
 
+// Which socket, not just which path: a replaced endpoint keeps the name and
+// changes the inode, and that is the only way to tell our own bus from the one
+// that took its place.
+function socketIdentity(path: string): string | null {
+  try {
+    const stats = lstatSync(path);
+    return stats.isSocket() ? `${stats.dev}:${stats.ino}` : null;
+  } catch {
+    return null;
+  }
+}
+
 // `Fye`: only a stale socket of ours is ours to remove. Anything else at that
 // path belongs to someone else, and deleting it is how two clients end up
 // fighting over one endpoint.
@@ -248,6 +264,8 @@ export class CodexIpcBridge {
   private socket: Socket | null = null;
   private detachReader: (() => void) | null = null;
   private reconnectTimer: ReturnType<typeof setTimeout> | null = null;
+  private busEndpointTimer: ReturnType<typeof setInterval> | null = null;
+  private busIdentity: string | null = null;
   private clientId = initializingClientId;
   private disposed = false;
   private status: CodexIpcSnapshot["status"] = "starting";
@@ -299,6 +317,30 @@ export class CodexIpcBridge {
     }
 
     await this.connect(clientType);
+    this.watchBusEndpoint();
+  }
+
+  // A replaced endpoint is silent on both sides: the router that lost it keeps
+  // accepting on an unreachable inode, and everyone connected to it keeps a
+  // working socket to a bus of its own. Nothing closes, so nothing reconnects —
+  // it has to be looked at. Dropping the connection is the whole recovery: the
+  // close handler runs the reconnect we already have, and the router manager
+  // has by then forgotten it ever hosted, so the election starts over.
+  private watchBusEndpoint(): void {
+    if (this.busEndpointTimer) {
+      return;
+    }
+
+    this.busEndpointTimer = setInterval(() => {
+      if (this.disposed || this.busIdentity === null || this.busIdentity === socketIdentity(this.socketPath)) {
+        return;
+      }
+
+      this.setStatus("disconnected", "the IPC endpoint was replaced under the bus we were on");
+      this.routerManager.stop();
+      this.socket?.destroy();
+    }, busEndpointCheckMs);
+    this.busEndpointTimer.unref?.();
   }
 
   stop(): void {
@@ -306,6 +348,10 @@ export class CodexIpcBridge {
     if (this.reconnectTimer) {
       clearTimeout(this.reconnectTimer);
       this.reconnectTimer = null;
+    }
+    if (this.busEndpointTimer) {
+      clearInterval(this.busEndpointTimer);
+      this.busEndpointTimer = null;
     }
 
     for (const pending of this.pendingResponses.values()) {
@@ -389,6 +435,7 @@ export class CodexIpcBridge {
         }
 
         this.socket = socket;
+        this.busIdentity = socketIdentity(this.socketPath);
         this.detachReader = attachMessageReader(
           socket,
           (message) => this.handleMessage(message),
@@ -425,6 +472,7 @@ export class CodexIpcBridge {
         this.detachReader?.();
         this.detachReader = null;
         this.socket = null;
+        this.busIdentity = null;
         this.clientId = initializingClientId;
         this.peers.clear();
 
@@ -637,6 +685,7 @@ class IpcRouterManager {
   private socketPath = "";
   private started = false;
   private ownsSocket = false;
+  private hostedSocketIdentity: string | null = null;
 
   constructor(private readonly fixedSocketPath?: string) {}
 
@@ -667,10 +716,26 @@ class IpcRouterManager {
     return this.socketPath;
   }
 
+  // Bind first and ask questions after. The extension removes whatever is at
+  // the endpoint as soon as its probe misses it, and it can host only once
+  // (`routerStarted` is a latch), so a socket we delete a moment after someone
+  // bound it is a VS Code that never comes back to the bus. Only a path nobody
+  // answers on is ours to clear.
   private async startRouter(): Promise<void> {
-    unlinkStaleSocket(this.socketPath);
+    if (await this.listenOnRouterSocket()) {
+      return;
+    }
 
-    await new Promise<void>((resolve, reject) => {
+    if (await this.canConnectToSocket(this.socketPath)) {
+      return;
+    }
+
+    unlinkStaleSocket(this.socketPath);
+    await this.listenOnRouterSocket();
+  }
+
+  private listenOnRouterSocket(): Promise<boolean> {
+    return new Promise<boolean>((resolve, reject) => {
       const server = createServer();
       const router = new IpcRouter(server);
       let settled = false;
@@ -680,14 +745,13 @@ class IpcRouterManager {
           return;
         }
 
+        settled = true;
         if (error.code === "EADDRINUSE") {
-          settled = true;
           server.close();
-          resolve();
+          resolve(false);
           return;
         }
 
-        settled = true;
         reject(error);
       });
 
@@ -704,22 +768,35 @@ class IpcRouterManager {
         this.router = router;
         this.started = true;
         this.ownsSocket = true;
+        this.hostedSocketIdentity = socketIdentity(this.socketPath);
         router.start();
-        resolve();
+        resolve(true);
       });
     });
   }
 
+  // Nothing tells a listening server that its path was unlinked: it keeps
+  // accepting on an inode no one can reach any more, and its own client stays
+  // connected, so the bus looks healthy from the inside while every other
+  // client is somewhere else.
+  hostsReplacedSocket(): boolean {
+    return this.ownsSocket && this.hostedSocketIdentity !== socketIdentity(this.socketPath);
+  }
+
   stop(): void {
+    const ownsLiveSocket = this.ownsSocket && !this.hostsReplacedSocket();
     this.router?.stop();
     this.router = null;
     this.server?.close();
     this.server = null;
     this.started = false;
-    if (this.ownsSocket && process.platform !== "win32" && existsSync(this.socketPath)) {
+    // Only the socket we are still listening on is ours to remove: once it has
+    // been replaced, the file belongs to whoever hosts the bus now.
+    if (ownsLiveSocket && process.platform !== "win32" && existsSync(this.socketPath)) {
       unlinkSync(this.socketPath);
     }
     this.ownsSocket = false;
+    this.hostedSocketIdentity = null;
   }
 
   private canConnectToSocket(socketPath: string): Promise<boolean> {
@@ -777,13 +854,6 @@ class IpcRouter {
   }
 
   stop(): void {
-    for (const detachReader of this.detachReaders.values()) {
-      detachReader();
-    }
-    this.detachReaders.clear();
-    this.clients.clear();
-    this.clientsById.clear();
-
     for (const [requestId, request] of this.pendingRequests.entries()) {
       clearTimeout(request.timeout);
       this.pendingRequests.delete(requestId);
@@ -795,6 +865,21 @@ class IpcRouter {
           error: "server-closed",
         });
       }
+    }
+
+    // Closing the server leaves everyone who is already connected talking to a
+    // router that no longer answers, and the extension reconnects on close and
+    // nothing else — so a router that walks away without hanging up takes every
+    // client with it.
+    const connected = Array.from(this.detachReaders.keys());
+    for (const detachReader of this.detachReaders.values()) {
+      detachReader();
+    }
+    this.detachReaders.clear();
+    this.clients.clear();
+    this.clientsById.clear();
+    for (const socket of connected) {
+      socket.destroy();
     }
 
     for (const [requestId, request] of this.pendingDiscoveryRequests.entries()) {

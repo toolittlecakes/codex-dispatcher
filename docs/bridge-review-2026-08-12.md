@@ -416,3 +416,54 @@ function $W(t){let e=t[0];return e==null?null:{id:`vscode-${sha256(t.join("\0"))
 Проверка: тесты на ретрай броска (`fetch` кидает на первой попытке, вторая проходит) с проверкой `User-Agent` из initialize, на отмену (499 приходит раньше, чем ответил бы origin), и переписанный тест не-2xx.
 
 Открытый хвост: `fetch-stream` (`cP.stream`) хост по-прежнему не реализует — вебвью зовёт `Fd.stream()`, не получает ни `fetch-stream-error`, ни `-complete`, и фича молча висит вечно. Это не входило в E18/E20, но зависание без единого следа хуже отказа: следующий кандидат в этот список вместе с `get-settings`.
+
+### E21. Follower падает на нашем снапшоте: мы шлём форму app-server, а вебвью ждёт свой стор — РАЗВЕДКА
+
+Найдено при прогоне `docs/manual-verification-follower.md` (Check 0). Хендшейк проходит целиком: VS Code пишет `thread_stream_role_changed ... role=follower`, наш `/debug` показывает `followers: [...]`, `hostErrors` пуст. И сразу после этого вебвью VS Code падает в `LocalConversationPage`: `TypeError: Cannot read properties of undefined (reading 'input')`, при попытке продолжить — `Failed to resume chat / Cannot read properties of undefined (reading 'settings')`. В браузере это не видно никогда: там наш вебвью сам owner и наш снапшот не потребляет.
+
+Причина установлена по бандлу, гадать не пришлось. Owner отдаёт в `conversationState` **дословно свой стор**:
+
+```js
+sendConversationSnapshot(e,t,n){if(this.getStreamRole(e)?.role!==`owner`)return!1;let r=this.params.threadStore.getConversation(e);return r?(this.params.ipcBridge.threadStreamStateChanged?.({conversationId:e,hostId:this.params.hostId,targetClientIds:t,change:{type:`snapshot`,revision:n,conversationState:r}})...
+```
+
+Follower его принимает через `zPe` → `BPe` → `LPe`: нормализуются только даты (`createdAt/updatedAt/recencyAt`, `turnStartedAtMs`, `firstTurnWorkItemStartedAtMs`, `finalAssistantStartedAtMs`), `title`, `turnHistory.history.entitiesByKey`, и добавляются дефолты `hostId`/`turnsPagination`/`workspaceKind`. Всё остальное кладётся в стор как есть. То есть контракт снапшота — это внутренний объект `Conversation` вебвью, а не тред app-server.
+
+Мы же (`conversationFromThread` в `src/server.ts`) разворачиваем в снапшот сырой ответ `thread/read`. Турн app-server — это `{id, items, itemsView, status, error, startedAt, completedAt, durationMs}` (проверено на живом `codex app-server`), а вебвью читает у турна `params.input`, `turnId`, `turnStartedAtMs`, `durationMs`, `finalAssistantStartedAtMs`, `commandExecutionStartedAtMsById`; отсюда и `undefined.input`.
+
+Конструктор разговора — `VIe`, полный список полей: `id, sessionId, forkedFromId, hostId, turns, requests, createdAt, updatedAt, recencyAt, title, source, threadSource, historyMode, parentThreadId, mode, threadStartKind, modelProvider, latestModel, latestReasoningEffort, previousTurnModel, latestCollaborationMode, hasUnreadTurn, threadRuntimeStatus, rolloutPath, gitInfo, resumeState, latestTokenUsageInfo, workspaceKind, workspaceBrowserRoot, projectlessOutputDirectory, cwd` (+ `turnsPagination`, `turnHistory` при канонической истории).
+
+Маппер турнов app-server → стор в бандле уже есть готовый, это `jy` (обёртки `ePe`/`Ay`/`$Ne`), ~25 строк: `params.input` берётся из `itemsPaginationByTurnId[id].oldestUserInput` либо из первого `userMessage.content`, `turnStartedAtMs = startedAt*1000`, `finalAssistantStartedAtMs = completedAt*1000`, `permissionParamsSource: "inferred"`, items прогоняются через `nPe`/`rPe` (только `imageGeneration` и `collabAgentToolCall` меняются).
+
+Побочно подтвердилось главное про архитектуру: **в расширении хост — тупая труба**. В `out/extension.js` нет ни стора разговоров, ни `getStreamRole`, ни `thread-role-for-host`. Вся раздача ролей и обслуживание follower-запросов — `wq({hostId, ipcClient, viewService})`: `canHandle` каждого `thread-follower-*` = «вебвью говорит, что он owner» (`viewService.getThreadRole`), сам хендлер = `Zrt` → `viewService.requestThreadFollower`, а все broadcast'ы просто пересылаются в вебвью (`Yrt`). `thread-owner-discovery` устроен так же и возвращает пустой `{}` — важен только `handledByClientId`. Наш диспетчер вместо этого держит этот мозг у себя (`dispatcher-owner.ts` + `dispatcherOwnedConversations` в `server.ts`), и расхождение формы — прямое следствие.
+
+Два выхода, оба реальные:
+
+- **A. Стать трубой, как расширение.** Наш хост уже держит обратный стаб вебвью (`getRemoteMain().services.clientCoordination` в `src/webview-rpc.ts`), а на нём у вебвью есть ровно нужные `getThreadRole` и `requestThreadFollower` — то есть плюс два метода и перепроводка, минус ~300 строк owner-логики. Цена не в коде: owner существует только пока подключён вебвью. Телефон закрыли — тред не наш, хотя турн у нас в app-server всё ещё идёт, и VS Code, открыв его, отрезюмит тот же rollout на своём app-server. Это ровно то, ради чего диспетчер и писался, так что A ломает продукт, а не архитектуру.
+- **B. Остаться owner'ом и портировать форму.** Отдавать в снапшоте объект `VIe` с турнами из `jy`. Редьюсеры стора портировать не нужно: `handleThreadStreamStateChanged` принимает снапшот всегда и безусловно, `patches` — только опция, а мы и так на каждое изменение перечитываем `thread/read` и шлём снапшот целиком. Объём — маппинг + тесты, ревизии, `latest*` и `requests` у нас уже свои.
+
+Выбор — B: диспетчер обязан владеть тредом без подключённого вебвью, а цена B ограничена одним маппером.
+
+Открытый хвост разведки: живой снапшот от настоящего owner'а снять не удалось — VS Code не успевает поднять вебвью (`Webview did not finish starting` → «Codex could not start»), потому что машина под load average ~134 от постороннего ffmpeg. Это внешнее, к мосту отношения не имеет, и на форму ответа не влияет: контракт вычитан из продюсера и консьюмера напрямую. Проверять маппинг всё равно придётся на живом follower'е.
+
+Вторая находка, отдельная от E21 — см. E22 ниже; разбираться с ней решено первой, потому что без живой шины проверять follower нечем.
+
+### E22. Шина умирала молча: мы сносили чужой живой сокет и уходили не попрощавшись — DONE
+
+Симптом, из-за которого встала проверка follower'а: `/debug` показывает `peers: []` и `status: connected` одновременно, `thread-owner-discovery` отвечает `no-client-found`, broadcast от пробника не долетает ни в одно окно VS Code — при том что оба окна живы и ничего не логируют. Лечилось только перезагрузкой окна.
+
+Механика восстановлена по бандлу и подтверждена живьём. У расширения два свойства, которые вместе делают любую потерю сокета необратимой:
+
+- `getOrStartRouterEndpoint` **удаляет** то, что лежит на эндпоинте, как только его проба туда не достучалась (`Fye(e)`), и сразу биндит своё;
+- `routerStarted` — защёлка на всю жизнь процесса: она выставляется в колбэке `listen` и не сбрасывается никогда. Роутер, у которого из-под ног убрали файл сокета, продолжает слушать недостижимый inode, его собственный клиент к нему подключён и не рвётся — и второй раз поднять роутер он уже не может.
+
+Отсюда две наши ошибки, обе исправлены:
+
+- **Мы сносили живой сокет.** `startRouter` шёл `проба → unlink → listen`, и между пробой и unlink кто угодно успевал забиндиться. Теперь порядок обратный: `listen` первым, и только на `EADDRINUSE` мы пробуем подключиться; удаляем файл, лишь если на нём никто не отвечает. Заодно `stop()` больше не удаляет файл, который уже не наш — раньше выход диспетчера мог унести с собой сокет чужого роутера.
+- **Мы уходили не попрощавшись.** `IpcRouter.stop()` закрывал сервер, оставляя принятые соединения открытыми. Расширение переподключается **только** по `close` — то есть брошенный нами роутер забирал с собой всех, кто на нём висел. Теперь при остановке роутера соединения рвутся явно, после того как по ним отправлены ответы `server-closed`.
+
+И третье, уже про нашу собственную слепоту: потерю эндпоинта не слышит ни сервер, ни клиент, поэтому её приходится **смотреть**. Раз в секунду сверяем inode сокета, на котором стоит шина, с тем, к которому мы подключились; расхождение — это чужая шина на нашем пути, мы бросаем осиротевшее соединение, и дальше отрабатывает обычный реконнект с новыми выборами.
+
+Проверка: тест на подмену сокета под работающим роутером — и хозяин, и его клиент оказываются на новой шине, а raw-клиент (тот, что переподключается только по `close`, как расширение) получает разрыв. Живьём: диспетчер держит роутер, два окна VS Code на нём; сторонний процесс удаляет сокет и биндит свой — через 2 секунды на новой шине оказываются все трое. До фикса тот же прогон оставлял `peers: []` на всё время наблюдения, а окна VS Code — мёртвыми до перезагрузки.
+
+Чего мы починить не можем: защёлка `routerStarted` живёт в расширении. Если окно VS Code успело побыть роутером и его сокет подменили не мы, это окно останется вне шины до перезагрузки окна — наша сторона на это влиять не может.
