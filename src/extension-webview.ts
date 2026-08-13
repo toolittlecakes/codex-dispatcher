@@ -49,6 +49,10 @@ type ExtensionWebviewOptions = {
   getThreadRole?: (conversationId: string) => string | Promise<string>;
   handleFollowerRequest?: (method: string, params: JsonValue) => Promise<JsonValue>;
   ipcCoordination?: WebviewIpcCoordination;
+  // Who is on the bus and which threads are whose. The webview's own traffic
+  // says nothing about either, and that is exactly what a follower session that
+  // silently does nothing looks like from here.
+  getBridgeState?: () => JsonObject;
   onThreadActivity?: (method: string, conversationId: string, thread?: JsonObject) => void;
 };
 
@@ -113,6 +117,7 @@ export class ExtensionWebview {
   private readonly getThreadRole: ((conversationId: string) => string | Promise<string>) | undefined;
   private readonly handleFollowerRequest: ((method: string, params: JsonValue) => Promise<JsonValue>) | undefined;
   private readonly ipcCoordination: WebviewIpcCoordination | undefined;
+  private readonly getBridgeState: (() => JsonObject) | undefined;
   private readonly onThreadActivity: ((method: string, conversationId: string, thread?: JsonObject) => void) | undefined;
   private readonly clients = new Map<string, StreamClient>();
   // One RPC session per webview, exactly as VS Code keys them by webview.
@@ -138,6 +143,7 @@ export class ExtensionWebview {
     this.getThreadRole = options.getThreadRole;
     this.handleFollowerRequest = options.handleFollowerRequest;
     this.ipcCoordination = options.ipcCoordination;
+    this.getBridgeState = options.getBridgeState;
     this.onThreadActivity = options.onThreadActivity;
     this.state = new ExtensionState(options.statePath ?? extensionStatePath());
     this.webviewRoot = resolveExtensionWebviewRoot();
@@ -1219,6 +1225,7 @@ select,
       startedAt: this.startedAt,
       webviewRoot: this.webviewRoot,
       clients: this.clients.size,
+      bridge: this.getBridgeState?.() ?? null,
       messageCounts: Object.fromEntries(this.messageCounts.entries()) as JsonObject,
       recentMessages: this.recentMessages,
       hostErrors: this.hostErrors,

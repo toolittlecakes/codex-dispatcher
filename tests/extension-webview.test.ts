@@ -986,6 +986,43 @@ describe("extension webview", () => {
     }
   });
 
+  test("reports who is on the bus and which threads are ours", async () => {
+    const previousRoot = process.env.CODEX_EXTENSION_WEBVIEW_ROOT;
+    const root = mkdtempSync(join(tmpdir(), "codex-webview-bridge-state-"));
+    process.env.CODEX_EXTENSION_WEBVIEW_ROOT = root;
+    writeFileSync(join(root, "index.html"), "<html><head></head><body></body></html>");
+
+    try {
+      const webview = new ExtensionWebview({
+        appServer: {} as never,
+        defaultCwd: "/repo",
+        getToken: () => "secret",
+        getBridgeState: () => ({
+          ipc: { status: "connected", peers: [{ clientId: "vscode-1", clientType: "vscode" }] },
+          ownedThreads: [{ threadId: "thread-1", revision: 3, followers: ["vscode-1"] }],
+        }),
+      });
+
+      const response = await webview.fetch(
+        new Request("http://localhost/debug", { headers: { cookie: "codex_dispatcher_webview=secret" } }),
+        new URL("http://localhost/debug"),
+      );
+      const snapshot = await response.json();
+
+      expect(snapshot.bridge).toEqual({
+        ipc: { status: "connected", peers: [{ clientId: "vscode-1", clientType: "vscode" }] },
+        ownedThreads: [{ threadId: "thread-1", revision: 3, followers: ["vscode-1"] }],
+      });
+    } finally {
+      if (previousRoot === undefined) {
+        delete process.env.CODEX_EXTENSION_WEBVIEW_ROOT;
+      } else {
+        process.env.CODEX_EXTENSION_WEBVIEW_ROOT = previousRoot;
+      }
+      rmSync(root, { recursive: true, force: true });
+    }
+  });
+
   // The webview matches on the app server's exact wording to tell a stop that
   // lost a race from a stop that failed, so the error reaches it unedited.
   test("hands the app server's own error to the webview", async () => {

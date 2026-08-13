@@ -34,6 +34,7 @@ const extensionWebview = new ExtensionWebview({
   assertThreadFollowerOwner: (conversationId) => assertExtensionFollowerOwner(conversationId),
   getThreadRole: (conversationId) => extensionThreadRole(conversationId),
   handleFollowerRequest: (method, params) => handleExtensionFollowerRequest(method, params),
+  getBridgeState: () => buildBridgeDebugState(),
   ipcCoordination: {
     broadcast: (method, params, targetClientIds) => broadcastForWebview(method, params, targetClientIds),
     request: (method, params, options) => requestForWebview(method, params, options),
@@ -775,6 +776,29 @@ function buildExtensionEventReplayMessages(): JsonObject[] {
   // them through our app server and already has their state, and a replay per
   // owned thread grows with every thread the phone has ever run.
   return messages;
+}
+
+// What the follower path actually depends on, none of which the webview's own
+// traffic reveals: who else is on the bus, which threads we drive, who is
+// listening to them, and whose snapshots we are mirroring.
+function buildBridgeDebugState(): JsonObject {
+  const snapshot = ipcBridge.getSnapshot();
+  return {
+    ipc: {
+      status: snapshot.status,
+      socketPath: snapshot.socketPath,
+      clientId: snapshot.clientId,
+      peers: snapshot.peers.map((peer) => ({ clientId: peer.clientId, clientType: peer.clientType })),
+      detail: snapshot.detail ?? null,
+    },
+    ownedThreads: [...dispatcherOwnedConversations.keys()].map((threadId) => ({
+      threadId,
+      revision: dispatcherOwnedRevision(threadId),
+      followers: [...(streamFollowersByConversation.get(threadId) ?? [])],
+    })),
+    mirroredThreads: [...mirroredConversations.keys()],
+    threadOwners: Object.fromEntries(streamOwners),
+  };
 }
 
 function extensionThreadRole(threadId: string): string {
