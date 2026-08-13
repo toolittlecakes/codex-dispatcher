@@ -260,6 +260,26 @@ export function applyThreadSettingsUpdate(conversation: JsonObject, threadSettin
   rememberPreviousTurnModel(conversation, previousModeModel, collaborationModeModel(collaborationMode));
 }
 
+// The app server's own notification, which carries the thread's whole settings
+// object rather than the piece somebody changed. The webview keeps a separate
+// function for it (`gIe`) and replaces wholesale: merging it like a patch would
+// keep keys the thread no longer has and never pick up a cleared one.
+export function applyThreadSettingsNotification(conversation: JsonObject, threadSettingsValue: JsonValue): void {
+  const settings = asJsonObject(threadSettingsValue);
+  if (!settings) {
+    throw new Error("threadSettings must be an object");
+  }
+
+  const previousModeModel = collaborationModeModel(conversation.latestCollaborationMode);
+  conversation.latestThreadSettings = settings;
+  conversation.latestModel = settings.model ?? null;
+  conversation.modelProvider = settings.modelProvider ?? null;
+  conversation.latestReasoningEffort = settings.effort ?? null;
+  conversation.latestCollaborationMode = settings.collaborationMode ?? null;
+  conversation.cwd = settings.cwd ?? null;
+  rememberPreviousTurnModel(conversation, previousModeModel, collaborationModeModel(settings.collaborationMode));
+}
+
 // `yIe`: a mode sent by the follower replaces ours as given; otherwise a model
 // or effort change is folded into the mode we already have, since that is what
 // the next turn is started from.
@@ -413,9 +433,11 @@ export function buildDispatcherTurnStartRequest(
   // inherited one rides along with the thread's own, and dropping them there
   // would run the turn on the app server's default model.
   const modeCarriesModel = turnStartParams.collaborationMode != null;
+  // `Wb`: a thread starts life with an empty model and keeps it until the app
+  // server names one, and an empty string sent here is a model, not a silence.
   const model = modeCarriesModel
     ? null
-    : turnStartParams.model ?? (inherited ? conversation?.latestModel ?? null : null);
+    : normalizeJsonString(turnStartParams.model ?? (inherited ? conversation?.latestModel : null));
   const effort = modeCarriesModel
     ? null
     : turnStartParams.effort === undefined

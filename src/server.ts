@@ -3,6 +3,7 @@ import { networkInterfaces } from "node:os";
 import { AppServerError, CodexAppServer, type JsonObject, type JsonValue } from "./codex-app-server";
 import { CodexIpcBridge, type IpcBroadcastMessage } from "./codex-ipc";
 import {
+  applyThreadSettingsNotification,
   applyThreadSettingsUpdate,
   buildDispatcherSnapshotParams,
   buildDispatcherTurnStartRequest,
@@ -68,6 +69,10 @@ const dispatcherOwnedRefreshRequested = new Set<string>();
 // conversation cannot answer this question: the only thing that ever puts turns
 // in it is the read this gate stands in front of.
 const dispatcherOwnedThreadsWithTurns = new Set<string>();
+// A settings change we made, and how many the app server has announced since:
+// together they say whether our own write is still the newest thing we know.
+const pendingThreadSettingsUpdates = new Map<string, Promise<void>>();
+const dispatcherOwnedSettingsAnnouncements = new Map<string, number>();
 // Who asked to be kept up to date on which thread. A thread nobody follows is
 // still ours to drive, it just costs no traffic.
 const streamFollowersByConversation = new Map<string, Set<string>>();
@@ -123,8 +128,9 @@ appServer.onEvent((event) => {
     // and the only way a follower's change reaches that webview.
     if (event.notification.method === "thread/settings/updated") {
       const settings = asJsonObject(event.notification.params)?.threadSettings ?? null;
+      dispatcherOwnedSettingsAnnouncements.set(threadId, (dispatcherOwnedSettingsAnnouncements.get(threadId) ?? 0) + 1);
       updateDispatcherOwnedConversation(threadId, (conversation) => {
-        applyThreadSettingsUpdate(conversation, settings);
+        applyThreadSettingsNotification(conversation, settings);
       });
       broadcastDispatcherOwnedSnapshot(threadId);
     }
@@ -424,10 +430,7 @@ async function handleDispatcherOwnerRequest(method: string, paramsValue: JsonVal
     // conversation and the webview attached to us both learn about it from the
     // notification that call raises.
     case "thread-follower-update-thread-settings":
-      await appServer.request("thread/settings/update", {
-        threadId: conversationId,
-        ...(asJsonObject(params.threadSettings) ?? {}),
-      });
+      await updateDispatcherOwnedThreadSettings(conversationId, asJsonObject(params.threadSettings) ?? {});
       return { ok: true };
 
     // We keep the whole conversation as the app server hands it to us, so there
@@ -512,6 +515,10 @@ function editedUserMessageInput(turn: JsonObject, message: string): JsonValue[] 
 
 async function handleDispatcherOwnerStartTurn(conversationId: string, params: JsonObject): Promise<JsonValue> {
   const turnStartParams = requireJsonObject(params.turnStartParams, "turnStartParams");
+  // The follower sends the turn the moment we answer its settings change, and
+  // the app server answers that change before it announces it. Starting the
+  // turn from our copy in between would name the model the user just replaced.
+  await pendingThreadSettingsUpdates.get(conversationId);
   const result = await appServer.request(
     "turn/start",
     buildDispatcherTurnStartRequest(
@@ -522,6 +529,33 @@ async function handleDispatcherOwnerStartTurn(conversationId: string, params: Js
   );
   scheduleDispatcherOwnedRefresh(conversationId, 0);
   return { result };
+}
+
+// The app server answers a settings change before it announces it, so between
+// those two moments our copy of the thread still names the old model. The
+// webview closes the same window the same way (`pendingThreadSettingsUpdates`):
+// apply what we just wrote, unless the announcement got there first.
+async function updateDispatcherOwnedThreadSettings(threadId: string, threadSettings: JsonObject): Promise<void> {
+  const announced = dispatcherOwnedSettingsAnnouncements.get(threadId) ?? 0;
+  const update = (async () => {
+    await appServer.request("thread/settings/update", { threadId, ...threadSettings });
+    if ((dispatcherOwnedSettingsAnnouncements.get(threadId) ?? 0) !== announced) {
+      return;
+    }
+    updateDispatcherOwnedConversation(threadId, (conversation) => {
+      applyThreadSettingsUpdate(conversation, threadSettings);
+    });
+    broadcastDispatcherOwnedSnapshot(threadId);
+  })();
+
+  pendingThreadSettingsUpdates.set(threadId, update);
+  try {
+    await update;
+  } finally {
+    if (pendingThreadSettingsUpdates.get(threadId) === update) {
+      pendingThreadSettingsUpdates.delete(threadId);
+    }
+  }
 }
 
 async function handleDispatcherOwnerSteerTurn(conversationId: string, params: JsonObject): Promise<JsonValue> {
@@ -635,6 +669,7 @@ function releaseDispatcherOwnership(threadId: string): void {
   dispatcherOwnedRevisions.delete(threadId);
   dispatcherOwnedRefreshRequested.delete(threadId);
   dispatcherOwnedThreadsWithTurns.delete(threadId);
+  dispatcherOwnedSettingsAnnouncements.delete(threadId);
   const pending = dispatcherOwnedRefreshTimers.get(threadId);
   if (pending) {
     clearTimeout(pending);

@@ -1,6 +1,7 @@
 import { describe, expect, test } from "bun:test";
 import { AppServerError } from "../src/codex-app-server";
 import {
+  applyThreadSettingsNotification,
   applyThreadSettingsUpdate,
   buildDispatcherSnapshotParams,
   buildDispatcherTurnStartRequest,
@@ -159,6 +160,45 @@ describe("dispatcher owner IPC helpers", () => {
       effort: "high",
       collaborationMode: null,
     });
+  });
+
+  // The app server sends the whole settings object, and the webview replaces
+  // its own with it. Merging it as a patch keeps keys the thread has dropped.
+  test("replaces the thread settings the app server announces instead of merging them", () => {
+    const conversation = minimalOwnerConversationState("thread-1", "/repo", []);
+    applyThreadSettingsUpdate(conversation, { model: "gpt-5.4", permissions: "read-only" });
+
+    applyThreadSettingsNotification(conversation, {
+      cwd: "/repo",
+      model: "gpt-5.6-sol",
+      modelProvider: "openai",
+      effort: "high",
+      activePermissionProfile: null,
+      collaborationMode: { mode: "default", settings: { model: "gpt-5.6-sol", reasoning_effort: "high" } },
+    });
+
+    expect(conversation.latestThreadSettings).toEqual({
+      cwd: "/repo",
+      model: "gpt-5.6-sol",
+      modelProvider: "openai",
+      effort: "high",
+      activePermissionProfile: null,
+      collaborationMode: { mode: "default", settings: { model: "gpt-5.6-sol", reasoning_effort: "high" } },
+    });
+    expect(conversation.latestModel).toBe("gpt-5.6-sol");
+    expect(conversation.modelProvider).toBe("openai");
+    expect(conversation.latestReasoningEffort).toBe("high");
+    expect(conversation.cwd).toBe("/repo");
+  });
+
+  // A thread carries an empty model until the app server names one, and the
+  // extension turns that into "no model named" rather than into a model.
+  test("does not name the empty model a thread starts life with", () => {
+    expect(
+      buildDispatcherTurnStartRequest("thread-1", minimalOwnerConversationState("thread-1", "/repo", []), {
+        input: [{ type: "text", text: "hi" }],
+      }).model,
+    ).toBeNull();
   });
 
   // The thread always has a collaboration mode, so nulling the model whenever
