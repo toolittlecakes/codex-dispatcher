@@ -1775,6 +1775,203 @@ describe("extension webview", () => {
     }
   });
 
+  // `cP.stream`: nothing rides back on the request, so a host that stays quiet
+  // leaves `/codex/responses` waiting forever. Every part of the answer is a
+  // message, the end of it included.
+  test("streams a server-sent-events response back to the webview", async () => {
+    const previousRoot = process.env.CODEX_EXTENSION_WEBVIEW_ROOT;
+    const root = mkdtempSync(join(tmpdir(), "codex-webview-stream-"));
+    process.env.CODEX_EXTENSION_WEBVIEW_ROOT = root;
+    writeFileSync(join(root, "index.html"), "<html><head></head><body></body></html>");
+
+    const origin = Bun.serve({
+      port: 0,
+      fetch() {
+        const body = [
+          "event: heartbeat\ndata: {}",
+          "event: delta\ndata: {\"text\":\"hel\"}",
+          "data: {\"text\":\"lo\"}",
+        ].join("\n\n") + "\n\n";
+        return new Response(body, {
+          headers: { "content-type": "text/event-stream", "x-oai-request-id": "req-abc", "x-secret": "leak" },
+        });
+      },
+    });
+
+    const appServer = { request: () => Promise.resolve({}), onEvent: () => () => {} };
+
+    try {
+      const webview = new ExtensionWebview({
+        appServer: appServer as never,
+        defaultCwd: "/repo",
+        getToken: () => "secret",
+      });
+      const stream = await openEventStream(webview, "tab-1");
+      await webview.fetch(
+        new Request("http://localhost/host-message", {
+          method: "POST",
+          headers: { cookie: "codex_dispatcher_webview=secret", "x-dispatcher-client": "tab-1" },
+          body: JSON.stringify({ messages: [{
+            type: "fetch-stream",
+            requestId: "stream-1",
+            url: `${origin.url.origin}/codex/responses`,
+            method: "POST",
+            body: JSON.stringify({ prompt: "hi" }),
+          }] }),
+        }),
+        new URL("http://localhost/host-message"),
+      );
+
+      const messages = await stream.waitFor(4, 5_000);
+      expect(messages[0]).toMatchObject({
+        type: "fetch-stream-response",
+        requestId: "stream-1",
+        status: 200,
+        headers: { "x-oai-request-id": "req-abc" },
+      });
+      // Only the timing headers travel; the rest of the response's own headers
+      // are none of the webview's business.
+      expect(Object.keys(messages[0]!.headers as object)).toEqual(["x-oai-request-id"]);
+      // The heartbeat is the connection talking about itself, not an event.
+      expect(messages[1]).toEqual({ type: "fetch-stream-event", requestId: "stream-1", event: "delta", data: { text: "hel" } });
+      expect(messages[2]).toEqual({ type: "fetch-stream-event", requestId: "stream-1", data: { text: "lo" } });
+      expect(messages[3]).toEqual({ type: "fetch-stream-complete", requestId: "stream-1" });
+      await stream.cancel();
+    } finally {
+      await origin.stop(true);
+      if (previousRoot === undefined) {
+        delete process.env.CODEX_EXTENSION_WEBVIEW_ROOT;
+      } else {
+        process.env.CODEX_EXTENSION_WEBVIEW_ROOT = previousRoot;
+      }
+      rmSync(root, { recursive: true, force: true });
+    }
+  });
+
+  // A stream that fails is still an answer: without `fetch-stream-error` the
+  // webview keeps its handler and waits on nothing.
+  test("reports a stream the backend refused instead of going quiet", async () => {
+    const previousRoot = process.env.CODEX_EXTENSION_WEBVIEW_ROOT;
+    const root = mkdtempSync(join(tmpdir(), "codex-webview-streamfail-"));
+    process.env.CODEX_EXTENSION_WEBVIEW_ROOT = root;
+    writeFileSync(join(root, "index.html"), "<html><head></head><body></body></html>");
+
+    const origin = Bun.serve({
+      port: 0,
+      fetch() {
+        return new Response("nope", { status: 403, statusText: "Forbidden" });
+      },
+    });
+
+    const appServer = { request: () => Promise.resolve({}), onEvent: () => () => {} };
+
+    try {
+      const webview = new ExtensionWebview({
+        appServer: appServer as never,
+        defaultCwd: "/repo",
+        getToken: () => "secret",
+      });
+      const stream = await openEventStream(webview, "tab-1");
+      await webview.fetch(
+        new Request("http://localhost/host-message", {
+          method: "POST",
+          headers: { cookie: "codex_dispatcher_webview=secret", "x-dispatcher-client": "tab-1" },
+          body: JSON.stringify({ messages: [{
+            type: "fetch-stream",
+            requestId: "stream-1",
+            url: `${origin.url.origin}/codex/responses`,
+            method: "POST",
+          }] }),
+        }),
+        new URL("http://localhost/host-message"),
+      );
+
+      const [message] = await stream.waitFor(1, 5_000);
+      expect(message).toEqual({ type: "fetch-stream-error", requestId: "stream-1", error: "403 Forbidden" });
+      await stream.cancel();
+    } finally {
+      await origin.stop(true);
+      if (previousRoot === undefined) {
+        delete process.env.CODEX_EXTENSION_WEBVIEW_ROOT;
+      } else {
+        process.env.CODEX_EXTENSION_WEBVIEW_ROOT = previousRoot;
+      }
+      rmSync(root, { recursive: true, force: true });
+    }
+  });
+
+  // `cancel-fetch-stream`: the webview stopped reading, so the connection to the
+  // backend has to close — and a cancelled stream is finished, not broken.
+  test("closes a stream the webview cancelled", async () => {
+    const previousRoot = process.env.CODEX_EXTENSION_WEBVIEW_ROOT;
+    const root = mkdtempSync(join(tmpdir(), "codex-webview-streamcancel-"));
+    process.env.CODEX_EXTENSION_WEBVIEW_ROOT = root;
+    writeFileSync(join(root, "index.html"), "<html><head></head><body></body></html>");
+
+    let closed = false;
+    const origin = Bun.serve({
+      port: 0,
+      fetch() {
+        const body = new ReadableStream<Uint8Array>({
+          start(controller) {
+            controller.enqueue(new TextEncoder().encode("event: delta\ndata: {\"text\":\"hel\"}\n\n"));
+          },
+          cancel() {
+            closed = true;
+          },
+        });
+        return new Response(body, { headers: { "content-type": "text/event-stream" } });
+      },
+    });
+
+    const appServer = { request: () => Promise.resolve({}), onEvent: () => () => {} };
+
+    try {
+      const webview = new ExtensionWebview({
+        appServer: appServer as never,
+        defaultCwd: "/repo",
+        getToken: () => "secret",
+      });
+      const stream = await openEventStream(webview, "tab-1");
+      const post = (message: JsonValue) =>
+        webview.fetch(
+          new Request("http://localhost/host-message", {
+            method: "POST",
+            headers: { cookie: "codex_dispatcher_webview=secret", "x-dispatcher-client": "tab-1" },
+            body: JSON.stringify({ messages: [message] }),
+          }),
+          new URL("http://localhost/host-message"),
+        );
+
+      await post({
+        type: "fetch-stream",
+        requestId: "stream-1",
+        url: `${origin.url.origin}/codex/responses`,
+        method: "POST",
+      });
+      await stream.waitFor(2, 5_000);
+      await post({ type: "cancel-fetch-stream", requestId: "stream-1" });
+
+      const messages = await stream.waitFor(3, 5_000);
+      expect(messages[2]).toEqual({ type: "fetch-stream-complete", requestId: "stream-1" });
+      // The point of cancelling is that the backend stops sending, so the origin
+      // has to see the connection go.
+      for (let waited = 0; !closed && waited < 2_000; waited += 50) {
+        await Bun.sleep(50);
+      }
+      expect(closed).toBe(true);
+      await stream.cancel();
+    } finally {
+      await origin.stop(true);
+      if (previousRoot === undefined) {
+        delete process.env.CODEX_EXTENSION_WEBVIEW_ROOT;
+      } else {
+        process.env.CODEX_EXTENSION_WEBVIEW_ROOT = previousRoot;
+      }
+      rmSync(root, { recursive: true, force: true });
+    }
+  });
+
   test("persists extension host state across webview host restarts", async () => {
     const previousRoot = process.env.CODEX_EXTENSION_WEBVIEW_ROOT;
     const root = mkdtempSync(join(tmpdir(), "codex-webview-state-"));

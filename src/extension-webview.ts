@@ -97,6 +97,14 @@ const externalFetchAttempts = 3;
 const externalFetchBaseBackoffMs = 300;
 const externalFetchMaxBackoffMs = 2_000;
 const chatgptOriginator = "codex_vscode";
+// `VGe`: the only response headers a stream reports back.
+const streamReportedHeaders = [
+  "s-cf-origin-ttfb-msec",
+  "s-cf-quic-rtt-msec",
+  "s-cf-tcp-rtt-msec",
+  "s-sa-server-ttfb-msec",
+  "x-oai-request-id",
+];
 // `Ee.LOCAL_PROJECTS` / `Ee.SELECTED_PROJECT` in out/extension.js.
 const localProjectsStateKey = "local-projects";
 const selectedProjectStateKey = "selected-project";
@@ -132,6 +140,7 @@ export class ExtensionWebview {
   private readonly onThreadActivity: ((method: string, conversationId: string, thread?: JsonObject) => void) | undefined;
   private readonly clients = new Map<string, StreamClient>();
   private readonly externalFetches = new Map<string, AbortController>();
+  private readonly externalFetchStreams = new Map<string, AbortController>();
   // One RPC session per webview, exactly as VS Code keys them by webview.
   private readonly rpcSessions = new Map<string, WebviewRpcSession>();
   // VS Code hosts exactly one webview, and the extension is written for that:
@@ -498,6 +507,19 @@ select,
         }
         return [];
 
+      // `cP.stream`: unlike a fetch, a stream has no reply to carry an answer —
+      // the webview settles it only on `fetch-stream-complete` or
+      // `-error`, so a host that says nothing leaves it waiting forever.
+      case "fetch-stream":
+        this.startExternalFetchStream(message);
+        return [];
+
+      case "cancel-fetch-stream":
+        if (typeof message.requestId === "string") {
+          this.externalFetchStreams.get(message.requestId)?.abort();
+        }
+        return [];
+
       case "mcp-request":
       case "thread-prewarm-start":
         return [await this.handleMcpRequest(message)];
@@ -577,6 +599,30 @@ select,
         this.externalFetches.delete(requestId);
       }
     }
+  }
+
+  private startExternalFetchStream(message: HostMessage): void {
+    const requestId = requireString(message.requestId, "fetch-stream requestId");
+    const cancel = new AbortController();
+    this.externalFetchStreams.set(requestId, cancel);
+
+    void handleExternalFetchStream(
+      message,
+      requestId,
+      (refreshToken) => this.readAuthToken(refreshToken),
+      { userAgent: this.backendUserAgent(), cancelSignal: cancel.signal },
+      (event) => this.broadcast(event),
+    )
+      .catch((error: unknown) => {
+        this.broadcast({
+          type: "fetch-stream-error",
+          requestId,
+          error: error instanceof Error ? error.message : String(error),
+        });
+      })
+      .finally(() => {
+        this.externalFetchStreams.delete(requestId);
+      });
   }
 
   // `setUserAgent(initializeResult.userAgent ?? Pf)`: the app server names the
@@ -1671,6 +1717,199 @@ async function handleExternalFetch(
   };
 
   return attempt(0, attachAuth ? await getAuthToken(false) : null);
+}
+
+// `cP.stream` in out/extension.js. The webview streams `/codex/responses` this
+// way, and nothing rides back on the request itself: every part of the answer,
+// including the fact that there is none, is a message the host has to send.
+// There is no deadline here on purpose — the unary proxy has one because the
+// relay gives up on a request after 30s, but these events travel down the
+// webview's own event stream, and a long answer is exactly what a stream is for.
+async function handleExternalFetchStream(
+  message: HostMessage,
+  requestId: string,
+  getAuthToken: AuthTokenReader,
+  options: { userAgent: string; cancelSignal: AbortSignal },
+  emit: (event: JsonObject) => void,
+): Promise<void> {
+  const url = normalizeExternalFetchUrl(message.url);
+  const method = typeof message.method === "string" ? message.method : "GET";
+  const attachAuth = shouldAttachAuth(url);
+  const signal = options.cancelSignal;
+
+  const attempt = async (attemptIndex: number, token: string | null): Promise<void> => {
+    const headers = buildExternalFetchHeaders(message, isJwt(token) ? token : null, {
+      method,
+      attachAuth,
+      userAgent: options.userAgent,
+    });
+    const authorized = headers.has("authorization");
+
+    const init: RequestInit = { method, headers, signal };
+    if (typeof message.body === "string" && method !== "GET") {
+      init.body = message.body;
+    }
+
+    try {
+      const response = await fetch(url, init);
+      if (response.status === 200 && response.body) {
+        emit({ type: "fetch-stream-response", requestId, status: response.status, headers: streamTimingHeaders(response.headers) });
+        const events = message.format === "ndjson"
+          ? readNdjsonStream(response.body, signal)
+          : readServerSentEvents(response.body, signal);
+        for await (const event of events) {
+          emit({ type: "fetch-stream-event", requestId, ...event });
+        }
+        emit({ type: "fetch-stream-complete", requestId });
+        return;
+      }
+
+      if (response.status === 401 && authorized && attemptIndex < externalFetchAttempts) {
+        const refreshed = await getAuthToken(true);
+        if (refreshed && refreshed !== token) {
+          return attempt(attemptIndex + 1, refreshed);
+        }
+      }
+
+      if (isRetryableFetchStatus(response.status) && attemptIndex < externalFetchAttempts) {
+        await Bun.sleep(externalFetchBackoffMs(attemptIndex));
+        return attempt(attemptIndex + 1, token);
+      }
+
+      emit({ type: "fetch-stream-error", requestId, error: `${response.status} ${response.statusText}` });
+    } catch (error) {
+      // A cancelled stream is finished, not broken: the webview asked for it to
+      // stop and has already dropped what it had.
+      if (signal.aborted || (error instanceof Error && error.name === "AbortError")) {
+        emit({ type: "fetch-stream-complete", requestId });
+        return;
+      }
+
+      if (attemptIndex < externalFetchAttempts) {
+        await Bun.sleep(externalFetchBackoffMs(attemptIndex));
+        return attempt(attemptIndex + 1, token);
+      }
+
+      emit({ type: "fetch-stream-error", requestId, error: error instanceof Error ? error.message : "Unknown error" });
+    }
+  };
+
+  await attempt(0, attachAuth ? await getAuthToken(false) : null);
+}
+
+// `F5`: a stream's headers are reported for timing only, so only those go back.
+function streamTimingHeaders(headers: Headers): JsonObject {
+  const reported: JsonObject = {};
+  for (const name of streamReportedHeaders) {
+    const value = headers.get(name);
+    if (value != null) {
+      reported[name] = value;
+    }
+  }
+  return reported;
+}
+
+// `B5`: one JSON document per line.
+async function* readNdjsonStream(body: ReadableStream<Uint8Array>, signal: AbortSignal): AsyncGenerator<JsonObject> {
+  for await (const chunk of readStreamChunks(body, signal, (pending) => [pending.indexOf("\n"), 1])) {
+    const line = chunk.replace(/\r$/, "");
+    if (line.trim().length > 0) {
+      yield { data: JSON.parse(line) as JsonValue };
+    }
+  }
+}
+
+// `mve` with `_N`: events separated by a blank line, `data:` lines joined and
+// parsed as one document. A heartbeat is the connection talking about itself.
+async function* readServerSentEvents(body: ReadableStream<Uint8Array>, signal: AbortSignal): AsyncGenerator<JsonObject> {
+  for await (const chunk of readStreamChunks(body, signal, findEventBoundary)) {
+    const event = parseServerSentEvent(chunk);
+    if (event && event.event !== "heartbeat") {
+      yield event;
+    }
+  }
+}
+
+function parseServerSentEvent(chunk: string): JsonObject | null {
+  let name: string | undefined;
+  const data: string[] = [];
+  for (const line of chunk.split(/\r?\n/)) {
+    if (line.startsWith("event:")) {
+      name = line.slice(6).trim();
+    } else if (line.startsWith("data:")) {
+      data.push(line.slice(5).trim());
+    }
+  }
+  if (data.length === 0) {
+    return null;
+  }
+
+  try {
+    const parsed = JSON.parse(data.join("\n")) as JsonValue;
+    return name === undefined ? { data: parsed } : { event: name, data: parsed };
+  } catch {
+    // `_N` returns null on a fragment it cannot parse and the stream carries on:
+    // the events are independent, and one unreadable event is not the end.
+    return null;
+  }
+}
+
+// `nnt`: an event ends at a blank line, and a server is free to spell that line
+// either way — whichever comes first is the end of this event.
+function findEventBoundary(pending: string): [number, number] {
+  const crlf = pending.indexOf("\r\n\r\n");
+  const lf = pending.indexOf("\n\n");
+  if (crlf === -1) {
+    return [lf, 2];
+  }
+  if (lf === -1 || crlf < lf) {
+    return [crlf, 4];
+  }
+  return [lf, 2];
+}
+
+async function* readStreamChunks(
+  body: ReadableStream<Uint8Array>,
+  signal: AbortSignal,
+  findSeparator: (pending: string) => [number, number],
+): AsyncGenerator<string> {
+  const reader = body.getReader();
+  const decoder = new TextDecoder();
+  const cancelRead = (): void => {
+    reader.cancel().catch(() => {});
+  };
+  signal.addEventListener("abort", cancelRead, { once: true });
+  if (signal.aborted) {
+    cancelRead();
+  }
+
+  let pending = "";
+  try {
+    while (!signal.aborted) {
+      const { value, done } = await reader.read();
+      if (done || value == null) {
+        break;
+      }
+      pending += decoder.decode(value, { stream: true });
+      let [index, length] = findSeparator(pending);
+      while (index >= 0) {
+        yield pending.slice(0, index);
+        pending = pending.slice(index + length);
+        [index, length] = findSeparator(pending);
+      }
+    }
+    // Whatever the last chunk left behind is an event too, unless the reader was
+    // cancelled — then there is nobody left to hand it to.
+    if (!signal.aborted) {
+      const tail = pending + decoder.decode();
+      if (tail.trim().length > 0) {
+        yield tail;
+      }
+    }
+  } finally {
+    signal.removeEventListener("abort", cancelRead);
+    reader.releaseLock();
+  }
 }
 
 // `shouldAttachAuth`: the account token goes to OpenAI's own hosts and nowhere
