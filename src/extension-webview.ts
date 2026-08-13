@@ -2003,8 +2003,8 @@ function parseResumePoint(client: StreamClient, header: string | null): number |
 const authCookieMaxAgeSeconds = 90 * 24 * 60 * 60;
 
 function authCookie(token: string, secure: boolean): string {
-  // Secure is conditional on purpose: the LAN entry point is plain http, and an
-  // unconditional flag would make the cookie unusable exactly there.
+  // Secure is conditional on purpose: `DISPATCHER_TLS=off` serves plain http,
+  // and an unconditional flag would make the cookie unusable exactly there.
   return `${authCookieName}=${encodeURIComponent(token)}; HttpOnly; SameSite=Lax; Max-Age=${authCookieMaxAgeSeconds}; Path=${routePrefix || "/"}${secure ? "; Secure" : ""}`;
 }
 

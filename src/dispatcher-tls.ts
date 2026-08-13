@@ -1,5 +1,5 @@
 import { spawnSync } from "node:child_process";
-import { mkdirSync, readFileSync } from "node:fs";
+import { chmodSync, mkdirSync, readFileSync } from "node:fs";
 import { homedir } from "node:os";
 import { join } from "node:path";
 
@@ -27,7 +27,7 @@ export function ensureDispatcherCertificate(directory: string, hosts: string[]):
   // The address a laptop hands out changes with the network it is on, and a
   // certificate that does not name the current one is a warning the phone
   // cannot click past.
-  if (!certificateCovers(certPath, required)) {
+  if (!certificateIsUsable(certPath, keyPath, required)) {
     mkdirSync(directory, { recursive: true });
     generateCertificate(certPath, keyPath, required);
   }
@@ -55,9 +55,9 @@ export function coversSubjectAltNames(certificateNames: string[], required: stri
   return required.every((name) => certificateNames.includes(name));
 }
 
-// `openssl x509 -ext subjectAltName` prints the names one indented line at a
-// time, spelling addresses `IP Address:` where the request that made them says
-// `IP:`.
+// Read out of the printed certificate, where the names sit one indented line at
+// a time and addresses are spelled `IP Address:` — the request that asked for
+// them says `IP:`.
 export function parseSubjectAltNames(printedExtension: string): string[] {
   const names: string[] = [];
   for (const part of printedExtension.split(/[\n,]/)) {
@@ -69,15 +69,26 @@ export function parseSubjectAltNames(printedExtension: string): string[] {
   return names;
 }
 
-function certificateCovers(certPath: string, required: string[]): boolean {
+// Anything the certificate on disk cannot do — missing key, expired, truncated
+// by an interrupted first run, unreadable by this openssl — means the same
+// thing here: it is not what we serve, so issue one that is.
+function certificateIsUsable(certPath: string, keyPath: string, required: string[]): boolean {
   try {
     readFileSync(certPath);
+    readFileSync(keyPath);
   } catch {
     return false;
   }
 
-  const printed = openssl(["x509", "-noout", "-ext", "subjectAltName", "-in", certPath]);
-  return coversSubjectAltNames(parseSubjectAltNames(printed), required);
+  if (opensslStatus(["x509", "-noout", "-checkend", "0", "-in", certPath]) !== 0) {
+    return false;
+  }
+
+  // `-ext subjectAltName` would be shorter, but the openssl macOS ships is
+  // LibreSSL and has no such option: printing the whole certificate is the
+  // reading both understand.
+  const printed = opensslOutput(["x509", "-noout", "-text", "-in", certPath]);
+  return printed !== null && coversSubjectAltNames(parseSubjectAltNames(printed), required);
 }
 
 function generateCertificate(certPath: string, keyPath: string, names: string[]): void {
@@ -101,6 +112,8 @@ function generateCertificate(certPath: string, keyPath: string, names: string[])
     "-out",
     certPath,
   ]);
+  // OpenSSL writes the key 0600, LibreSSL writes it with the process umask.
+  chmodSync(keyPath, 0o600);
 }
 
 function certificateFingerprint(certPath: string): string {
@@ -116,6 +129,16 @@ function openssl(args: string[]): string {
     throw new Error(`openssl ${args[0]} failed: ${result.stderr.trim()}`);
   }
   return result.stdout;
+}
+
+// Inspecting a certificate answers a question; only issuing one has to succeed.
+function opensslStatus(args: string[]): number | null {
+  return spawnSync("openssl", args, { encoding: "utf8" }).status;
+}
+
+function opensslOutput(args: string[]): string | null {
+  const result = spawnSync("openssl", args, { encoding: "utf8" });
+  return result.status === 0 ? result.stdout : null;
 }
 
 function isIpAddress(host: string): boolean {

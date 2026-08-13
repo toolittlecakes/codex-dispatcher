@@ -614,6 +614,19 @@ async function runDoctor(options: CliOptions): Promise<boolean> {
     });
   }
 
+  // Serving the LAN directly means serving it over TLS — a phone gets no
+  // `crypto.randomUUID` otherwise and the webview dies on boot — and the
+  // certificate for it is issued by openssl at startup.
+  if (options.relay || options.tunnel !== null) {
+    checks.push({
+      label: "OpenSSL",
+      ok: true,
+      detail: options.relay ? "not needed; the relay terminates TLS" : "not needed; the tunnel terminates TLS",
+    });
+  } else {
+    checks.push(await checkExecutable("OpenSSL", "openssl", ["version"]));
+  }
+
   checks.push({
     label: "Server entry",
     ok: canStartServerProcess(),
