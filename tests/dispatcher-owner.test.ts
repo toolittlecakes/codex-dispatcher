@@ -76,6 +76,21 @@ describe("dispatcher owner IPC helpers", () => {
     expect(conversation.hostId).toBe(dispatcherIpcHostId);
   });
 
+  test("titles the conversation from the thread name the webview reads it from", () => {
+    expect(buildOwnerConversationState("thread-1", { name: "  Fix the bus  ", turns: [] }, undefined, []).title).toBe(
+      "Fix the bus",
+    );
+    // An unnamed thread is the common case: the app-server thread has no title.
+    expect(buildOwnerConversationState("thread-1", { turns: [] }, undefined, []).title).toBeNull();
+  });
+
+  test("always carries a collaboration mode, which the follower reads through without a guard", () => {
+    expect(buildOwnerConversationState("thread-1", { turns: [] }, undefined, []).latestCollaborationMode).toEqual({
+      mode: "default",
+      settings: { model: "", reasoning_effort: null, developer_instructions: null },
+    });
+  });
+
   test("keeps what the follower changed through us across a thread re-read", () => {
     const previous = minimalOwnerConversationState("thread-1", "/repo", []);
     applyThreadSettingsUpdate(previous, { model: "gpt-5.4", permissions: "read-only" });

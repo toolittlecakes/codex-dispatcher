@@ -48,7 +48,9 @@ export function buildOwnerConversationState(
     createdAt: timestamps.createdAt,
     updatedAt: timestamps.updatedAt,
     recencyAt: timestamps.recencyAt ?? timestamps.updatedAt,
-    title: thread.title ?? null,
+    // `Fb(thread.name)`: the app-server thread has no `title` at all, and the
+    // name is what every conversation the webview builds takes its title from.
+    title: threadTitle(thread.name),
     source: thread.source ?? null,
     threadSource: thread.threadSource ?? "user",
     historyMode: thread.historyMode ?? null,
@@ -59,7 +61,7 @@ export function buildOwnerConversationState(
     latestModel: previous?.latestModel ?? "",
     latestReasoningEffort: previous?.latestReasoningEffort ?? null,
     previousTurnModel: previous?.previousTurnModel ?? null,
-    latestCollaborationMode: previous?.latestCollaborationMode ?? null,
+    latestCollaborationMode: previous?.latestCollaborationMode ?? defaultCollaborationMode(),
     hasUnreadTurn: false,
     threadRuntimeStatus: thread.status ?? null,
     rolloutPath: thread.path ?? "",
@@ -97,6 +99,22 @@ export function minimalOwnerConversationState(
     undefined,
     requests,
   );
+}
+
+// Every conversation the webview builds carries a mode, and the code that reads
+// it — settings merges, turn starts, the model label — reaches straight through
+// to `.settings.model`. A null here is the same crash E21 was, one field over.
+function defaultCollaborationMode(): JsonObject {
+  return { mode: "default", settings: { model: "", reasoning_effort: null, developer_instructions: null } };
+}
+
+function threadTitle(name: JsonValue | undefined): string | null {
+  if (typeof name !== "string") {
+    return null;
+  }
+
+  const trimmed = name.trim();
+  return trimmed.length > 0 ? trimmed : null;
 }
 
 // `Ob`: seconds on the wire, milliseconds in the store.
