@@ -725,7 +725,10 @@ select,
 
     if (endpoint === "get-setting") {
       const key = requireString(requireObject(body, "get-setting params").key, "key");
-      return { handled: true, result: { value: this.state.storedSetting(key) ?? this.settingDefault(key) ?? null } };
+      // The table is consulted first, as the extension does: a value left in our
+      // store by a version that still had the setting is not an answer.
+      const fallback = this.settingDefault(key);
+      return { handled: true, result: { value: this.state.storedSetting(key) ?? fallback ?? null } };
     }
 
     if (endpoint === "set-setting") {

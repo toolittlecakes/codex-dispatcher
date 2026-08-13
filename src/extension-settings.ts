@@ -196,6 +196,11 @@ function resolve(bindings: Map<string, Node>, node: Node, locals: Map<string, un
         throw new Error("Setting definition reads a property of something that is not an object");
       }
       const name = node.computed ? String(resolve(bindings, node.property, locals)) : node.property.name;
+      // A member that is not there reads as `undefined`, which is also a legal
+      // default — so a renamed constant would drop a default instead of failing.
+      if (!(name in object)) {
+        throw new Error(`Setting definition reads ${name}, which its object does not have`);
+      }
       return object[name];
     }
     default:
