@@ -1,6 +1,6 @@
 import { randomUUID } from "node:crypto";
-import { existsSync, mkdirSync, unlinkSync } from "node:fs";
-import { tmpdir } from "node:os";
+import { chmodSync, existsSync, lstatSync, mkdirSync, unlinkSync } from "node:fs";
+import { homedir, tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { createServer, Socket, type Server } from "node:net";
 import type { JsonObject, JsonValue } from "./codex-app-server";
@@ -148,15 +148,46 @@ const methodVersions: Record<string, number> = {
   "thread-queued-followups-changed": 1,
 };
 
-export function getCodexIpcSocketPath(): string {
+// Where the extension's own router lives (`gT` in out/extension.js). The
+// directory is the extension's to own, so the same ownership check guards it:
+// a bus under someone else's socket is a bus we must not join.
+export function codexIpcEndpoint(): string {
   if (process.platform === "win32") {
     return join("\\\\.\\pipe", "codex-ipc");
   }
 
-  const socketDirectory = join(tmpdir(), "codex-ipc");
-  mkdirSync(socketDirectory, { recursive: true });
+  const directory = join(process.env.CODEX_HOME ?? join(homedir(), ".codex"), "ipc");
+  mkdirSync(directory, { mode: 0o700, recursive: true });
+  const stats = lstatSync(directory);
   const uid = process.getuid?.();
-  return join(socketDirectory, uid ? `ipc-${uid}.sock` : "ipc.sock");
+  if (uid == null || !stats.isDirectory() || stats.uid !== uid) {
+    throw new Error("Codex IPC directory is not owned by the current user");
+  }
+  chmodSync(directory, 0o700);
+
+  return join(directory, "ipc.sock");
+}
+
+// The endpoint the extension used before it moved into CODEX_HOME (`Lye`). It
+// still joins one there when it finds it, so a dispatcher that started first
+// and owns this socket keeps working.
+export function legacyCodexIpcSocketPath(): string {
+  const uid = process.getuid?.();
+  return join(tmpdir(), "codex-ipc", uid ? `ipc-${uid}.sock` : "ipc.sock");
+}
+
+function isOwnedSocket(path: string): boolean {
+  const uid = process.getuid?.();
+  if (uid == null) {
+    return false;
+  }
+
+  try {
+    const stats = lstatSync(path);
+    return stats.isSocket() && stats.uid === uid;
+  } catch {
+    return false;
+  }
 }
 
 export class CodexIpcBridge {
@@ -174,11 +205,12 @@ export class CodexIpcBridge {
   private status: CodexIpcSnapshot["status"] = "starting";
   private detail: string | null = null;
 
-  readonly socketPath: string;
+  // Unset until start resolves it: which bus we are on is the answer to «is
+  // anyone already hosting one», and that is only knowable at connect time.
+  socketPath = "";
 
-  constructor(socketPath: string = getCodexIpcSocketPath()) {
-    this.socketPath = socketPath;
-    this.routerManager = new IpcRouterManager(socketPath);
+  constructor(private readonly fixedSocketPath?: string) {
+    this.routerManager = new IpcRouterManager(fixedSocketPath);
   }
 
   onEvent(listener: (event: CodexIpcEvent) => void): () => void {
@@ -211,7 +243,7 @@ export class CodexIpcBridge {
 
     this.setStatus("starting");
     try {
-      await this.routerManager.startRouterIfNeeded();
+      this.socketPath = await this.routerManager.resolveEndpoint();
     } catch (error) {
       this.setStatus("error", toError(error).message);
       this.scheduleReconnect(clientType);
@@ -554,16 +586,40 @@ export class CodexIpcBridge {
 class IpcRouterManager {
   private server: Server | null = null;
   private router: IpcRouter | null = null;
+  private socketPath = "";
   private started = false;
   private ownsSocket = false;
 
-  constructor(private readonly socketPath: string) {}
+  constructor(private readonly fixedSocketPath?: string) {}
 
-  async startRouterIfNeeded(): Promise<void> {
-    if (this.started || (await this.canConnectToSocket())) {
-      return;
+  // The extension's own resolution order (`getOrStartRouterEndpoint`), and it
+  // has to be ours too: pick a different endpoint and both sides sit on a bus
+  // of one, each convinced it is connected.
+  async resolveEndpoint(): Promise<string> {
+    if (this.started) {
+      return this.socketPath;
     }
 
+    this.socketPath = this.fixedSocketPath ?? codexIpcEndpoint();
+    if (await this.canConnectToSocket(this.socketPath)) {
+      return this.socketPath;
+    }
+
+    if (!this.fixedSocketPath && process.platform !== "win32") {
+      // Whoever is on the old endpoint got there first and the extension will
+      // join them, so we join them too rather than splitting the bus.
+      const legacyPath = legacyCodexIpcSocketPath();
+      if (isOwnedSocket(legacyPath) && (await this.canConnectToSocket(legacyPath))) {
+        this.socketPath = legacyPath;
+        return this.socketPath;
+      }
+    }
+
+    await this.startRouter();
+    return this.socketPath;
+  }
+
+  private async startRouter(): Promise<void> {
     if (process.platform !== "win32" && existsSync(this.socketPath)) {
       unlinkSync(this.socketPath);
     }
@@ -613,7 +669,7 @@ class IpcRouterManager {
     this.ownsSocket = false;
   }
 
-  private canConnectToSocket(): Promise<boolean> {
+  private canConnectToSocket(socketPath: string): Promise<boolean> {
     return new Promise((resolve) => {
       // Listener first: connecting to a socket path that does not exist reports
       // ENOENT before connect() returns, and an unhandled error here would fail
@@ -622,7 +678,7 @@ class IpcRouterManager {
       socket.on("error", () => {
         resolve(false);
       });
-      socket.connect(this.socketPath, () => {
+      socket.connect(socketPath, () => {
         socket.end();
         resolve(true);
       });

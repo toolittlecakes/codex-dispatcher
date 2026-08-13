@@ -1,10 +1,15 @@
 import { describe, expect, test } from "bun:test";
-import { mkdtempSync, readFileSync, rmSync } from "node:fs";
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync } from "node:fs";
 import { homedir, tmpdir } from "node:os";
-import { dirname } from "node:path";
 import { Socket } from "node:net";
-import { join } from "node:path";
-import { CodexIpcBridge, ipcMethodVersion, type IpcBroadcastMessage } from "../src/codex-ipc";
+import { dirname, join } from "node:path";
+import {
+  CodexIpcBridge,
+  codexIpcEndpoint,
+  ipcMethodVersion,
+  legacyCodexIpcSocketPath,
+  type IpcBroadcastMessage,
+} from "../src/codex-ipc";
 import { selectExtensionWebviewRoot } from "../src/extension-webview";
 
 type Collected = { method: string; params: unknown }[];
@@ -30,6 +35,17 @@ async function waitForClientId(bridge: CodexIpcBridge): Promise<string> {
     await Bun.sleep(10);
   }
   throw new Error("bridge never registered with the router");
+}
+
+async function waitFor(condition: () => boolean): Promise<void> {
+  const deadline = Date.now() + 2_000;
+  while (Date.now() < deadline) {
+    if (condition()) {
+      return;
+    }
+    await Bun.sleep(10);
+  }
+  throw new Error("condition never held");
 }
 
 type RawMessage = {
@@ -219,6 +235,86 @@ describe("codex ipc", () => {
       bridge.stop();
       rmSync(root, { recursive: true, force: true });
     }
+  });
+
+  // Which socket we pick is not a detail: the extension resolves its endpoint
+  // in a fixed order, and a dispatcher that picks differently ends up alone on
+  // a bus of one — connected, healthy-looking and talking to nobody.
+  describe("endpoint resolution", () => {
+    async function withCodexHome(run: (home: string, legacyRoot: string) => Promise<void>): Promise<void> {
+      const home = mkdtempSync(join(tmpdir(), "codex-home-"));
+      const legacyRoot = mkdtempSync(join(tmpdir(), "codex-legacy-"));
+      const previousHome = process.env.CODEX_HOME;
+      const previousTmp = process.env.TMPDIR;
+      process.env.CODEX_HOME = home;
+      process.env.TMPDIR = legacyRoot;
+      try {
+        await run(home, legacyRoot);
+      } finally {
+        if (previousHome === undefined) {
+          delete process.env.CODEX_HOME;
+        } else {
+          process.env.CODEX_HOME = previousHome;
+        }
+        if (previousTmp === undefined) {
+          delete process.env.TMPDIR;
+        } else {
+          process.env.TMPDIR = previousTmp;
+        }
+        rmSync(home, { recursive: true, force: true });
+        rmSync(legacyRoot, { recursive: true, force: true });
+      }
+    }
+
+    test("hosts the bus where the extension looks for it", async () => {
+      await withCodexHome(async (home) => {
+        const bridge = new CodexIpcBridge();
+        try {
+          await bridge.start();
+          expect(bridge.socketPath).toBe(join(home, "ipc", "ipc.sock"));
+          expect(existsSync(bridge.socketPath)).toBe(true);
+        } finally {
+          bridge.stop();
+        }
+      });
+    });
+
+    test("joins the bus already hosted there instead of starting a second one", async () => {
+      await withCodexHome(async (home) => {
+        const host = new CodexIpcBridge();
+        const guest = new CodexIpcBridge();
+        try {
+          await host.start("host-client");
+          await guest.start("guest-client");
+          expect(guest.socketPath).toBe(join(home, "ipc", "ipc.sock"));
+          const guestId = await waitForClientId(guest);
+          await waitFor(() => host.getSnapshot().peers.some((peer) => peer.clientId === guestId));
+        } finally {
+          guest.stop();
+          host.stop();
+        }
+      });
+    });
+
+    // The extension still joins a live socket at the old location, so leaving it
+    // for the newer one would split the two of us across two buses.
+    test("falls in behind whoever is on the endpoint the extension used before", async () => {
+      await withCodexHome(async () => {
+        const legacyPath = legacyCodexIpcSocketPath();
+        mkdirSync(dirname(legacyPath), { recursive: true });
+        const legacyHost = new CodexIpcBridge(legacyPath);
+        const bridge = new CodexIpcBridge();
+        try {
+          await legacyHost.start("legacy-host");
+          await bridge.start();
+          expect(bridge.socketPath).toBe(legacyPath);
+          expect(existsSync(codexIpcEndpoint())).toBe(false);
+        } finally {
+          bridge.stop();
+          legacyHost.stop();
+        }
+      });
+    });
   });
 
   // Loading a long thread's history is a five-minute call. The router runs its
