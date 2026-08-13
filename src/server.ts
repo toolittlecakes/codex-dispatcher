@@ -627,7 +627,19 @@ function releaseDispatcherOwnership(threadId: string): void {
   }
 }
 
+// The gate stands for "the app server will answer thread/read for this thread",
+// and a thread carrying turns has passed the first user message that makes it
+// readable. A resumed or forked thread arrives that way, long before any
+// `turn/started` of ours.
+function noteDispatcherOwnedThreadIsReadable(threadId: string, thread: JsonObject): void {
+  const turns = thread.turns;
+  if (Array.isArray(turns) && turns.length > 0) {
+    dispatcherOwnedThreadsWithTurns.add(threadId);
+  }
+}
+
 function adoptDispatcherOwnedThread(threadId: string, thread: JsonObject): void {
+  noteDispatcherOwnedThreadIsReadable(threadId, thread);
   dispatcherOwnedConversations.set(
     threadId,
     conversationFromThread(threadId, thread, dispatcherOwnedConversations.get(threadId)),
@@ -719,6 +731,7 @@ async function readDispatcherOwnedConversation(threadId: string): Promise<void> 
     return;
   }
 
+  noteDispatcherOwnedThreadIsReadable(threadId, thread);
   dispatcherOwnedConversations.set(
     threadId,
     conversationFromThread(threadId, thread, dispatcherOwnedConversations.get(threadId)),
