@@ -1,4 +1,4 @@
-import { timingSafeEqual } from "node:crypto";
+import { createHash, timingSafeEqual } from "node:crypto";
 import { existsSync, readFileSync, readdirSync } from "node:fs";
 import { homedir, platform, release } from "node:os";
 import { basename, dirname, join, resolve, sep } from "node:path";
@@ -97,6 +97,9 @@ const externalFetchAttempts = 3;
 const externalFetchBaseBackoffMs = 300;
 const externalFetchMaxBackoffMs = 2_000;
 const chatgptOriginator = "codex_vscode";
+// `Ee.LOCAL_PROJECTS` / `Ee.SELECTED_PROJECT` in out/extension.js.
+const localProjectsStateKey = "local-projects";
+const selectedProjectStateKey = "selected-project";
 const maxReplayEvents = 500;
 const detachedClientRetentionMs = 5 * 60_000;
 // The follower endpoints the webview actually calls (its `requestThreadFollower`
@@ -560,7 +563,30 @@ select,
     // endpoint table below it.
     if (endpoint === "get-global-state") {
       const key = asObject(body)?.key;
-      return { handled: true, result: { value: typeof key === "string" ? this.state.globalValue(key) : null } };
+      if (typeof key !== "string") {
+        return { handled: true, result: { value: null } };
+      }
+
+      // The extension does not store the open project — it derives one from the
+      // window's workspace folders every time it is asked (`$W(Ib())`). Answer
+      // from our own workspace or the composer has no cwd to run a turn in and
+      // refuses to send anything at all.
+      const project = workspaceProject([this.defaultCwd]);
+      if (key === localProjectsStateKey) {
+        return { handled: true, result: { value: project ? { [String(project.id)]: project } : {} } };
+      }
+      if (key === selectedProjectStateKey) {
+        const stored = asObject(this.state.globalValue(key));
+        if (stored?.type === "remote" && typeof stored.projectId === "string") {
+          return { handled: true, result: { value: stored } };
+        }
+        return {
+          handled: true,
+          result: { value: project ? { type: "local", projectId: project.id } : null },
+        };
+      }
+
+      return { handled: true, result: { value: this.state.globalValue(key) } };
     }
 
     if (endpoint === "set-global-state") {
@@ -1465,6 +1491,23 @@ export async function handleVSCodeRequest(
     default:
       throw new Error(`Unsupported vscode://codex/${endpoint}`);
   }
+}
+
+// `$W` in out/extension.js: the project id is a hash of the roots, so every
+// client that opens the same folders agrees on it without storing anything.
+function workspaceProject(roots: string[]): JsonObject | null {
+  const first = roots[0];
+  if (!first) {
+    return null;
+  }
+
+  return {
+    id: `vscode-${createHash("sha256").update(roots.join("\0")).digest("hex").slice(0, 32)}`,
+    name: basename(first) || first,
+    rootPaths: roots,
+    createdAt: 1,
+    updatedAt: 1,
+  };
 }
 
 export function makeFetchResponse(options: FetchResponseOptions): JsonObject {

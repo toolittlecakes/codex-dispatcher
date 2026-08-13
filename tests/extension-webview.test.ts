@@ -1209,6 +1209,65 @@ describe("extension webview", () => {
     }
   });
 
+  // Without a project the composer refuses to send anything at all: the cwd a
+  // turn would run in comes from here, and the extension answers from the
+  // window's folders rather than from anything it stored.
+  test("derives the open project from the workspace the dispatcher runs in", async () => {
+    const previousRoot = process.env.CODEX_EXTENSION_WEBVIEW_ROOT;
+    const root = mkdtempSync(join(tmpdir(), "codex-webview-project-"));
+    process.env.CODEX_EXTENSION_WEBVIEW_ROOT = root;
+    writeFileSync(join(root, "index.html"), "<html><head></head><body></body></html>");
+
+    try {
+      const webview = new ExtensionWebview({
+        appServer: {} as never,
+        defaultCwd: "/repo/checkout",
+        getToken: () => "secret",
+      });
+      const stream = await openEventStream(webview, "tab-1");
+      const readState = async (key: string, index: number) => {
+        await webview.fetch(
+          new Request("http://localhost/host-message", {
+            method: "POST",
+            headers: { cookie: "codex_dispatcher_webview=secret", "x-dispatcher-client": "tab-1" },
+            body: JSON.stringify({ messages: [{
+              type: "fetch",
+              requestId: `req-${key}`,
+              url: "vscode://codex/get-global-state",
+              method: "POST",
+              body: JSON.stringify({ key }),
+            }] }),
+          }),
+          new URL("http://localhost/host-message"),
+        );
+        const messages = await stream.waitFor(index);
+        return JSON.parse((messages[index - 1] as { bodyJsonString: string }).bodyJsonString).value;
+      };
+
+      const projects = await readState("local-projects", 1);
+      const projectId = Object.keys(projects)[0] ?? "";
+      // The id is a hash of the roots, so every client that opens the same
+      // folder agrees on it without anyone storing it.
+      expect(projectId).toMatch(/^vscode-[0-9a-f]{32}$/);
+      expect(projects[projectId]).toEqual({
+        id: projectId,
+        name: "checkout",
+        rootPaths: ["/repo/checkout"],
+        createdAt: 1,
+        updatedAt: 1,
+      });
+      expect(await readState("selected-project", 2)).toEqual({ type: "local", projectId });
+      await stream.cancel();
+    } finally {
+      if (previousRoot === undefined) {
+        delete process.env.CODEX_EXTENSION_WEBVIEW_ROOT;
+      } else {
+        process.env.CODEX_EXTENSION_WEBVIEW_ROOT = previousRoot;
+      }
+      rmSync(root, { recursive: true, force: true });
+    }
+  });
+
   // The webview has no credentials of its own: it asks the host for every
   // backend call precisely because the host is the one holding the account.
   test("signs backend calls with the account token the app server hands out", async () => {
