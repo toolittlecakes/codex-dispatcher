@@ -37,7 +37,7 @@ const extensionWebview = new ExtensionWebview({
   getEventReplayMessages: () => buildExtensionEventReplayMessages(),
   assertThreadFollowerOwner: (conversationId) => assertExtensionFollowerOwner(conversationId),
   getThreadRole: (conversationId) => extensionThreadRole(conversationId),
-  handleFollowerRequest: (method, params) => handleExtensionFollowerRequest(method, params),
+  handleFollowerRequest: (method, params, signal) => handleExtensionFollowerRequest(method, params, signal),
   getBridgeState: () => buildBridgeDebugState(),
   ipcCoordination: {
     broadcast: (method, params, targetClientIds) => broadcastForWebview(method, params, targetClientIds),
@@ -928,14 +928,14 @@ async function requestForWebview(
   return outcome;
 }
 
-async function handleExtensionFollowerRequest(method: string, params: JsonValue): Promise<JsonValue> {
+async function handleExtensionFollowerRequest(method: string, params: JsonValue, signal: AbortSignal): Promise<JsonValue> {
   const threadId = requestThreadId({ params });
   const ownerClientId = threadId ? streamOwners.get(threadId) : null;
   if (!ownerClientId) {
     throw new Error(`No IPC owner for thread ${threadId ?? "unknown"}`);
   }
 
-  const response = await ipcBridge.request(method, params, { targetClientId: ownerClientId });
+  const response = await ipcBridge.request(method, params, { targetClientId: ownerClientId, signal });
   if (response.resultType === "error") {
     throw new Error(response.error ?? `${method} failed`);
   }

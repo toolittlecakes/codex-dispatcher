@@ -379,7 +379,7 @@ export class CodexIpcBridge {
   request(
     method: string,
     params: JsonValue,
-    options: { targetClientId?: string | undefined; timeoutMs?: number | undefined } = {},
+    options: { targetClientId?: string | undefined; timeoutMs?: number | undefined; signal?: AbortSignal | undefined } = {},
   ): Promise<IpcResponseMessage> {
     return this.sendRequest(method, params, options);
   }
@@ -506,7 +506,7 @@ export class CodexIpcBridge {
   private sendRequest(
     method: string,
     params: JsonValue,
-    options: { targetClientId?: string | undefined; timeoutMs?: number | undefined } = {},
+    options: { targetClientId?: string | undefined; timeoutMs?: number | undefined; signal?: AbortSignal | undefined } = {},
   ): Promise<IpcResponseMessage> {
     const socket = this.socket;
     if (!socket || !socket.writable) {
@@ -534,7 +534,21 @@ export class CodexIpcBridge {
         reject(new Error("timeout"));
       }, options.timeoutMs ?? requestTimeoutMs);
 
-      this.pendingResponses.set(request.requestId, { timer, resolve, reject });
+      // A caller that stopped waiting — the webview cancelling its fetch — must
+      // stop us waiting too: with E14's long deadlines the owner's answer can be
+      // minutes away, and nobody is there to read it.
+      const settled = new AbortController();
+      const finish = <T>(settle: (value: T) => void) => (value: T) => {
+        settled.abort();
+        settle(value);
+      };
+      options.signal?.addEventListener("abort", () => {
+        clearTimeout(timer);
+        this.pendingResponses.delete(request.requestId);
+        reject(new Error("cancelled"));
+      }, { once: true, signal: settled.signal });
+
+      this.pendingResponses.set(request.requestId, { timer, resolve: finish(resolve), reject: finish(reject) });
       writeFrame(socket, request);
     });
   }

@@ -1551,6 +1551,230 @@ describe("extension webview", () => {
     }
   });
 
+  // Four attempts and then the last failure, as `cP.fetch` reports it: a 501
+  // from the outer catch instead would tell the webview the host itself broke.
+  test("gives up on a backend that never answers with the last error it saw", async () => {
+    const previousRoot = process.env.CODEX_EXTENSION_WEBVIEW_ROOT;
+    const root = mkdtempSync(join(tmpdir(), "codex-webview-budget-"));
+    process.env.CODEX_EXTENSION_WEBVIEW_ROOT = root;
+    writeFileSync(join(root, "index.html"), "<html><head></head><body></body></html>");
+
+    let attempts = 0;
+    const originalFetch = globalThis.fetch;
+    globalThis.fetch = (async () => {
+      attempts += 1;
+      throw new TypeError(`fetch failed #${attempts}`);
+    }) as typeof fetch;
+
+    const appServer = { request: () => Promise.resolve({}), onEvent: () => () => {} };
+
+    try {
+      const webview = new ExtensionWebview({
+        appServer: appServer as never,
+        defaultCwd: "/repo",
+        getToken: () => "secret",
+      });
+      const stream = await openEventStream(webview, "tab-1");
+      await webview.fetch(
+        new Request("http://localhost/host-message", {
+          method: "POST",
+          headers: { cookie: "codex_dispatcher_webview=secret", "x-dispatcher-client": "tab-1" },
+          body: JSON.stringify({ messages: [{
+            type: "fetch",
+            requestId: "req-1",
+            url: "/wham/tasks/list",
+            method: "GET",
+          }] }),
+        }),
+        new URL("http://localhost/host-message"),
+      );
+
+      const [response] = await stream.waitFor(1, 10_000);
+      expect(response).toMatchObject({ responseType: "error", status: 432, error: "fetch failed #4" });
+      expect(attempts).toBe(4);
+      await stream.cancel();
+    } finally {
+      globalThis.fetch = originalFetch;
+      if (previousRoot === undefined) {
+        delete process.env.CODEX_EXTENSION_WEBVIEW_ROOT;
+      } else {
+        process.env.CODEX_EXTENSION_WEBVIEW_ROOT = previousRoot;
+      }
+      rmSync(root, { recursive: true, force: true });
+    }
+  });
+
+  // The webview resolves a success by parsing `bodyJsonString`, so a 2xx whose
+  // JSON does not parse is a failed exchange, not something to pass along.
+  test("retries a 2xx whose json body is broken", async () => {
+    const previousRoot = process.env.CODEX_EXTENSION_WEBVIEW_ROOT;
+    const root = mkdtempSync(join(tmpdir(), "codex-webview-badjson-"));
+    process.env.CODEX_EXTENSION_WEBVIEW_ROOT = root;
+    writeFileSync(join(root, "index.html"), "<html><head></head><body></body></html>");
+
+    let attempts = 0;
+    const originalFetch = globalThis.fetch;
+    globalThis.fetch = (async () => {
+      attempts += 1;
+      const body = attempts === 1 ? "<html>gateway</html>" : JSON.stringify({ ok: true });
+      return new Response(body, { headers: { "content-type": "application/json" } });
+    }) as typeof fetch;
+
+    const appServer = { request: () => Promise.resolve({}), onEvent: () => () => {} };
+
+    try {
+      const webview = new ExtensionWebview({
+        appServer: appServer as never,
+        defaultCwd: "/repo",
+        getToken: () => "secret",
+      });
+      const stream = await openEventStream(webview, "tab-1");
+      await webview.fetch(
+        new Request("http://localhost/host-message", {
+          method: "POST",
+          headers: { cookie: "codex_dispatcher_webview=secret", "x-dispatcher-client": "tab-1" },
+          body: JSON.stringify({ messages: [{
+            type: "fetch",
+            requestId: "req-1",
+            url: "/wham/tasks/list",
+            method: "GET",
+          }] }),
+        }),
+        new URL("http://localhost/host-message"),
+      );
+
+      const [response] = await stream.waitFor(1, 5_000);
+      expect(response).toMatchObject({ responseType: "success", status: 200, bodyJsonString: JSON.stringify({ ok: true }) });
+      expect(attempts).toBe(2);
+      await stream.cancel();
+    } finally {
+      globalThis.fetch = originalFetch;
+      if (previousRoot === undefined) {
+        delete process.env.CODEX_EXTENSION_WEBVIEW_ROOT;
+      } else {
+        process.env.CODEX_EXTENSION_WEBVIEW_ROOT = previousRoot;
+      }
+      rmSync(root, { recursive: true, force: true });
+    }
+  });
+
+  // The base64 markers are a word between the webview and its host about how the
+  // body travels; the origin has no use for them and must never see them, on a
+  // GET least of all. Nor does the host name itself before the app server has.
+  test("keeps the host's own headers off the request it makes for the webview", async () => {
+    const previousRoot = process.env.CODEX_EXTENSION_WEBVIEW_ROOT;
+    const root = mkdtempSync(join(tmpdir(), "codex-webview-headers-"));
+    process.env.CODEX_EXTENSION_WEBVIEW_ROOT = root;
+    writeFileSync(join(root, "index.html"), "<html><head></head><body></body></html>");
+
+    let seen: Headers | null = null;
+    const origin = Bun.serve({
+      port: 0,
+      fetch(request) {
+        seen = request.headers;
+        return new Response("{}", { headers: { "content-type": "application/json" } });
+      },
+    });
+
+    const appServer = { request: () => Promise.resolve({}), onEvent: () => () => {} };
+
+    try {
+      const webview = new ExtensionWebview({
+        appServer: appServer as never,
+        defaultCwd: "/repo",
+        getToken: () => "secret",
+      });
+      const stream = await openEventStream(webview, "tab-1");
+      await webview.fetch(
+        new Request("http://localhost/host-message", {
+          method: "POST",
+          headers: { cookie: "codex_dispatcher_webview=secret", "x-dispatcher-client": "tab-1" },
+          body: JSON.stringify({ messages: [{
+            type: "fetch",
+            requestId: "req-1",
+            url: `${origin.url.origin}/anything`,
+            method: "GET",
+            headers: { "x-codex-base64": "1", "x-codex-binary-response": "1" },
+          }] }),
+        }),
+        new URL("http://localhost/host-message"),
+      );
+
+      const [response] = await stream.waitFor(1);
+      expect(response).toMatchObject({ responseType: "success", status: 200 });
+      expect(seen!.get("x-codex-base64")).toBeNull();
+      expect(seen!.get("x-codex-binary-response")).toBeNull();
+      expect(seen!.get("originator")).toBe("codex_vscode");
+      // Nothing on the wire may say Bun: the app server has not named this client
+      // yet, so it goes out under the extension's own fallback name.
+      expect(seen!.get("user-agent")).toBe("codex_vscode");
+      await stream.cancel();
+    } finally {
+      await origin.stop(true);
+      if (previousRoot === undefined) {
+        delete process.env.CODEX_EXTENSION_WEBVIEW_ROOT;
+      } else {
+        process.env.CODEX_EXTENSION_WEBVIEW_ROOT = previousRoot;
+      }
+      rmSync(root, { recursive: true, force: true });
+    }
+  });
+
+  // A follower call waits on another client of the bus, and E14 made that wait
+  // long on purpose. `cancel-fetch` has to reach it too.
+  test("cancels a follower call that is still waiting on the bus", async () => {
+    const previousRoot = process.env.CODEX_EXTENSION_WEBVIEW_ROOT;
+    const root = mkdtempSync(join(tmpdir(), "codex-webview-followercancel-"));
+    process.env.CODEX_EXTENSION_WEBVIEW_ROOT = root;
+    writeFileSync(join(root, "index.html"), "<html><head></head><body></body></html>");
+
+    const appServer = { request: () => Promise.resolve({}), onEvent: () => () => {} };
+
+    try {
+      const webview = new ExtensionWebview({
+        appServer: appServer as never,
+        defaultCwd: "/repo",
+        getToken: () => "secret",
+        handleFollowerRequest: (_method, _params, signal) =>
+          new Promise<JsonValue>((_resolve, reject) => {
+            signal.addEventListener("abort", () => reject(new Error("cancelled")), { once: true });
+          }),
+      });
+      const stream = await openEventStream(webview, "tab-1");
+      const post = (message: JsonValue) =>
+        webview.fetch(
+          new Request("http://localhost/host-message", {
+            method: "POST",
+            headers: { cookie: "codex_dispatcher_webview=secret", "x-dispatcher-client": "tab-1" },
+            body: JSON.stringify({ messages: [message] }),
+          }),
+          new URL("http://localhost/host-message"),
+        );
+
+      const pending = post({
+        type: "fetch",
+        requestId: "req-1",
+        url: "vscode://codex/thread-follower-load-complete-history-for-host",
+        method: "POST",
+        body: JSON.stringify({ hostId: "local", conversationId: "thread-1" }),
+      });
+      await Bun.sleep(50);
+      await post({ type: "cancel-fetch", requestId: "req-1" });
+      await pending;
+
+      const [response] = await stream.waitFor(1);
+      expect(response).toMatchObject({ responseType: "error", status: 433, error: "cancelled" });
+      await stream.cancel();
+    } finally {
+      if (previousRoot === undefined) {
+        delete process.env.CODEX_EXTENSION_WEBVIEW_ROOT;
+      } else {
+        process.env.CODEX_EXTENSION_WEBVIEW_ROOT = previousRoot;
+      }
+      rmSync(root, { recursive: true, force: true });
+    }
+  });
+
   test("persists extension host state across webview host restarts", async () => {
     const previousRoot = process.env.CODEX_EXTENSION_WEBVIEW_ROOT;
     const root = mkdtempSync(join(tmpdir(), "codex-webview-state-"));

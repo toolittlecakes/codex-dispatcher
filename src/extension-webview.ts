@@ -47,7 +47,7 @@ type ExtensionWebviewOptions = {
   statePath?: string;
   assertThreadFollowerOwner?: (conversationId: string) => Promise<void> | void;
   getThreadRole?: (conversationId: string) => string | Promise<string>;
-  handleFollowerRequest?: (method: string, params: JsonValue) => Promise<JsonValue>;
+  handleFollowerRequest?: (method: string, params: JsonValue, signal: AbortSignal) => Promise<JsonValue>;
   ipcCoordination?: WebviewIpcCoordination;
   // Who is on the bus and which threads are whose. The webview's own traffic
   // says nothing about either, and that is exactly what a follower session that
@@ -126,7 +126,7 @@ export class ExtensionWebview {
   private readonly getEventReplayMessages: (() => JsonObject[]) | undefined;
   private readonly assertThreadFollowerOwner: ((conversationId: string) => Promise<void> | void) | undefined;
   private readonly getThreadRole: ((conversationId: string) => string | Promise<string>) | undefined;
-  private readonly handleFollowerRequest: ((method: string, params: JsonValue) => Promise<JsonValue>) | undefined;
+  private readonly handleFollowerRequest: ((method: string, params: JsonValue, signal: AbortSignal) => Promise<JsonValue>) | undefined;
   private readonly ipcCoordination: WebviewIpcCoordination | undefined;
   private readonly getBridgeState: (() => JsonObject) | undefined;
   private readonly onThreadActivity: ((method: string, conversationId: string, thread?: JsonObject) => void) | undefined;
@@ -543,11 +543,18 @@ select,
 
   private async handleFetchMessage(message: HostMessage): Promise<JsonObject> {
     const requestId = typeof message.requestId === "string" ? message.requestId : undefined;
+    // The controller is registered before the `vscode://codex` branch, as it is
+    // in the bundle: a follower call waits on another client of the bus, which
+    // is exactly the wait a cancel needs to be able to cut.
+    const cancel = new AbortController();
+    if (requestId) {
+      this.externalFetches.set(requestId, cancel);
+    }
     try {
       if (typeof message.url === "string" && message.url.startsWith("vscode://codex/")) {
         const endpoint = parseVSCodeCodexEndpoint(message.url);
         const body = parseOptionalBody(message.body);
-        const hostResult = await this.handleVSCodeHostRequest(endpoint, body);
+        const hostResult = await this.handleVSCodeHostRequest(endpoint, body, cancel.signal);
         if (hostResult.handled) {
           return makeFetchResponse({ requestId, result: hostResult.result });
         }
@@ -555,31 +562,28 @@ select,
         return makeFetchResponse({ requestId, result });
       }
 
-      const cancel = new AbortController();
-      if (requestId) {
-        this.externalFetches.set(requestId, cancel);
-      }
-      try {
-        return await handleExternalFetch(message, requestId, (refreshToken) => this.readAuthToken(refreshToken), {
-          userAgent: this.backendUserAgent(),
-          cancelSignal: cancel.signal,
-        });
-      } finally {
-        if (requestId) {
-          this.externalFetches.delete(requestId);
-        }
-      }
+      return await handleExternalFetch(message, requestId, (refreshToken) => this.readAuthToken(refreshToken), {
+        userAgent: this.backendUserAgent(),
+        cancelSignal: cancel.signal,
+      });
     } catch (error) {
       return makeFetchResponse({
         requestId,
         error: error instanceof Error ? error.message : String(error),
-        status: 501,
+        status: 433,
       });
+    } finally {
+      if (requestId) {
+        this.externalFetches.delete(requestId);
+      }
     }
   }
 
   // `setUserAgent(initializeResult.userAgent ?? Pf)`: the app server names the
-  // client, and only falls back to the bare originator when it does not.
+  // client, and only falls back to the bare originator when it does not. Before
+  // it has answered, the extension sends no header at all — but a missing header
+  // is not a missing name here: Bun would put `Bun/<version>` on the wire, so the
+  // extension's own fallback is the closer thing to say.
   private backendUserAgent(): string {
     const userAgent = asObject(this.appServer.initialized)?.userAgent;
     return typeof userAgent === "string" && userAgent.length > 0 ? userAgent : chatgptOriginator;
@@ -588,6 +592,7 @@ select,
   private async handleVSCodeHostRequest(
     endpoint: string,
     body: JsonValue,
+    signal: AbortSignal,
   ): Promise<{ handled: true; result: JsonValue } | { handled: false }> {
     // Memento storage belongs to this host's state, not to the stateless
     // endpoint table below it.
@@ -652,7 +657,7 @@ select,
 
     return {
       handled: true,
-      result: await this.handleFollowerRequest(followerMethod, stripHostId(requireObject(body, `${endpoint} params`))),
+      result: await this.handleFollowerRequest(followerMethod, stripHostId(requireObject(body, `${endpoint} params`)), signal),
     };
   }
 
@@ -1631,8 +1636,14 @@ async function handleExternalFetch(
       }
 
       if (isRetryableFetchStatus(response.status) && attemptIndex < externalFetchAttempts) {
-        await Bun.sleep(externalFetchBackoffMs(attemptIndex));
-        return attempt(attemptIndex + 1, token);
+        await waitForRetry(externalFetchBackoffMs(attemptIndex), deadline);
+        // The deadline is terminal, and that has to include the wait between
+        // attempts: a retry started after it has passed can only produce an
+        // answer the relay has already stopped waiting for, so the status we
+        // are holding is the last true thing we know.
+        if (!deadline.aborted) {
+          return attempt(attemptIndex + 1, token);
+        }
       }
 
       return { type: "fetch-response", responseType: "error", requestId, status: response.status, error: response.statusText };
@@ -1643,8 +1654,10 @@ async function handleExternalFetch(
       // A dropped connection is what the retry budget is for; the extension
       // retries the throw exactly like a 5xx.
       if (!deadline.aborted && attemptIndex < externalFetchAttempts) {
-        await Bun.sleep(externalFetchBackoffMs(attemptIndex));
-        return attempt(attemptIndex + 1, token);
+        await waitForRetry(externalFetchBackoffMs(attemptIndex), deadline);
+        if (!deadline.aborted) {
+          return attempt(attemptIndex + 1, token);
+        }
       }
 
       return {
@@ -1723,6 +1736,23 @@ function chatgptAccountId(token: string): string | null {
 
 function isRetryableFetchStatus(status: number): boolean {
   return status === 408 || status === 425 || status === 429 || (status >= 500 && status <= 599);
+}
+
+// The backoff ends early when the deadline does, so that the exchange keeps the
+// 25s it promised instead of spending another full backoff past it.
+function waitForRetry(delayMs: number, deadline: AbortSignal): Promise<void> {
+  if (deadline.aborted) {
+    return Promise.resolve();
+  }
+  return new Promise((resolve) => {
+    const finish = (): void => {
+      clearTimeout(timer);
+      deadline.removeEventListener("abort", finish);
+      resolve();
+    };
+    const timer = setTimeout(finish, delayMs);
+    deadline.addEventListener("abort", finish, { once: true });
+  });
 }
 
 function externalFetchBackoffMs(attemptIndex: number): number {
