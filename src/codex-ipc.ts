@@ -529,26 +529,29 @@ export class CodexIpcBridge {
     }
 
     return new Promise((resolve, reject) => {
-      const timer = setTimeout(() => {
-        this.pendingResponses.delete(request.requestId);
-        reject(new Error("timeout"));
-      }, options.timeoutMs ?? requestTimeoutMs);
-
-      // A caller that stopped waiting — the webview cancelling its fetch — must
-      // stop us waiting too: with E14's long deadlines the owner's answer can be
-      // minutes away, and nobody is there to read it.
+      // Whichever way this request ends, it ends once: settling drops the
+      // subscription to the caller's signal along with it.
       const settled = new AbortController();
       const finish = <T>(settle: (value: T) => void) => (value: T) => {
         settled.abort();
         settle(value);
       };
+      const fail = finish(reject);
+
+      const timer = setTimeout(() => {
+        this.pendingResponses.delete(request.requestId);
+        fail(new Error("timeout"));
+      }, options.timeoutMs ?? requestTimeoutMs);
+
+      // A caller that stopped waiting — the webview cancelling its fetch — must
+      // stop us waiting too, so the answer nobody will read is not still owed.
       options.signal?.addEventListener("abort", () => {
         clearTimeout(timer);
         this.pendingResponses.delete(request.requestId);
-        reject(new Error("cancelled"));
+        fail(new Error("cancelled"));
       }, { once: true, signal: settled.signal });
 
-      this.pendingResponses.set(request.requestId, { timer, resolve: finish(resolve), reject: finish(reject) });
+      this.pendingResponses.set(request.requestId, { timer, resolve: finish(resolve), reject: fail });
       writeFrame(socket, request);
     });
   }

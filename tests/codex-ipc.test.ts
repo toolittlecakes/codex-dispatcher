@@ -479,6 +479,36 @@ describe("codex ipc", () => {
     }
   });
 
+  // A caller that gave up must stop being owed an answer: the webview cancels a
+  // fetch and the wait on the bus behind it has to end with it, not when the
+  // owner eventually replies.
+  test("gives up on a request whose caller cancelled it", async () => {
+    const root = mkdtempSync(join(tmpdir(), "codex-ipc-cancel-"));
+    const socketPath = join(root, "ipc.sock");
+
+    const sender = await connectedBridge(socketPath, []);
+    const peer = await rawIpcClient(socketPath);
+    try {
+      await waitForClientId(sender);
+      const cancel = new AbortController();
+      // Nothing answers it, and the deadline is far enough away that only the
+      // cancel can end this.
+      const pending = sender.request(
+        "thread-follower-load-complete-history",
+        { conversationId: "thread-1" },
+        { timeoutMs: 300_000, signal: cancel.signal },
+      );
+
+      await peer.waitForMessage((message) => message.type === "client-discovery-request");
+      cancel.abort();
+      await expect(pending).rejects.toThrow("cancelled");
+    } finally {
+      peer.close();
+      sender.stop();
+      rmSync(root, { recursive: true, force: true });
+    }
+  });
+
   // The one check that catches drift: every peer silently drops a broadcast or
   // request whose version is not the one it expects, so these numbers are only
   // ever right relative to the extension we are hosting.
