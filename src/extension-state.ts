@@ -7,6 +7,7 @@ import { isRecord } from "./shared";
 type PersistentExtensionState = {
   globalState: JsonObject;
   persistedAtomState: JsonObject;
+  settings: JsonObject;
 };
 
 export function extensionStatePath(): string {
@@ -21,6 +22,11 @@ export class ExtensionState {
   private readonly globalState = new Map<string, JsonValue>();
   private readonly persistedAtomState = new Map<string, JsonValue>();
   private readonly sharedObjectState = new Map<string, JsonValue>();
+  // VS Code spreads settings over three stores because it has three; which one
+  // a setting lands in is invisible to the webview, which reads and writes all
+  // of them through the same endpoints. So they get one store here, kept apart
+  // from the atoms only so that neither can shadow a key of the other.
+  private readonly settings = new Map<string, JsonValue>();
 
   constructor(private readonly path: string) {
     if (!existsSync(path)) {
@@ -34,6 +40,22 @@ export class ExtensionState {
     for (const [key, value] of Object.entries(state.persistedAtomState)) {
       this.persistedAtomState.set(key, value ?? null);
     }
+    for (const [key, value] of Object.entries(state.settings)) {
+      this.settings.set(key, value ?? null);
+    }
+  }
+
+  storedSetting(key: string): JsonValue | undefined {
+    return this.settings.get(key);
+  }
+
+  storedSettings(): JsonObject {
+    return Object.fromEntries(this.settings.entries()) as JsonObject;
+  }
+
+  setSetting(key: string, value: JsonValue): void {
+    this.settings.set(key, value);
+    this.write();
   }
 
   globalValue(key: string): JsonValue {
@@ -98,6 +120,7 @@ export class ExtensionState {
     const state: PersistentExtensionState = {
       globalState: Object.fromEntries(this.globalState.entries()) as JsonObject,
       persistedAtomState: this.persistedAtoms(),
+      settings: this.storedSettings(),
     };
     mkdirSync(dirname(this.path), { recursive: true });
     writeFileSync(this.path, `${JSON.stringify(state, null, 2)}\n`, { mode: 0o600 });
@@ -111,6 +134,7 @@ function parsePersistentExtensionState(value: unknown): PersistentExtensionState
   return {
     globalState: optionalStateObject(value.globalState, "globalState"),
     persistedAtomState: optionalStateObject(value.persistedAtomState, "persistedAtomState"),
+    settings: optionalStateObject(value.settings, "settings"),
   };
 }
 

@@ -20,6 +20,7 @@ import {
   pwaServiceWorkerPath,
   pwaServiceWorkerSource,
 } from "./pwa";
+import { readSettingDefinitions, type SettingDefinitions } from "./extension-settings";
 import { ExtensionState, extensionStatePath } from "./extension-state";
 import { cookieValues, isRecord, jsonResponse } from "./shared";
 import { WebviewRpcSession, parseRpcConnect, parseRpcMessage, type WebviewIpcCoordination } from "./webview-rpc";
@@ -154,6 +155,7 @@ export class ExtensionWebview {
   private readonly experimentalEnablementSetResults = new Map<string, JsonValue>();
   private readonly webviewRoot: string | null;
   private readonly state: ExtensionState;
+  private settingDefinitionsCache: SettingDefinitions | null = null;
 
   constructor(options: ExtensionWebviewOptions) {
     this.appServer = options.appServer;
@@ -635,6 +637,31 @@ select,
     return typeof userAgent === "string" && userAgent.length > 0 ? userAgent : chatgptOriginator;
   }
 
+  // Read once, on the first setting a webview asks for, out of the bundle whose
+  // webview we are serving: a table copied into this repository would drift from
+  // whichever extension version is actually installed, and the drift would be
+  // invisible — wrong defaults look exactly like a user's choices.
+  private settingDefinitions(): SettingDefinitions {
+    if (!this.settingDefinitionsCache) {
+      if (!this.webviewRoot) {
+        throw new Error("Codex VS Code extension was not found, so its settings cannot be read.");
+      }
+      this.settingDefinitionsCache = readSettingDefinitions(join(dirname(this.webviewRoot), "out", "extension.js"));
+    }
+    return this.settingDefinitionsCache;
+  }
+
+  // A setting with no default in the table has none to send: the extension
+  // answers `stored ?? undefined` there, and undefined is a key the webview
+  // never receives rather than a null it would store.
+  private settingDefault(key: string): JsonValue | undefined {
+    const definitions = this.settingDefinitions();
+    if (!definitions.has(key)) {
+      throw new Error(`Unknown setting: ${key}`);
+    }
+    return definitions.get(key);
+  }
+
   private async handleVSCodeHostRequest(
     endpoint: string,
     body: JsonValue,
@@ -678,29 +705,36 @@ select,
       return { handled: true, result: { success: true } };
     }
 
-    // The extension keeps each setting in whichever of VS Code's three stores its
-    // definition names — settings file, memento, persisted atom — and for the
-    // persisted-atom ones the webview reads the store itself, not the endpoint.
-    // We have one store, so every setting lives in that one: the split exists to
-    // serve VS Code's stores, and the only half of it a webview can see is the
-    // half we keep. Defaults are not ours to send — the webview carries the same
-    // table and falls back to `definition.default` on anything we do not answer.
+    // Which of VS Code's three stores a setting lives in is the extension's
+    // business, not the webview's: the webview reads and writes every setting
+    // through these three endpoints and never looks at the storage kind. So one
+    // store answers all of them — but the value it answers with is
+    // `stored ?? default`, exactly as the extension's `getSettingValue` does,
+    // because the webview's hook for a setting's *configured* value has no
+    // fallback of its own and reads a missing key as a deliberate one.
     if (endpoint === "get-settings") {
-      return { handled: true, result: { values: this.state.persistedAtoms() } };
+      const values: JsonObject = {};
+      for (const [key, fallback] of this.settingDefinitions()) {
+        const value = this.state.storedSetting(key) ?? fallback;
+        if (value !== undefined) {
+          values[key] = value;
+        }
+      }
+      return { handled: true, result: { values } };
     }
 
     if (endpoint === "get-setting") {
       const key = requireString(requireObject(body, "get-setting params").key, "key");
-      return { handled: true, result: { value: this.state.persistedAtoms()[key] ?? null } };
+      return { handled: true, result: { value: this.state.storedSetting(key) ?? this.settingDefault(key) ?? null } };
     }
 
     if (endpoint === "set-setting") {
       const params = requireObject(body, "set-setting params");
       const key = requireString(params.key, "key");
-      const value = params.value ?? null;
-      this.state.applyAtomUpdate({ key, value });
-      // Same word the webview would hear had it written the atom itself.
-      this.broadcast({ type: "persisted-atom-updated", key, value, deleted: false });
+      // The same refusal the extension gives a key its table does not have; the
+      // webview answers it by rolling back the change it already drew.
+      this.settingDefault(key);
+      this.state.setSetting(key, params.value ?? null);
       return { handled: true, result: { success: true } };
     }
 

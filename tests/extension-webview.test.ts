@@ -1972,15 +1972,26 @@ describe("extension webview", () => {
     }
   });
 
-  // A setting the webview writes has to come back on the next read and reach the
-  // running view, and it has to land where a webview that reads the atom store
-  // itself will see it — that is the half of the extension's three-way storage a
-  // webview can tell apart.
-  test("stores a setting where the webview can read it back and see it change", async () => {
+  // A setting the webview writes has to come back on the next read, and one it
+  // has never written has to come back as the extension's default: the webview's
+  // hook for a setting's configured value has no fallback of its own, so a
+  // missing key there reads as a deliberate choice.
+  test("answers settings the way the extension does: stored value, then default", async () => {
     const previousRoot = process.env.CODEX_EXTENSION_WEBVIEW_ROOT;
-    const root = mkdtempSync(join(tmpdir(), "codex-webview-settings-"));
+    const extension = mkdtempSync(join(tmpdir(), "codex-webview-settings-"));
+    const root = join(extension, "webview");
+    mkdirSync(join(extension, "out"), { recursive: true });
+    mkdirSync(root, { recursive: true });
     process.env.CODEX_EXTENSION_WEBVIEW_ROOT = root;
     writeFileSync(join(root, "index.html"), "<html><head></head><body></body></html>");
+    // The shape the reader looks for, small enough to read: two groups of
+    // definitions spread into one table.
+    writeFileSync(
+      join(extension, "out", "extension.js"),
+      'var a={turnMode:st({agentAccess:"read-write",default:"unfocused",description:"d",key:"notifications-turn-mode",schema:s})},'
+        + 'b={detail:ot({agentAccess:"read-write",default:"STEPS_COMMANDS",description:"d",key:"conversationDetailMode",schema:s})};'
+        + "var table=[...Object.values(a),...Object.values(b)];\n",
+    );
 
     const appServer = { request: () => Promise.resolve({}), onEvent: () => () => {} };
 
@@ -1989,7 +2000,7 @@ describe("extension webview", () => {
         appServer: appServer as never,
         defaultCwd: "/repo",
         getToken: () => "secret",
-        statePath: join(root, "state.json"),
+        statePath: join(extension, "state.json"),
       });
       const stream = await openEventStream(webview, "tab-1");
       const post = (message: JsonValue) =>
@@ -2016,31 +2027,7 @@ describe("extension webview", () => {
         method: "POST",
         body: JSON.stringify({ key: "notifications-turn-mode" }),
       });
-      await post({
-        type: "fetch",
-        requestId: "read-all",
-        url: "vscode://codex/get-settings",
-        method: "POST",
-      });
-
-      const messages = await stream.waitFor(4, 5_000);
-      // The running view hears about it the same way it would about an atom it
-      // wrote itself, before the write is even answered.
-      expect(messages[0]).toEqual({
-        type: "persisted-atom-updated",
-        key: "notifications-turn-mode",
-        value: "always",
-        deleted: false,
-      });
-      expect(messages[1]).toMatchObject({ requestId: "write-1", bodyJsonString: JSON.stringify({ success: true }) });
-      expect(messages[2]).toMatchObject({ requestId: "read-1", bodyJsonString: JSON.stringify({ value: "always" }) });
-      expect(messages[3]).toMatchObject({
-        requestId: "read-all",
-        bodyJsonString: JSON.stringify({ values: { "notifications-turn-mode": "always" } }),
-      });
-
-      // A setting nobody has written is absent, not null: the webview answers it
-      // from its own copy of the definition's default.
+      // Never written: the default of the definition, not null.
       await post({
         type: "fetch",
         requestId: "read-2",
@@ -2048,10 +2035,37 @@ describe("extension webview", () => {
         method: "POST",
         body: JSON.stringify({ key: "conversationDetailMode" }),
       });
-      expect((await stream.waitFor(5, 5_000))[4]).toMatchObject({
-        requestId: "read-2",
-        bodyJsonString: JSON.stringify({ value: null }),
+      await post({
+        type: "fetch",
+        requestId: "read-all",
+        url: "vscode://codex/get-settings",
+        method: "POST",
       });
+      // Unknown to the table is unknown to the extension too, which throws on it
+      // rather than storing it.
+      await post({
+        type: "fetch",
+        requestId: "write-2",
+        url: "vscode://codex/set-setting",
+        method: "POST",
+        body: JSON.stringify({ key: "invented-setting", value: 1 }),
+      });
+
+      const messages = await stream.waitFor(5, 5_000);
+      expect(messages[0]).toMatchObject({ requestId: "write-1", bodyJsonString: JSON.stringify({ success: true }) });
+      expect(messages[1]).toMatchObject({ requestId: "read-1", bodyJsonString: JSON.stringify({ value: "always" }) });
+      expect(messages[2]).toMatchObject({
+        requestId: "read-2",
+        bodyJsonString: JSON.stringify({ value: "STEPS_COMMANDS" }),
+      });
+      expect(messages[3]).toMatchObject({
+        requestId: "read-all",
+        bodyJsonString: JSON.stringify({
+          values: { "notifications-turn-mode": "always", conversationDetailMode: "STEPS_COMMANDS" },
+        }),
+      });
+      expect(messages[4]).toMatchObject({ requestId: "write-2", responseType: "error" });
+      expect(String((messages[4] as JsonObject).error)).toContain("Unknown setting: invented-setting");
       await stream.cancel();
     } finally {
       if (previousRoot === undefined) {
@@ -2059,7 +2073,7 @@ describe("extension webview", () => {
       } else {
         process.env.CODEX_EXTENSION_WEBVIEW_ROOT = previousRoot;
       }
-      rmSync(root, { recursive: true, force: true });
+      rmSync(extension, { recursive: true, force: true });
     }
   });
 
@@ -2127,6 +2141,7 @@ describe("extension webview", () => {
       await firstStream.cancel();
 
       expect(JSON.parse(readFileSync(statePath, "utf8"))).toEqual({
+        settings: {},
         globalState: { "welcome.dismissed": true },
         persistedAtomState: { "onboarding.complete": { done: true } },
       });
@@ -2227,6 +2242,7 @@ describe("extension webview", () => {
       expect((await secondStream.waitFor(3))[2]).toEqual({ type: "persisted-atom-sync", state: {} });
       expect(existsSync(secondPath)).toBe(false);
       expect(JSON.parse(readFileSync(firstPath, "utf8"))).toEqual({
+        settings: {},
         globalState: {},
         persistedAtomState: { "onboarding.complete": { done: true } },
       });
