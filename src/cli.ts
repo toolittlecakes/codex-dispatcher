@@ -89,8 +89,12 @@ try {
   const webviewRoot = await ensureCodexExtensionWebviewRoot(options.installExtension);
   const port = options.port ?? await findOpenPort(defaultPort);
   const token = randomBytes(18).toString("base64url");
-  const localTarget = `http://localhost:${port}`;
   const relayConfig = options.relay ? requireRelayConfig(options) : null;
+  // The relay and the tunnel terminate TLS themselves and reach the dispatcher
+  // over loopback; without one of them the phone talks to it directly, and only
+  // https gives the webview the secure context it needs to boot.
+  const terminatesTlsUpstream = relayConfig !== null || options.tunnel !== null;
+  const localTarget = `${terminatesTlsUpstream ? "http" : "https"}://localhost:${port}`;
 
   console.log(`Codex extension webview: ${webviewRoot}`);
 
@@ -103,6 +107,7 @@ try {
     host: options.host,
     port,
     token,
+    tls: !terminatesTlsUpstream,
   });
 
   if (relayConfig) {
@@ -127,6 +132,7 @@ try {
     console.log(`Phone:  ${extensionUrl(tunnelStart.url, token)}`);
   } else {
     console.log("Phone:  use the LAN URL printed by dispatcher from a device on the same network");
+    console.log("        (self-signed certificate: accept it once, against the fingerprint above)");
   }
   console.log("");
 } catch (error) {
@@ -705,6 +711,7 @@ function startDispatcher(options: {
   host: string;
   port: number;
   token: string;
+  tls: boolean;
 }): Promise<ChildProcess> {
   return new Promise((resolve, reject) => {
     const launch = serverLaunchCommand();
@@ -714,6 +721,7 @@ function startDispatcher(options: {
         ...process.env,
         CODEX_DISPATCHER_CWD: options.cwd,
         DISPATCHER_TOKEN: options.token,
+        DISPATCHER_TLS: options.tls ? "on" : "off",
         HOST: options.host,
         PORT: String(options.port),
       },

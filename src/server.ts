@@ -2,6 +2,7 @@ import { randomBytes } from "node:crypto";
 import { networkInterfaces } from "node:os";
 import { AppServerError, CodexAppServer, type JsonObject, type JsonValue } from "./codex-app-server";
 import { CodexIpcBridge, type IpcBroadcastMessage } from "./codex-ipc";
+import { defaultCertificateDirectory, ensureDispatcherCertificate } from "./dispatcher-tls";
 import {
   applyThreadSettingsNotification,
   applyThreadSettingsUpdate,
@@ -208,11 +209,20 @@ ipcBridge.addRequestHandler(
 await appServer.start();
 await ipcBridge.start();
 
+// Off only where something in front of us terminates TLS — the relay and the
+// tunnel both do, and both reach us over loopback.
+const addresses = lanAddresses();
+const certificate = process.env.DISPATCHER_TLS === "off" ? null : ensureDispatcherCertificate(
+  defaultCertificateDirectory(),
+  addresses,
+);
+
 let server: Bun.Server<undefined>;
 try {
   server = Bun.serve({
     port,
     hostname: host,
+    ...(certificate ? { tls: { cert: certificate.cert, key: certificate.key } } : {}),
     fetch(request) {
       return extensionWebview.fetch(request, new URL(request.url));
     },
@@ -223,10 +233,17 @@ try {
   throw error;
 }
 
+const scheme = certificate ? "https" : "http";
 console.log(`Codex dispatcher listening on ${server.url.toString()}`);
-console.log(`Open locally: ${clientUrl(`http://localhost:${port}`)}`);
-for (const address of lanAddresses()) {
-  console.log(`Open from phone: ${clientUrl(`http://${address}:${port}`)}`);
+console.log(`Open locally: ${clientUrl(`${scheme}://localhost:${port}`)}`);
+if (certificate) {
+  for (const address of addresses) {
+    console.log(`Open from phone: ${clientUrl(`https://${address}:${port}`)}`);
+  }
+  console.log(`Certificate: ${certificate.path}`);
+  // The phone has to accept this certificate by hand, and the fingerprint is
+  // the only thing it can be checked against.
+  console.log(`Fingerprint: ${certificate.fingerprint}`);
 }
 
 process.once("SIGINT", () => {
