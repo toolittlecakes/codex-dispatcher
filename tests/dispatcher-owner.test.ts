@@ -161,6 +161,35 @@ describe("dispatcher owner IPC helpers", () => {
     });
   });
 
+  // The thread always has a collaboration mode, so nulling the model whenever
+  // one is present would run every inherited turn on the default model.
+  test("keeps the thread's model on a turn that only inherited its collaboration mode", () => {
+    expect(
+      buildDispatcherTurnStartRequest(
+        "thread-1",
+        {
+          latestModel: "gpt-5.4",
+          latestReasoningEffort: "high",
+          latestCollaborationMode: { mode: "default", settings: { model: "gpt-5.4", reasoning_effort: "high" } },
+        },
+        { input: [{ type: "text", text: "hi" }] },
+      ),
+    ).toMatchObject({ model: "gpt-5.4", effort: "high" });
+  });
+
+  test("lets a collaboration mode the caller named carry the model and effort itself", () => {
+    expect(
+      buildDispatcherTurnStartRequest(
+        "thread-1",
+        { latestModel: "gpt-5.4", latestReasoningEffort: "high" },
+        {
+          input: [{ type: "text", text: "hi" }],
+          collaborationMode: { mode: "plan", settings: { model: "gpt-5-codex", reasoning_effort: "low" } },
+        },
+      ),
+    ).toMatchObject({ model: null, effort: null });
+  });
+
   test("reads a following announcement addressed to our host", () => {
     expect(
       parseStreamFollowingChange({ conversationId: "thread-1", hostId: dispatcherIpcHostId, following: true }, "client-7"),

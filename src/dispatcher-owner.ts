@@ -409,13 +409,20 @@ export function buildDispatcherTurnStartRequest(
   const collaborationMode =
     turnStartParams.collaborationMode ??
     (inherited ? conversation?.latestCollaborationMode ?? null : null);
-  const model = collaborationMode
+  // Only a mode the caller named itself carries the model and effort: an
+  // inherited one rides along with the thread's own, and dropping them there
+  // would run the turn on the app server's default model.
+  const modeCarriesModel = turnStartParams.collaborationMode != null;
+  const model = modeCarriesModel
     ? null
     : turnStartParams.model ?? (inherited ? conversation?.latestModel ?? null : null);
-  const effort =
-    collaborationMode
-      ? null
-      : turnStartParams.effort ?? (inherited ? conversation?.latestReasoningEffort ?? null : null);
+  const effort = modeCarriesModel
+    ? null
+    : turnStartParams.effort === undefined
+      ? inherited
+        ? conversation?.latestReasoningEffort ?? null
+        : null
+      : turnStartParams.effort;
 
   return {
     threadId: conversationId,
