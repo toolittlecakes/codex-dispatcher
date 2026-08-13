@@ -4,9 +4,11 @@ import {
   applyThreadSettingsUpdate,
   buildDispatcherSnapshotParams,
   buildDispatcherTurnStartRequest,
+  buildOwnerConversationState,
   buildQueuedFollowUpsBroadcastParams,
   dispatcherIpcHostId,
   isNoActiveTurnError,
+  minimalOwnerConversationState,
   mismatchedTurnId,
   parseStreamFollowingChange,
 } from "../src/dispatcher-owner";
@@ -33,6 +35,78 @@ describe("dispatcher owner IPC helpers", () => {
         },
       },
     });
+  });
+
+  test("hands the follower a stored turn, not the app-server one it cannot read", () => {
+    const conversation = buildOwnerConversationState(
+      "thread-1",
+      {
+        createdAt: 1_700_000_000,
+        updatedAt: 1_700_000_060,
+        cwd: "/repo",
+        turns: [
+          {
+            id: "turn-1",
+            status: "completed",
+            startedAt: 1_700_000_010,
+            completedAt: 1_700_000_050,
+            durationMs: 40_000,
+            items: [{ type: "userMessage", content: [{ type: "text", text: "hi" }] }],
+          },
+        ],
+      },
+      { latestModel: "gpt-5.4", latestReasoningEffort: "high" },
+      [],
+    );
+
+    const turn = asJsonObject(asJsonObject(conversation.turns?.[0])!);
+    // The crash this replaced: the follower reads `params.input` off every turn.
+    expect(asJsonObject(turn?.params)?.input).toEqual([{ type: "text", text: "hi" }]);
+    expect(turn?.turnId).toBe("turn-1");
+    expect(turn?.permissionParamsSource).toBe("inferred");
+    // Seconds on the wire, milliseconds in the store.
+    expect(turn?.turnStartedAtMs).toBe(1_700_000_010_000);
+    expect(turn?.finalAssistantStartedAtMs).toBe(1_700_000_050_000);
+    expect(asJsonObject(turn?.params)?.model).toBe("gpt-5.4");
+    expect(asJsonObject(turn?.params)?.effort).toBe("high");
+    expect(conversation.createdAt).toBe(1_700_000_000_000);
+    expect(conversation.recencyAt).toBe(1_700_000_060_000);
+    expect(conversation.resumeState).toBe("resumed");
+    expect(conversation.workspaceKind).toBe("project");
+    expect(conversation.hostId).toBe(dispatcherIpcHostId);
+  });
+
+  test("keeps what the follower changed through us across a thread re-read", () => {
+    const previous = minimalOwnerConversationState("thread-1", "/repo", []);
+    applyThreadSettingsUpdate(previous, { model: "gpt-5.4", permissions: "read-only" });
+    previous.queuedFollowUpsState = { "thread-1": [{ id: "msg-1" }] };
+
+    const conversation = buildOwnerConversationState("thread-1", { cwd: "/repo", turns: [] }, previous, []);
+    expect(conversation.latestModel).toBe("gpt-5.4");
+    expect(conversation.queuedFollowUpsState).toEqual({ "thread-1": [{ id: "msg-1" }] });
+    expect(asJsonObject(conversation.latestThreadSettings)?.activePermissionProfile).toEqual({
+      id: "read-only",
+      extends: null,
+    });
+  });
+
+  test("names the permission profile the turn ran under instead of a sandbox policy", () => {
+    const previous = minimalOwnerConversationState("thread-1", "/repo", []);
+    applyThreadSettingsUpdate(previous, { permissions: "read-only" });
+
+    const params = asJsonObject(
+      asJsonObject(
+        buildOwnerConversationState(
+          "thread-1",
+          { cwd: "/repo", turns: [{ id: "turn-1", items: [] }] },
+          previous,
+          [],
+        ).turns?.[0],
+      )?.params,
+    );
+    expect(params?.permissions).toBe("read-only");
+    expect(params?.runtimeWorkspaceRoots).toEqual([]);
+    expect(params?.sandboxPolicy).toBeUndefined();
   });
 
   test("broadcasts queued follow-up messages from the follower state map", () => {

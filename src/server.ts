@@ -8,9 +8,11 @@ import {
   buildDispatcherTurnStartRequest,
   buildFollowingChangeParams,
   buildFollowingStatusRequestParams,
+  buildOwnerConversationState,
   buildQueuedFollowUpsBroadcastParams,
   dispatcherIpcHostId,
   isNoActiveTurnError,
+  minimalOwnerConversationState,
   mismatchedTurnId,
   parseStreamFollowingChange,
 } from "./dispatcher-owner";
@@ -444,7 +446,7 @@ async function handleDispatcherOwnerEditLastUserTurn(
   const conversation = dispatcherOwnedConversations.get(conversationId);
   const turns = Array.isArray(conversation?.turns) ? conversation.turns : [];
   const lastTurn = asJsonObject(turns.at(-1));
-  if (!lastTurn || lastTurn.id !== turnId) {
+  if (!lastTurn || lastTurn.turnId !== turnId) {
     throw new Error("Only the most recent message can be edited.");
   }
   if (lastTurn.status === "inProgress") {
@@ -863,42 +865,16 @@ function updateDispatcherOwnedConversation(threadId: string, update: (conversati
 }
 
 function conversationFromThread(threadId: string, thread: JsonObject, previous?: JsonObject): JsonObject {
-  return {
-    ...preservedDispatcherConversationFields(previous),
-    ...cloneJsonObject(thread),
-    id: threadId,
-    hostId: dispatcherIpcHostId,
-    requests: pendingRequestsForThread(threadId),
-  };
-}
-
-function preservedDispatcherConversationFields(previous: JsonObject | undefined): JsonObject {
-  if (!previous) {
-    return {};
-  }
-
-  const preserved: JsonObject = {};
-  for (const key of ["queuedFollowUpsState", "latestModel", "latestReasoningEffort", "latestCollaborationMode"]) {
-    if (previous[key] !== undefined) {
-      preserved[key] = cloneJson(previous[key]);
-    }
-  }
-  return preserved;
+  return buildOwnerConversationState(
+    threadId,
+    cloneJsonObject(thread),
+    previous ? cloneJsonObject(previous) : undefined,
+    pendingRequestsForThread(threadId),
+  );
 }
 
 function minimalDispatcherConversation(threadId: string): JsonObject {
-  return {
-    id: threadId,
-    hostId: dispatcherIpcHostId,
-    title: null,
-    name: null,
-    preview: null,
-    cwd: defaultCwd,
-    source: "appServer",
-    status: { type: "running" },
-    turns: [],
-    requests: pendingRequestsForThread(threadId),
-  };
+  return minimalOwnerConversationState(threadId, defaultCwd, pendingRequestsForThread(threadId));
 }
 
 function pendingRequestsForThread(threadId: string): JsonValue[] {
@@ -932,9 +908,6 @@ function findInProgressTurnId(conversation: JsonObject | undefined): string | nu
 
     if (typeof turn.turnId === "string") {
       return turn.turnId;
-    }
-    if (typeof turn.id === "string") {
-      return turn.id;
     }
   }
   return null;

@@ -26,6 +26,184 @@ export function buildDispatcherSnapshotParams(
   };
 }
 
+// What a snapshot actually carries is the webview's own conversation object
+// (`VIe`), not the app-server thread: the follower puts `conversationState`
+// into its store as it stands — normalising nothing but dates and the title —
+// and then reads `turn.params.input` off it. Handing it a thread crashes the
+// page it lands on, which is what E21 was.
+export function buildOwnerConversationState(
+  conversationId: string,
+  thread: JsonObject,
+  previous: JsonObject | undefined,
+  requests: JsonValue[],
+): JsonObject {
+  const timestamps = conversationTimestamps(thread);
+  const conversation: JsonObject = {
+    id: conversationId,
+    sessionId: thread.sessionId ?? null,
+    forkedFromId: thread.forkedFromId ?? null,
+    hostId: dispatcherIpcHostId,
+    turns: ownerTurnsFromThread(conversationId, thread, previous),
+    requests,
+    createdAt: timestamps.createdAt,
+    updatedAt: timestamps.updatedAt,
+    recencyAt: timestamps.recencyAt ?? timestamps.updatedAt,
+    title: thread.title ?? null,
+    source: thread.source ?? null,
+    threadSource: thread.threadSource ?? "user",
+    historyMode: thread.historyMode ?? null,
+    parentThreadId: thread.parentThreadId ?? null,
+    mode: thread.mode ?? null,
+    threadStartKind: thread.threadStartKind ?? null,
+    modelProvider: thread.modelProvider ?? null,
+    latestModel: previous?.latestModel ?? "",
+    latestReasoningEffort: previous?.latestReasoningEffort ?? null,
+    previousTurnModel: previous?.previousTurnModel ?? null,
+    latestCollaborationMode: previous?.latestCollaborationMode ?? null,
+    hasUnreadTurn: false,
+    threadRuntimeStatus: thread.status ?? null,
+    rolloutPath: thread.path ?? "",
+    gitInfo: thread.gitInfo ?? null,
+    // The thread runs on our app server and is loaded there, which is exactly
+    // what this field says. A follower that reads `needs_resume` offers to
+    // resume a thread it does not drive.
+    resumeState: "resumed",
+    latestTokenUsageInfo: previous?.latestTokenUsageInfo ?? null,
+    workspaceKind: "project",
+    workspaceBrowserRoot: null,
+    projectlessOutputDirectory: null,
+    cwd: thread.cwd ?? previous?.cwd ?? null,
+  };
+
+  // Ours to keep, not the thread's: the follower changed them through us and
+  // our next snapshot is what it reads them back from.
+  for (const key of ["latestThreadSettings", "queuedFollowUpsState"]) {
+    if (previous?.[key] !== undefined) {
+      conversation[key] = previous[key];
+    }
+  }
+  return conversation;
+}
+
+export function minimalOwnerConversationState(
+  conversationId: string,
+  cwd: string,
+  requests: JsonValue[],
+): JsonObject {
+  const now = Date.now();
+  return buildOwnerConversationState(
+    conversationId,
+    { createdAt: now / 1000, updatedAt: now / 1000, cwd, turns: [] },
+    undefined,
+    requests,
+  );
+}
+
+// `Ob`: seconds on the wire, milliseconds in the store.
+function conversationTimestamps(thread: JsonObject): {
+  createdAt: number;
+  updatedAt: number;
+  recencyAt: number | null;
+} {
+  const createdAt = millisecondsFromSeconds(thread.createdAt) ?? Date.now();
+  return {
+    createdAt,
+    updatedAt: millisecondsFromSeconds(thread.updatedAt) ?? createdAt,
+    recencyAt: millisecondsFromSeconds(thread.recencyAt),
+  };
+}
+
+// `tPe`
+function millisecondsFromSeconds(value: JsonValue | undefined): number | null {
+  if (typeof value !== "number" || !Number.isFinite(value * 1000)) {
+    return null;
+  }
+  return value * 1000;
+}
+
+// `jy`: an app-server turn is items and timings, a stored turn is the start
+// params plus the stream state around them. `permissionParamsSource: "inferred"`
+// is the extension's own word for what this is — params rebuilt from history
+// rather than the ones the turn actually ran with.
+function ownerTurnsFromThread(
+  conversationId: string,
+  thread: JsonObject,
+  previous: JsonObject | undefined,
+): JsonValue[] {
+  const turns = Array.isArray(thread.turns) ? thread.turns : [];
+  const settings = asJsonObject(previous?.latestThreadSettings) ?? {};
+  const cwd = thread.cwd ?? previous?.cwd ?? null;
+
+  return turns.flatMap((turnValue) => {
+    const turn = asJsonObject(turnValue);
+    if (!turn || typeof turn.id !== "string") {
+      return [];
+    }
+
+    const items = Array.isArray(turn.items) ? turn.items : [];
+    const userMessage = items.map((item) => asJsonObject(item)).find((item) => item?.type === "userMessage");
+    return [
+      {
+        params: {
+          threadId: conversationId,
+          input: Array.isArray(userMessage?.content) ? userMessage.content : [],
+          approvalPolicy: settings.approvalPolicy ?? null,
+          approvalsReviewer: settings.approvalsReviewer ?? null,
+          ...ownerTurnPermissionParams(settings),
+          model: previous?.latestModel ?? "",
+          cwd,
+          // The extension parses these back out of the message text (`Eae`); we
+          // do not, so the mention block stays visible in the message and the
+          // chips above it are missing on a dispatcher-owned turn.
+          attachments: [],
+          effort: previous?.latestReasoningEffort ?? null,
+          summary: "none",
+          personality: null,
+          outputSchema: null,
+          collaborationMode: null,
+        },
+        permissionParamsSource: "inferred",
+        turnId: turn.id,
+        turnStartedAtMs: millisecondsFromSeconds(turn.startedAt),
+        durationMs: turn.durationMs ?? null,
+        finalAssistantStartedAtMs: millisecondsFromSeconds(turn.completedAt),
+        status: turn.status ?? null,
+        error: turn.error ?? null,
+        diff: null,
+        items: items.map((item) => ownerTurnItem(item)),
+      },
+    ];
+  });
+}
+
+// `Jr`/`jr`
+function ownerTurnPermissionParams(settings: JsonObject): JsonObject {
+  const profile = asJsonObject(settings.activePermissionProfile);
+  const sandboxPolicy = asJsonObject(settings.sandboxPolicy);
+  if (!profile) {
+    return { sandboxPolicy: settings.sandboxPolicy ?? null };
+  }
+
+  const writableRoots = sandboxPolicy?.type === "workspaceWrite" ? sandboxPolicy.writableRoots : [];
+  return {
+    permissions: profile.id ?? null,
+    runtimeWorkspaceRoots: settings.runtimeWorkspaceRoots ?? writableRoots ?? [],
+  };
+}
+
+// `rPe`. The image branch is deliberately not ported: it rewrites the saved
+// path into a webview URI of the owner's own webview, which means nothing in
+// the follower's.
+function ownerTurnItem(itemValue: JsonValue): JsonValue {
+  const item = asJsonObject(itemValue);
+  if (item?.type !== "collabAgentToolCall") {
+    return itemValue;
+  }
+
+  const receiverThreadIds = Array.isArray(item.receiverThreadIds) ? item.receiverThreadIds : [];
+  return { ...item, receiverThreads: receiverThreadIds.map((threadId) => ({ threadId, thread: null })) };
+}
+
 // The 26.803 replacement for the old per-setting follower calls: one payload
 // carrying whatever the follower changed. The merge is a line-by-line copy of
 // the webview's own (`Cb` in the webview bundle), because the follower ran
