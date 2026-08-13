@@ -63,6 +63,11 @@ const dispatcherOwnedRefreshTimers = new Map<string, ReturnType<typeof setTimeou
 const dispatcherOwnedRevisions = new Map<string, number>();
 const dispatcherOwnedRefreshesInFlight = new Set<string>();
 const dispatcherOwnedRefreshRequested = new Set<string>();
+// The app server refuses to read a thread's turns before its first user
+// message, so the read waits for the notification that says one exists. Our own
+// conversation cannot answer this question: the only thing that ever puts turns
+// in it is the read this gate stands in front of.
+const dispatcherOwnedThreadsWithTurns = new Set<string>();
 // Who asked to be kept up to date on which thread. A thread nobody follows is
 // still ours to drive, it just costs no traffic.
 const streamFollowersByConversation = new Map<string, Set<string>>();
@@ -105,7 +110,14 @@ appServer.onEvent((event) => {
 
   if (event.type === "notification") {
     const threadId = notificationThreadId(event.notification);
-    if (threadId && claimDispatcherOwnership(threadId) && dispatcherOwnedThreadHasTurns(threadId)) {
+    if (!threadId || !claimDispatcherOwnership(threadId)) {
+      return;
+    }
+
+    if (event.notification.method === "turn/started") {
+      dispatcherOwnedThreadsWithTurns.add(threadId);
+    }
+    if (dispatcherOwnedThreadsWithTurns.has(threadId)) {
       scheduleDispatcherOwnedRefresh(threadId);
     }
     return;
@@ -596,13 +608,6 @@ function canAnswerThreadOwnerDiscovery(paramsValue: JsonValue | undefined): bool
   return Boolean(conversationId && dispatcherOwnedConversations.has(conversationId));
 }
 
-// The app server refuses to read a thread's turns before its first user
-// message, and a thread with no turns has nothing to refresh anyway. The turn
-// the webview submits refreshes unconditionally, which is what ends this state.
-function dispatcherOwnedThreadHasTurns(threadId: string): boolean {
-  const turns = dispatcherOwnedConversations.get(threadId)?.turns;
-  return Array.isArray(turns) && turns.length > 0;
-}
 
 // A snapshot from another client means that window is now driving the thread.
 // Two owners would race turns on the same rollout and flip followers between
@@ -614,6 +619,7 @@ function releaseDispatcherOwnership(threadId: string): void {
   streamFollowersByConversation.delete(threadId);
   dispatcherOwnedRevisions.delete(threadId);
   dispatcherOwnedRefreshRequested.delete(threadId);
+  dispatcherOwnedThreadsWithTurns.delete(threadId);
   const pending = dispatcherOwnedRefreshTimers.get(threadId);
   if (pending) {
     clearTimeout(pending);
