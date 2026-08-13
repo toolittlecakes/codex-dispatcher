@@ -13,7 +13,7 @@ import {
   resolveWebviewAssetPath,
   selectExtensionWebviewRoot,
 } from "../src/extension-webview";
-import { AppServerError } from "../src/codex-app-server";
+import { AppServerError, type JsonValue } from "../src/codex-app-server";
 
 type StreamCollector = {
   waitFor: (expected: number, timeoutMs?: number) => Promise<JsonRecord[]>;
@@ -1153,9 +1153,9 @@ describe("extension webview", () => {
     const origin = Bun.serve({
       port: 0,
       fetch(request) {
-        if (new URL(request.url).pathname === "/rate-limited") {
-          return new Response(JSON.stringify({ detail: "slow down", retry_after: 30 }), {
-            status: 429,
+        if (new URL(request.url).pathname === "/forbidden") {
+          return new Response(JSON.stringify({ detail: "not yours", code: "forbidden" }), {
+            status: 403,
             headers: { "content-type": "application/json" },
           });
         }
@@ -1190,13 +1190,172 @@ describe("extension webview", () => {
         return messages[delivered - 1] as { responseType: string; status: number; bodyJsonString: string };
       };
 
-      const failed = await postFetch("/rate-limited");
-      expect(failed).toMatchObject({ responseType: "success", status: 429 });
-      expect(JSON.parse(failed.bodyJsonString)).toEqual({ detail: "slow down", retry_after: 30 });
+      const failed = await postFetch("/forbidden");
+      expect(failed).toMatchObject({ responseType: "success", status: 403 });
+      expect(JSON.parse(failed.bodyJsonString)).toEqual({ detail: "not yours", code: "forbidden" });
 
       const succeeded = await postFetch("/ok");
       expect(succeeded).toMatchObject({ responseType: "success", status: 200 });
       expect(JSON.parse(succeeded.bodyJsonString)).toEqual({ ok: true });
+      await stream.cancel();
+    } finally {
+      await origin.stop(true);
+      if (previousRoot === undefined) {
+        delete process.env.CODEX_EXTENSION_WEBVIEW_ROOT;
+      } else {
+        process.env.CODEX_EXTENSION_WEBVIEW_ROOT = previousRoot;
+      }
+      rmSync(root, { recursive: true, force: true });
+    }
+  });
+
+  // The webview has no credentials of its own: it asks the host for every
+  // backend call precisely because the host is the one holding the account.
+  test("signs backend calls with the account token the app server hands out", async () => {
+    const previousRoot = process.env.CODEX_EXTENSION_WEBVIEW_ROOT;
+    const root = mkdtempSync(join(tmpdir(), "codex-webview-auth-"));
+    process.env.CODEX_EXTENSION_WEBVIEW_ROOT = root;
+    writeFileSync(join(root, "index.html"), "<html><head></head><body></body></html>");
+
+    const claims = Buffer.from(
+      JSON.stringify({ "https://api.openai.com/auth": { chatgpt_account_id: "acct-42" } }),
+    ).toString("base64url");
+    const expired = `header.${claims}.stale`;
+    const refreshed = `header.${claims}.fresh`;
+    const seen: { url: string; authorization: string | null; account: string | null; originator: string | null }[] = [];
+    // chatgpt.com is the only host this path is about, so the exchange is faked
+    // here rather than pointed at a local server on some other hostname.
+    const originalFetch = globalThis.fetch;
+    globalThis.fetch = (async (input: RequestInfo | URL, init?: RequestInit) => {
+      const headers = new Headers(init?.headers);
+      const authorization = headers.get("authorization");
+      seen.push({
+        url: String(input),
+        authorization,
+        account: headers.get("chatgpt-account-id"),
+        originator: headers.get("originator"),
+      });
+      if (authorization !== `Bearer ${refreshed}`) {
+        return new Response(JSON.stringify({ detail: "expired" }), {
+          status: 401,
+          headers: { "content-type": "application/json" },
+        });
+      }
+      return new Response(JSON.stringify({ statsigPayload: "{}" }), {
+        headers: { "content-type": "application/json" },
+      });
+    }) as typeof fetch;
+
+    const tokenRequests: JsonValue[] = [];
+    const appServer = {
+      request: (method: string, params: JsonValue) => {
+        if (method !== "getAuthStatus") {
+          throw new Error(`unexpected app server call ${method}`);
+        }
+        tokenRequests.push(params);
+        const refresh = (params as { refreshToken?: boolean }).refreshToken === true;
+        return Promise.resolve({ authToken: refresh ? refreshed : expired });
+      },
+      onEvent: () => () => {},
+    };
+
+    try {
+      const webview = new ExtensionWebview({
+        appServer: appServer as never,
+        defaultCwd: "/repo",
+        getToken: () => "secret",
+      });
+      const stream = await openEventStream(webview, "tab-1");
+      await webview.fetch(
+        new Request("http://localhost/host-message", {
+          method: "POST",
+          headers: { cookie: "codex_dispatcher_webview=secret", "x-dispatcher-client": "tab-1" },
+          body: JSON.stringify({ messages: [{
+            type: "fetch",
+            requestId: "req-1",
+            url: "/wham/statsig/bootstrap",
+            method: "POST",
+            body: "{}",
+          }] }),
+        }),
+        new URL("http://localhost/host-message"),
+      );
+
+      const [response] = await stream.waitFor(1);
+      expect(response).toMatchObject({ responseType: "success", status: 200 });
+      expect(seen[0]?.url).toBe("https://chatgpt.com/backend-api/wham/statsig/bootstrap");
+      // The stale token is retried once with a refreshed one, exactly as the
+      // extension does — the webview never learns the login expired.
+      expect(seen.map((entry) => entry.authorization)).toEqual([`Bearer ${expired}`, `Bearer ${refreshed}`]);
+      expect(seen.at(-1)).toMatchObject({ account: "acct-42", originator: "codex_vscode" });
+      expect(tokenRequests).toEqual([
+        { includeToken: true, refreshToken: false },
+        { includeToken: true, refreshToken: true },
+      ]);
+      await stream.cancel();
+    } finally {
+      globalThis.fetch = originalFetch;
+      if (previousRoot === undefined) {
+        delete process.env.CODEX_EXTENSION_WEBVIEW_ROOT;
+      } else {
+        process.env.CODEX_EXTENSION_WEBVIEW_ROOT = previousRoot;
+      }
+      rmSync(root, { recursive: true, force: true });
+    }
+  });
+
+  // Hosts that are not OpenAI's get no token, and a 429 is the backend asking
+  // to wait rather than an answer to hand back.
+  test("keeps the token off other hosts and rides out a rate limit", async () => {
+    const previousRoot = process.env.CODEX_EXTENSION_WEBVIEW_ROOT;
+    const root = mkdtempSync(join(tmpdir(), "codex-webview-retry-"));
+    process.env.CODEX_EXTENSION_WEBVIEW_ROOT = root;
+    writeFileSync(join(root, "index.html"), "<html><head></head><body></body></html>");
+
+    let attempts = 0;
+    const authorizations: (string | null)[] = [];
+    const origin = Bun.serve({
+      port: 0,
+      fetch(request) {
+        attempts += 1;
+        authorizations.push(request.headers.get("authorization"));
+        if (attempts === 1) {
+          return new Response("{}", { status: 429, headers: { "content-type": "application/json" } });
+        }
+        return new Response(JSON.stringify({ ok: true }), { headers: { "content-type": "application/json" } });
+      },
+    });
+
+    const appServer = {
+      request: () => Promise.resolve({ authToken: "header.payload.signature" }),
+      onEvent: () => () => {},
+    };
+
+    try {
+      const webview = new ExtensionWebview({
+        appServer: appServer as never,
+        defaultCwd: "/repo",
+        getToken: () => "secret",
+      });
+      const stream = await openEventStream(webview, "tab-1");
+      await webview.fetch(
+        new Request("http://localhost/host-message", {
+          method: "POST",
+          headers: { cookie: "codex_dispatcher_webview=secret", "x-dispatcher-client": "tab-1" },
+          body: JSON.stringify({ messages: [{
+            type: "fetch",
+            requestId: "req-1",
+            url: `${origin.url.origin}/anything`,
+            method: "GET",
+          }] }),
+        }),
+        new URL("http://localhost/host-message"),
+      );
+
+      const [response] = await stream.waitFor(1);
+      expect(response).toMatchObject({ responseType: "success", status: 200 });
+      expect(attempts).toBe(2);
+      expect(authorizations).toEqual([null, null]);
       await stream.cancel();
     } finally {
       await origin.stop(true);

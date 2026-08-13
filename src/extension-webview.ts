@@ -69,6 +69,8 @@ type StreamClient = {
   detachedAt: number | null;
 };
 
+type AuthTokenReader = (refreshToken: boolean) => Promise<string | null>;
+
 type FetchResponseOptions = {
   requestId: string | undefined;
   result?: JsonValue;
@@ -89,6 +91,12 @@ const maxDiagnosticMessages = 200;
 // after 60s, so a host fetch that outlives either would leave the webview waiting
 // forever. Stay under the strictest link in that chain.
 const externalFetchTimeoutMs = 25_000;
+// `Tf`, `bst`, `Sst` and `Pf` in out/extension.js: the retry budget the backend
+// is tuned for, and the originator it recognises this client by.
+const externalFetchAttempts = 3;
+const externalFetchBaseBackoffMs = 300;
+const externalFetchMaxBackoffMs = 2_000;
+const chatgptOriginator = "codex_vscode";
 const maxReplayEvents = 500;
 const detachedClientRetentionMs = 5 * 60_000;
 // The follower endpoints the webview actually calls (its `requestThreadFollower`
@@ -534,7 +542,7 @@ select,
         return makeFetchResponse({ requestId, result });
       }
 
-      return await handleExternalFetch(message, requestId);
+      return await handleExternalFetch(message, requestId, (refreshToken) => this.readAuthToken(refreshToken));
     } catch (error) {
       return makeFetchResponse({
         requestId,
@@ -590,6 +598,15 @@ select,
       handled: true,
       result: await this.handleFollowerRequest(followerMethod, stripHostId(requireObject(body, `${endpoint} params`))),
     };
+  }
+
+  // The extension asks the app server for the account token instead of reading
+  // the credentials itself (`p1.getToken` → `getAuthStatus{includeToken}`), so
+  // the refresh happens in the one process that owns the login.
+  private async readAuthToken(refreshToken: boolean): Promise<string | null> {
+    const status = asObject(await this.appServer.request("getAuthStatus", { includeToken: true, refreshToken }));
+    const token = status?.authToken;
+    return typeof token === "string" ? token : null;
   }
 
   private async handleMcpRequest(message: HostMessage): Promise<JsonObject> {
@@ -1471,140 +1488,153 @@ export function makeFetchResponse(options: FetchResponseOptions): JsonObject {
   };
 }
 
-async function handleExternalFetch(message: HostMessage, requestId: string | undefined): Promise<JsonObject> {
+// `cP.fetch` in out/extension.js. The webview asks its host for every backend
+// call precisely because the host is the one holding the account: an anonymous
+// proxy gets 401s the webview has no answer for, and the app never finishes
+// starting.
+async function handleExternalFetch(
+  message: HostMessage,
+  requestId: string | undefined,
+  getAuthToken: AuthTokenReader,
+): Promise<JsonObject> {
   const url = normalizeExternalFetchUrl(message.url);
-  const whamResponse = makeWhamFetchResponse(url, requestId);
-  if (whamResponse) {
-    return whamResponse;
-  }
+  const method = typeof message.method === "string" ? message.method : "GET";
+  const attachAuth = shouldAttachAuth(url);
 
-  const statsigResponse = makeStatsigFetchResponse(url, requestId);
-  if (statsigResponse) {
-    return statsigResponse;
-  }
+  const attempt = async (attemptIndex: number, token: string | null): Promise<JsonObject> => {
+    const headers = buildExternalFetchHeaders(message, isJwt(token) ? token : null, { method, attachAuth });
+    const authorized = headers.has("authorization");
+    const binaryResponse = headers.get("x-codex-binary-response") === "1";
+    headers.delete("x-codex-binary-response");
 
+    let body: BodyInit | undefined;
+    if (typeof message.body === "string" && method !== "GET") {
+      body = headers.get("x-codex-base64") === "1" ? Buffer.from(message.body, "base64") : message.body;
+      headers.delete("x-codex-base64");
+    }
+
+    const init: RequestInit = { method, headers, signal: AbortSignal.timeout(externalFetchTimeoutMs) };
+    if (body !== undefined) {
+      init.body = body;
+    }
+
+    const response = await fetch(url, init);
+    if (response.status === 401 && authorized && attemptIndex < externalFetchAttempts) {
+      const refreshed = await getAuthToken(true);
+      if (refreshed && refreshed !== token) {
+        return attempt(attemptIndex + 1, refreshed);
+      }
+    }
+
+    if (isRetryableFetchStatus(response.status) && attemptIndex < externalFetchAttempts) {
+      await Bun.sleep(externalFetchBackoffMs(attemptIndex));
+      return attempt(attemptIndex + 1, token);
+    }
+
+    const responseHeaders: JsonObject = {};
+    response.headers.forEach((value, key) => {
+      if (key.toLowerCase() !== "authorization") {
+        responseHeaders[key] = value;
+      }
+    });
+
+    return {
+      type: "fetch-response",
+      responseType: "success",
+      requestId,
+      status: response.status,
+      headers: responseHeaders,
+      bodyJsonString: await readExternalFetchBody(response, binaryResponse),
+    };
+  };
+
+  return attempt(0, attachAuth ? await getAuthToken(false) : null);
+}
+
+// `shouldAttachAuth`: the account token goes to OpenAI's own hosts and nowhere
+// else — `ab.chatgpt.com` is the experiment CDN and is deliberately excluded.
+function shouldAttachAuth(url: string): boolean {
+  const host = new URL(url).host.toLowerCase();
+  return (
+    host === "localhost:8000" ||
+    host === "localhost" ||
+    host === "openai.com" ||
+    host.endsWith(".openai.com") ||
+    host === "chatgpt.com" ||
+    (host.endsWith(".chatgpt.com") && !host.startsWith("ab."))
+  );
+}
+
+// `ixe`: anything that is not a JWT is not a token the backend will take, and
+// sending it as one only costs a round trip.
+function isJwt(token: string | null): token is string {
+  return token != null && /^[A-Za-z0-9-_]+\.[A-Za-z0-9-_]+\.[A-Za-z0-9-_]+$/.test(token);
+}
+
+// `buildHeaders`: the account id rides beside the token, because the backend
+// resolves a multi-account session from the header, not from the JWT.
+function buildExternalFetchHeaders(
+  message: HostMessage,
+  token: string | null,
+  options: { method: string; attachAuth: boolean },
+): Headers {
   const headers = headersFromMessage(message);
-  let body: BodyInit | undefined;
-
-  if (typeof message.body === "string" && message.method !== "GET") {
-    const base64Header = Array.from(headers.entries()).find(([key, value]) => key.toLowerCase() === "x-codex-base64" && value === "1");
-    if (base64Header) {
-      headers.delete(base64Header[0]);
-      body = Buffer.from(message.body, "base64");
-    } else {
-      body = message.body;
+  if (options.attachAuth && token && !headers.has("authorization")) {
+    headers.set("Authorization", `Bearer ${token}`);
+    const accountId = chatgptAccountId(token);
+    if (accountId) {
+      headers.set("ChatGPT-Account-Id", accountId);
     }
   }
-
-  const init: RequestInit = {
-    method: typeof message.method === "string" ? message.method : "GET",
-    headers,
-    signal: AbortSignal.timeout(externalFetchTimeoutMs),
-  };
-  if (body !== undefined) {
-    init.body = body;
+  if (options.method !== "GET" && !headers.has("content-type")) {
+    headers.set("Content-Type", "application/json");
+  }
+  if (!headers.has("originator")) {
+    headers.set("originator", chatgptOriginator);
   }
 
-  const response = await fetch(url, init);
+  return headers;
+}
 
-  const responseHeaders: JsonObject = {};
-  response.headers.forEach((value, key) => {
-    if (key.toLowerCase() !== "authorization") {
-      responseHeaders[key] = value;
-    }
-  });
+function chatgptAccountId(token: string): string | null {
+  try {
+    const claims = JSON.parse(Buffer.from(token.split(".")[1] ?? "", "base64url").toString("utf8")) as JsonValue;
+    const auth = asObject(asObject(claims)?.["https://api.openai.com/auth"]);
+    const accountId = auth?.chatgpt_account_id;
+    return typeof accountId === "string" ? accountId : null;
+  } catch {
+    return null;
+  }
+}
 
-  return {
-    type: "fetch-response",
-    responseType: "success",
-    requestId,
-    status: response.status,
-    headers: responseHeaders,
-    bodyJsonString: await readExternalFetchBody(response),
-  };
+function isRetryableFetchStatus(status: number): boolean {
+  return status === 408 || status === 425 || status === 429 || (status >= 500 && status <= 599);
+}
+
+function externalFetchBackoffMs(attemptIndex: number): number {
+  const delay = Math.min(externalFetchMaxBackoffMs, externalFetchBaseBackoffMs * 2 ** attemptIndex);
+  return Math.max(0, Math.floor(delay + delay * 0.2 * (Math.random() - 0.5) * 2));
 }
 
 // The webview resolves 2xx with JSON.parse(bodyJsonString) and rejects any other
 // status with bodyJsonString as the error message, so every completed exchange is
 // reported as `success` and the body carries the failure detail. `error` responses
 // are reserved for exchanges that never completed.
-export async function readExternalFetchBody(response: Response): Promise<string> {
+export async function readExternalFetchBody(response: Response, binaryResponse = false): Promise<string> {
   const contentTypeHeader = response.headers.get("content-type") ?? "";
   if (!response.ok) {
     return response.text();
   }
 
-  if (contentTypeHeader.includes("application/json")) {
+  // `x-codex-binary-response`: the caller wants the bytes even when the server
+  // labels them JSON.
+  if (!binaryResponse && contentTypeHeader.includes("application/json")) {
     const text = await response.text();
     return text.length > 0 ? text : "null";
   }
 
   const bytes = Buffer.from(await response.arrayBuffer());
   return JSON.stringify({ base64: bytes.toString("base64"), contentType: contentTypeHeader });
-}
-
-function makeWhamFetchResponse(url: string, requestId: string | undefined): JsonObject | null {
-  const parsedUrl = new URL(url);
-  if (parsedUrl.hostname !== "chatgpt.com") {
-    return null;
-  }
-
-  const path = parsedUrl.pathname.replace(/^\/backend-api/, "");
-  if (path === "/wham/accounts/check") {
-    return makeFetchResponse({ requestId, result: { account_ordering: [], accounts: {} } });
-  }
-
-  if (path === "/wham/tasks/list") {
-    return makeFetchResponse({ requestId, result: { items: [] } });
-  }
-
-  if (path === "/wham/environments") {
-    return makeFetchResponse({ requestId, result: [] });
-  }
-
-  if (path === "/wham/usage") {
-    return makeFetchResponse({ requestId, result: null });
-  }
-
-  if (path.startsWith("/accounts/check/")) {
-    return makeFetchResponse({ requestId, result: { accounts: {} } });
-  }
-
-  return null;
-}
-
-function makeStatsigFetchResponse(url: string, requestId: string | undefined): JsonObject | null {
-  const parsedUrl = new URL(url);
-  if (parsedUrl.hostname === "ab.chatgpt.com" && parsedUrl.pathname === "/v1/initialize") {
-    return {
-      type: "fetch-response",
-      responseType: "success",
-      requestId,
-      status: 200,
-      headers: { "content-type": "application/json" },
-      bodyJsonString: JSON.stringify({
-        feature_gates: {},
-        dynamic_configs: {},
-        layer_configs: {},
-        sdkParams: {},
-        has_updates: true,
-        time: Date.now(),
-      }),
-    };
-  }
-
-  if (parsedUrl.hostname === "chatgpt.com" && parsedUrl.pathname.startsWith("/ces/")) {
-    return {
-      type: "fetch-response",
-      responseType: "success",
-      requestId,
-      status: 202,
-      headers: { "content-type": "application/json" },
-      bodyJsonString: JSON.stringify({ success: true }),
-    };
-  }
-
-  return null;
 }
 
 function normalizeExternalFetchUrl(url: JsonValue | undefined): string {
