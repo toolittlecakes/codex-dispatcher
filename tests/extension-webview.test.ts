@@ -1145,7 +1145,7 @@ describe("extension webview", () => {
     }
   });
 
-  test("reports completed non-2xx fetches as success so the webview keeps the error body", async () => {
+  test("answers a non-2xx backend call the way the extension does, with the status text", async () => {
     const previousRoot = process.env.CODEX_EXTENSION_WEBVIEW_ROOT;
     const root = mkdtempSync(join(tmpdir(), "codex-webview-fetch-"));
     process.env.CODEX_EXTENSION_WEBVIEW_ROOT = root;
@@ -1191,8 +1191,7 @@ describe("extension webview", () => {
       };
 
       const failed = await postFetch("/forbidden");
-      expect(failed).toMatchObject({ responseType: "success", status: 403 });
-      expect(JSON.parse(failed.bodyJsonString)).toEqual({ detail: "not yours", code: "forbidden" });
+      expect(failed).toMatchObject({ responseType: "error", status: 403, error: "Forbidden" });
 
       const succeeded = await postFetch("/ok");
       expect(succeeded).toMatchObject({ responseType: "success", status: 200 });
@@ -1415,6 +1414,131 @@ describe("extension webview", () => {
       expect(response).toMatchObject({ responseType: "success", status: 200 });
       expect(attempts).toBe(2);
       expect(authorizations).toEqual([null, null]);
+      await stream.cancel();
+    } finally {
+      await origin.stop(true);
+      if (previousRoot === undefined) {
+        delete process.env.CODEX_EXTENSION_WEBVIEW_ROOT;
+      } else {
+        process.env.CODEX_EXTENSION_WEBVIEW_ROOT = previousRoot;
+      }
+      rmSync(root, { recursive: true, force: true });
+    }
+  });
+
+  // A dropped connection is what `cP.fetch` spends its retry budget on; giving
+  // up on the first throw turns a blink of the network into an error in the UI.
+  test("retries a dropped backend connection and names itself the way the app server does", async () => {
+    const previousRoot = process.env.CODEX_EXTENSION_WEBVIEW_ROOT;
+    const root = mkdtempSync(join(tmpdir(), "codex-webview-netfail-"));
+    process.env.CODEX_EXTENSION_WEBVIEW_ROOT = root;
+    writeFileSync(join(root, "index.html"), "<html><head></head><body></body></html>");
+
+    const userAgents: (string | null)[] = [];
+    const originalFetch = globalThis.fetch;
+    globalThis.fetch = (async (input: RequestInfo | URL, init?: RequestInit) => {
+      userAgents.push(new Headers(init?.headers).get("user-agent"));
+      if (userAgents.length === 1) {
+        throw new TypeError("fetch failed");
+      }
+      return new Response(JSON.stringify({ ok: true }), { headers: { "content-type": "application/json" } });
+    }) as typeof fetch;
+
+    const appServer = {
+      initialized: { userAgent: "codex_mobile_dispatcher/1.0 (probe)" },
+      request: () => Promise.resolve({ authToken: "header.payload.signature" }),
+      onEvent: () => () => {},
+    };
+
+    try {
+      const webview = new ExtensionWebview({
+        appServer: appServer as never,
+        defaultCwd: "/repo",
+        getToken: () => "secret",
+      });
+      const stream = await openEventStream(webview, "tab-1");
+      await webview.fetch(
+        new Request("http://localhost/host-message", {
+          method: "POST",
+          headers: { cookie: "codex_dispatcher_webview=secret", "x-dispatcher-client": "tab-1" },
+          body: JSON.stringify({ messages: [{
+            type: "fetch",
+            requestId: "req-1",
+            url: "/wham/tasks/list",
+            method: "GET",
+          }] }),
+        }),
+        new URL("http://localhost/host-message"),
+      );
+
+      const [response] = await stream.waitFor(1);
+      expect(response).toMatchObject({ responseType: "success", status: 200 });
+      expect(userAgents).toEqual([
+        "codex_mobile_dispatcher/1.0 (probe)",
+        "codex_mobile_dispatcher/1.0 (probe)",
+      ]);
+      await stream.cancel();
+    } finally {
+      globalThis.fetch = originalFetch;
+      if (previousRoot === undefined) {
+        delete process.env.CODEX_EXTENSION_WEBVIEW_ROOT;
+      } else {
+        process.env.CODEX_EXTENSION_WEBVIEW_ROOT = previousRoot;
+      }
+      rmSync(root, { recursive: true, force: true });
+    }
+  });
+
+  // `cP.cancel`: once the webview has given up, the proxy has to stop too, or a
+  // navigated-away view keeps spending the account's rate limit.
+  test("drops a backend call the webview cancelled", async () => {
+    const previousRoot = process.env.CODEX_EXTENSION_WEBVIEW_ROOT;
+    const root = mkdtempSync(join(tmpdir(), "codex-webview-cancel-"));
+    process.env.CODEX_EXTENSION_WEBVIEW_ROOT = root;
+    writeFileSync(join(root, "index.html"), "<html><head></head><body></body></html>");
+
+    const originResponseMs = 3_000;
+    const origin = Bun.serve({
+      port: 0,
+      async fetch() {
+        await Bun.sleep(originResponseMs);
+        return new Response("{}", { headers: { "content-type": "application/json" } });
+      },
+    });
+
+    const appServer = { request: () => Promise.resolve({}), onEvent: () => () => {} };
+
+    try {
+      const webview = new ExtensionWebview({
+        appServer: appServer as never,
+        defaultCwd: "/repo",
+        getToken: () => "secret",
+      });
+      const stream = await openEventStream(webview, "tab-1");
+      const post = (message: JsonValue) =>
+        webview.fetch(
+          new Request("http://localhost/host-message", {
+            method: "POST",
+            headers: { cookie: "codex_dispatcher_webview=secret", "x-dispatcher-client": "tab-1" },
+            body: JSON.stringify({ messages: [message] }),
+          }),
+          new URL("http://localhost/host-message"),
+        );
+
+      const startedAt = Date.now();
+      await post({
+        type: "fetch",
+        requestId: "req-1",
+        url: `${origin.url.origin}/slow`,
+        method: "GET",
+      });
+      await Bun.sleep(100);
+      await post({ type: "cancel-fetch", requestId: "req-1" });
+
+      const [response] = await stream.waitFor(1);
+      expect(response).toMatchObject({ responseType: "error", status: 499, error: "Request cancelled" });
+      // The answer comes from the cancel, not from the origin finally replying.
+      expect(Date.now() - startedAt).toBeLessThan(originResponseMs);
       await stream.cancel();
     } finally {
       await origin.stop(true);

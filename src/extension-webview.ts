@@ -131,6 +131,7 @@ export class ExtensionWebview {
   private readonly getBridgeState: (() => JsonObject) | undefined;
   private readonly onThreadActivity: ((method: string, conversationId: string, thread?: JsonObject) => void) | undefined;
   private readonly clients = new Map<string, StreamClient>();
+  private readonly externalFetches = new Map<string, AbortController>();
   // One RPC session per webview, exactly as VS Code keys them by webview.
   private readonly rpcSessions = new Map<string, WebviewRpcSession>();
   // VS Code hosts exactly one webview, and the extension is written for that:
@@ -488,6 +489,15 @@ select,
       case "fetch":
         return [await this.handleFetchMessage(message)];
 
+      // `cP.cancel`: the webview gives up on a backend call the moment its own
+      // signal aborts, so a proxy that keeps fetching is burning the account's
+      // rate limit on an answer nobody is waiting for.
+      case "cancel-fetch":
+        if (typeof message.requestId === "string") {
+          this.externalFetches.get(message.requestId)?.abort();
+        }
+        return [];
+
       case "mcp-request":
       case "thread-prewarm-start":
         return [await this.handleMcpRequest(message)];
@@ -545,7 +555,20 @@ select,
         return makeFetchResponse({ requestId, result });
       }
 
-      return await handleExternalFetch(message, requestId, (refreshToken) => this.readAuthToken(refreshToken));
+      const cancel = new AbortController();
+      if (requestId) {
+        this.externalFetches.set(requestId, cancel);
+      }
+      try {
+        return await handleExternalFetch(message, requestId, (refreshToken) => this.readAuthToken(refreshToken), {
+          userAgent: this.backendUserAgent(),
+          cancelSignal: cancel.signal,
+        });
+      } finally {
+        if (requestId) {
+          this.externalFetches.delete(requestId);
+        }
+      }
     } catch (error) {
       return makeFetchResponse({
         requestId,
@@ -553,6 +576,13 @@ select,
         status: 501,
       });
     }
+  }
+
+  // `setUserAgent(initializeResult.userAgent ?? Pf)`: the app server names the
+  // client, and only falls back to the bare originator when it does not.
+  private backendUserAgent(): string {
+    const userAgent = asObject(this.appServer.initialized)?.userAgent;
+    return typeof userAgent === "string" && userAgent.length > 0 ? userAgent : chatgptOriginator;
   }
 
   private async handleVSCodeHostRequest(
@@ -1539,56 +1569,92 @@ async function handleExternalFetch(
   message: HostMessage,
   requestId: string | undefined,
   getAuthToken: AuthTokenReader,
+  options: { userAgent: string; cancelSignal: AbortSignal },
 ): Promise<JsonObject> {
   const url = normalizeExternalFetchUrl(message.url);
   const method = typeof message.method === "string" ? message.method : "GET";
   const attachAuth = shouldAttachAuth(url);
+  // The extension lets a backend call run for as long as it likes and relies on
+  // `cancel-fetch` alone. We cannot: a response that arrives after the relay's
+  // 30s give-up never reaches the webview at all. So the whole exchange —
+  // retries included — shares one deadline, and blowing it is terminal.
+  const deadline = AbortSignal.timeout(externalFetchTimeoutMs);
+  const signal = AbortSignal.any([options.cancelSignal, deadline]);
 
   const attempt = async (attemptIndex: number, token: string | null): Promise<JsonObject> => {
-    const headers = buildExternalFetchHeaders(message, isJwt(token) ? token : null, { method, attachAuth });
+    const headers = buildExternalFetchHeaders(message, isJwt(token) ? token : null, {
+      method,
+      attachAuth,
+      userAgent: options.userAgent,
+    });
     const authorized = headers.has("authorization");
     const binaryResponse = headers.get("x-codex-binary-response") === "1";
+    const base64Body = headers.get("x-codex-base64") === "1";
     headers.delete("x-codex-binary-response");
+    headers.delete("x-codex-base64");
 
     let body: BodyInit | undefined;
     if (typeof message.body === "string" && method !== "GET") {
-      body = headers.get("x-codex-base64") === "1" ? Buffer.from(message.body, "base64") : message.body;
-      headers.delete("x-codex-base64");
+      body = base64Body ? Buffer.from(message.body, "base64") : message.body;
     }
 
-    const init: RequestInit = { method, headers, signal: AbortSignal.timeout(externalFetchTimeoutMs) };
+    const init: RequestInit = { method, headers, signal };
     if (body !== undefined) {
       init.body = body;
     }
 
-    const response = await fetch(url, init);
-    if (response.status === 401 && authorized && attemptIndex < externalFetchAttempts) {
-      const refreshed = await getAuthToken(true);
-      if (refreshed && refreshed !== token) {
-        return attempt(attemptIndex + 1, refreshed);
+    try {
+      const response = await fetch(url, init);
+      if (response.status >= 200 && response.status < 300) {
+        const responseHeaders: JsonObject = {};
+        response.headers.forEach((value, key) => {
+          if (key.toLowerCase() !== "authorization") {
+            responseHeaders[key] = value;
+          }
+        });
+
+        return {
+          type: "fetch-response",
+          responseType: "success",
+          requestId,
+          status: response.status,
+          headers: responseHeaders,
+          bodyJsonString: await readExternalFetchBody(response, binaryResponse),
+        };
       }
-    }
 
-    if (isRetryableFetchStatus(response.status) && attemptIndex < externalFetchAttempts) {
-      await Bun.sleep(externalFetchBackoffMs(attemptIndex));
-      return attempt(attemptIndex + 1, token);
-    }
-
-    const responseHeaders: JsonObject = {};
-    response.headers.forEach((value, key) => {
-      if (key.toLowerCase() !== "authorization") {
-        responseHeaders[key] = value;
+      if (response.status === 401 && authorized && attemptIndex < externalFetchAttempts) {
+        const refreshed = await getAuthToken(true);
+        if (refreshed && refreshed !== token) {
+          return attempt(attemptIndex + 1, refreshed);
+        }
       }
-    });
 
-    return {
-      type: "fetch-response",
-      responseType: "success",
-      requestId,
-      status: response.status,
-      headers: responseHeaders,
-      bodyJsonString: await readExternalFetchBody(response, binaryResponse),
-    };
+      if (isRetryableFetchStatus(response.status) && attemptIndex < externalFetchAttempts) {
+        await Bun.sleep(externalFetchBackoffMs(attemptIndex));
+        return attempt(attemptIndex + 1, token);
+      }
+
+      return { type: "fetch-response", responseType: "error", requestId, status: response.status, error: response.statusText };
+    } catch (error) {
+      if (options.cancelSignal.aborted) {
+        return { type: "fetch-response", responseType: "error", requestId, status: 499, error: "Request cancelled" };
+      }
+      // A dropped connection is what the retry budget is for; the extension
+      // retries the throw exactly like a 5xx.
+      if (!deadline.aborted && attemptIndex < externalFetchAttempts) {
+        await Bun.sleep(externalFetchBackoffMs(attemptIndex));
+        return attempt(attemptIndex + 1, token);
+      }
+
+      return {
+        type: "fetch-response",
+        responseType: "error",
+        requestId,
+        status: 432,
+        error: error instanceof Error ? error.message : "Unknown error",
+      };
+    }
   };
 
   return attempt(0, attachAuth ? await getAuthToken(false) : null);
@@ -1619,7 +1685,7 @@ function isJwt(token: string | null): token is string {
 function buildExternalFetchHeaders(
   message: HostMessage,
   token: string | null,
-  options: { method: string; attachAuth: boolean },
+  options: { method: string; attachAuth: boolean; userAgent: string },
 ): Headers {
   const headers = headersFromMessage(message);
   if (options.attachAuth && token && !headers.has("authorization")) {
@@ -1634,6 +1700,11 @@ function buildExternalFetchHeaders(
   }
   if (!headers.has("originator")) {
     headers.set("originator", chatgptOriginator);
+  }
+  // `userAgentProvider.getUserAgent()`: the app server tells the client what to
+  // call itself, and the backend reads that name.
+  if (!headers.has("user-agent")) {
+    headers.set("User-Agent", options.userAgent);
   }
 
   return headers;
@@ -1659,21 +1730,16 @@ function externalFetchBackoffMs(attemptIndex: number): number {
   return Math.max(0, Math.floor(delay + delay * 0.2 * (Math.random() - 0.5) * 2));
 }
 
-// The webview resolves 2xx with JSON.parse(bodyJsonString) and rejects any other
-// status with bodyJsonString as the error message, so every completed exchange is
-// reported as `success` and the body carries the failure detail. `error` responses
-// are reserved for exchanges that never completed.
-export async function readExternalFetchBody(response: Response, binaryResponse = false): Promise<string> {
+// Only 2xx gets here: the webview resolves `success` with
+// JSON.parse(bodyJsonString), and the extension answers every other status with
+// an `error` response instead, so a body that is not valid JSON is a failed
+// exchange rather than something to hand over raw.
+async function readExternalFetchBody(response: Response, binaryResponse = false): Promise<string> {
   const contentTypeHeader = response.headers.get("content-type") ?? "";
-  if (!response.ok) {
-    return response.text();
-  }
-
   // `x-codex-binary-response`: the caller wants the bytes even when the server
   // labels them JSON.
   if (!binaryResponse && contentTypeHeader.includes("application/json")) {
-    const text = await response.text();
-    return text.length > 0 ? text : "null";
+    return JSON.stringify(await response.json());
   }
 
   const bytes = Buffer.from(await response.arrayBuffer());
