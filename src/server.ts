@@ -117,6 +117,17 @@ appServer.onEvent((event) => {
     if (event.notification.method === "turn/started") {
       dispatcherOwnedThreadsWithTurns.add(threadId);
     }
+    // Thread settings belong to the app server — they are what its next turn
+    // runs with — so our conversation follows this notification. It is also the
+    // only way a change made in the webview attached to us reaches followers,
+    // and the only way a follower's change reaches that webview.
+    if (event.notification.method === "thread/settings/updated") {
+      const settings = asJsonObject(event.notification.params)?.threadSettings ?? null;
+      updateDispatcherOwnedConversation(threadId, (conversation) => {
+        applyThreadSettingsUpdate(conversation, settings);
+      });
+      broadcastDispatcherOwnedSnapshot(threadId);
+    }
     if (dispatcherOwnedThreadsWithTurns.has(threadId)) {
       scheduleDispatcherOwnedRefresh(threadId);
     }
@@ -408,11 +419,15 @@ async function handleDispatcherOwnerRequest(method: string, paramsValue: JsonVal
       return { ok: true };
     }
 
+    // The extension's owner answers this with the same call it makes for its own
+    // settings changes, so the app server is the one place they live. Our
+    // conversation and the webview attached to us both learn about it from the
+    // notification that call raises.
     case "thread-follower-update-thread-settings":
-      updateDispatcherOwnedConversation(conversationId, (conversation) => {
-        applyThreadSettingsUpdate(conversation, params.threadSettings ?? null);
+      await appServer.request("thread/settings/update", {
+        threadId: conversationId,
+        ...(asJsonObject(params.threadSettings) ?? {}),
       });
-      broadcastDispatcherOwnedSnapshot(conversationId);
       return { ok: true };
 
     // We keep the whole conversation as the app server hands it to us, so there
