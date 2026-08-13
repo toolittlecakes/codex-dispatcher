@@ -332,7 +332,15 @@ export class CodexIpcBridge {
     }
 
     this.busEndpointTimer = setInterval(() => {
-      if (this.disposed || this.busIdentity === null || this.busIdentity === socketIdentity(this.socketPath)) {
+      if (this.disposed) {
+        return;
+      }
+
+      // Both halves have to be looked at separately: while we are between
+      // connections there is no bus identity to compare, and that is exactly
+      // when a router of ours can lose its endpoint and never hear about it.
+      const connectedToReplaced = this.busIdentity !== null && this.busIdentity !== socketIdentity(this.socketPath);
+      if (!connectedToReplaced && !this.routerManager.hostsReplacedSocket()) {
         return;
       }
 
@@ -427,6 +435,11 @@ export class CodexIpcBridge {
         resolve();
       });
 
+      // Read before dialing, not after: a swap that lands mid-connect would
+      // otherwise record the new socket against a connection to the old one,
+      // and the check below would agree with itself forever. Reading first
+      // errs the other way — one reconnect too many, never one too few.
+      const dialled = socketIdentity(this.socketPath);
       socket.connect(this.socketPath, () => {
         if (this.disposed) {
           socket.destroy();
@@ -435,7 +448,7 @@ export class CodexIpcBridge {
         }
 
         this.socket = socket;
-        this.busIdentity = socketIdentity(this.socketPath);
+        this.busIdentity = dialled;
         this.detachReader = attachMessageReader(
           socket,
           (message) => this.handleMessage(message),
