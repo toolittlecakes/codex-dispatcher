@@ -1,5 +1,5 @@
 import { describe, expect, test } from "bun:test";
-import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync } from "node:fs";
+import { chmodSync, existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, statSync } from "node:fs";
 import { homedir, tmpdir } from "node:os";
 import { Socket } from "node:net";
 import { dirname, join } from "node:path";
@@ -292,6 +292,39 @@ describe("codex ipc", () => {
         } finally {
           guest.stop();
           host.stop();
+        }
+      });
+    });
+
+    // A socket in a directory anyone can write is a socket anyone can replace,
+    // so the extension refuses it — and a dispatcher that takes it anyway ends
+    // up on a bus the extension is not on.
+    test("refuses a legacy socket whose directory is open to everyone", async () => {
+      await withCodexHome(async (home) => {
+        const legacyPath = legacyCodexIpcSocketPath();
+        mkdirSync(dirname(legacyPath), { recursive: true });
+        chmodSync(dirname(legacyPath), 0o777);
+        const legacyHost = new CodexIpcBridge(legacyPath);
+        const bridge = new CodexIpcBridge();
+        try {
+          await legacyHost.start("legacy-host");
+          await bridge.start();
+          expect(bridge.socketPath).toBe(join(home, "ipc", "ipc.sock"));
+        } finally {
+          bridge.stop();
+          legacyHost.stop();
+        }
+      });
+    });
+
+    test("locks the socket it hosts to the user that hosts it", async () => {
+      await withCodexHome(async () => {
+        const bridge = new CodexIpcBridge();
+        try {
+          await bridge.start();
+          expect(statSync(bridge.socketPath).mode & 0o777).toBe(0o600);
+        } finally {
+          bridge.stop();
         }
       });
     });

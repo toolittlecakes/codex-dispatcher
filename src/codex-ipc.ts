@@ -190,6 +190,54 @@ function isOwnedSocket(path: string): boolean {
   }
 }
 
+// `$ye`: the legacy endpoint lives in a world-writable /tmp, so the socket being
+// ours is not enough — anyone who can write its directory can swap it for their
+// own. The extension refuses such a socket and hosts the bus elsewhere; a
+// dispatcher that accepts it lands on a different bus than the extension.
+function isSafeLegacySocket(path: string): boolean {
+  const uid = process.getuid?.();
+  if (uid == null || !isOwnedSocket(path)) {
+    return false;
+  }
+
+  try {
+    const directory = lstatSync(dirname(path));
+    return directory.isDirectory() && directory.uid === uid && (directory.mode & 0o22) === 0;
+  } catch {
+    return false;
+  }
+}
+
+// `Bye`: the socket inherits the umask, which is nobody's idea of a permission
+// decision. The extension re-checks the socket it just created and locks it to
+// its own user, refusing to serve on one it cannot.
+function secureRouterSocket(path: string): void {
+  if (process.platform === "win32") {
+    return;
+  }
+
+  if (!isOwnedSocket(path)) {
+    throw new Error("Codex IPC socket is not owned by the current user");
+  }
+  chmodSync(path, 0o600);
+}
+
+// `Fye`: only a stale socket of ours is ours to remove. Anything else at that
+// path belongs to someone else, and deleting it is how two clients end up
+// fighting over one endpoint.
+function unlinkStaleSocket(path: string): void {
+  if (process.platform === "win32" || !isOwnedSocket(path)) {
+    return;
+  }
+
+  try {
+    unlinkSync(path);
+  } catch {
+    // Losing the race to another client that just cleaned up is not an error:
+    // listen() decides who hosts the bus.
+  }
+}
+
 export class CodexIpcBridge {
   private readonly routerManager: IpcRouterManager;
   private readonly listeners = new Set<(event: CodexIpcEvent) => void>();
@@ -609,7 +657,7 @@ class IpcRouterManager {
       // Whoever is on the old endpoint got there first and the extension will
       // join them, so we join them too rather than splitting the bus.
       const legacyPath = legacyCodexIpcSocketPath();
-      if (isOwnedSocket(legacyPath) && (await this.canConnectToSocket(legacyPath))) {
+      if (isSafeLegacySocket(legacyPath) && (await this.canConnectToSocket(legacyPath))) {
         this.socketPath = legacyPath;
         return this.socketPath;
       }
@@ -620,9 +668,7 @@ class IpcRouterManager {
   }
 
   private async startRouter(): Promise<void> {
-    if (process.platform !== "win32" && existsSync(this.socketPath)) {
-      unlinkSync(this.socketPath);
-    }
+    unlinkStaleSocket(this.socketPath);
 
     await new Promise<void>((resolve, reject) => {
       const server = createServer();
@@ -647,6 +693,13 @@ class IpcRouterManager {
 
       server.listen(this.socketPath, () => {
         settled = true;
+        try {
+          secureRouterSocket(this.socketPath);
+        } catch (error) {
+          server.close();
+          reject(toError(error));
+          return;
+        }
         this.server = server;
         this.router = router;
         this.started = true;
