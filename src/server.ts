@@ -14,13 +14,12 @@ import {
   buildQueuedFollowUpsBroadcastParams,
   dispatcherIpcHostId,
   isNoActiveTurnError,
-  applyStreamStateChange,
   minimalOwnerConversationState,
   mismatchedTurnId,
   parseStreamFollowingChange,
 } from "./dispatcher-owner";
-import type { MirroredThread } from "./dispatcher-owner";
 import { ExtensionWebview } from "./extension-webview";
+import { ThreadMirrors } from "./thread-mirrors";
 import { applyJsonPatches, cloneJson } from "./json-patch";
 import { asJsonObject, isJsonObject, toError } from "./shared";
 import type { IpcRequestOutcome } from "./webview-rpc";
@@ -60,9 +59,7 @@ const extensionWebview = new ExtensionWebview({
     scheduleDispatcherOwnedRefresh(conversationId, 0);
   },
 });
-const streamOwners = new Map<string, string>();
-const mirroredConversations = new Map<string, JsonObject>();
-const mirroredRevisions = new Map<string, number>();
+const threadMirrors = new ThreadMirrors();
 const dispatcherOwnedConversations = new Map<string, JsonObject>();
 const dispatcherOwnedRefreshTimers = new Map<string, ReturnType<typeof setTimeout>>();
 const dispatcherOwnedRevisions = new Map<string, number>();
@@ -325,26 +322,18 @@ function applyIpcBroadcastEffects(broadcastMessage: IpcBroadcastMessage): void {
     }
   }
 
-  for (const [threadId, ownerClientId] of streamOwners.entries()) {
-    if (ownerClientId !== params.clientId) {
-      continue;
-    }
-
-    streamOwners.delete(threadId);
-    mirroredConversations.delete(threadId);
-    mirroredRevisions.delete(threadId);
-  }
+  threadMirrors.forgetClient(params.clientId);
 }
 
 // Everything this dispatcher has state for: the threads it drives and the ones
 // it mirrors from another window. This is its equivalent of the threads a VS
 // Code window has open, and it follows all of them.
 function openConversationIds(): string[] {
-  return [...new Set([...dispatcherOwnedConversations.keys(), ...mirroredConversations.keys()])];
+  return [...new Set([...dispatcherOwnedConversations.keys(), ...threadMirrors.threadIds()])];
 }
 
 function hasConversationOpen(conversationId: string): boolean {
-  return dispatcherOwnedConversations.has(conversationId) || mirroredConversations.has(conversationId);
+  return dispatcherOwnedConversations.has(conversationId) || threadMirrors.has(conversationId);
 }
 
 function announceFollowing(conversationId: string, targetClientIds?: string[]): void {
@@ -720,7 +709,7 @@ function claimDispatcherOwnership(threadId: string): boolean {
   if (dispatcherOwnedConversations.has(threadId)) {
     return true;
   }
-  if (streamOwners.has(threadId)) {
+  if (threadMirrors.ownerOf(threadId)) {
     return false;
   }
 
@@ -882,8 +871,8 @@ function buildBridgeDebugState(): JsonObject {
       revision: dispatcherOwnedRevision(threadId),
       followers: [...(streamFollowersByConversation.get(threadId) ?? [])],
     })),
-    mirroredThreads: [...mirroredConversations.keys()],
-    threadOwners: Object.fromEntries(streamOwners),
+    mirroredThreads: threadMirrors.threadIds(),
+    threadOwners: threadMirrors.ownersByThread(),
   };
 }
 
@@ -892,7 +881,7 @@ function extensionThreadRole(threadId: string): string {
 }
 
 function assertExtensionFollowerOwner(threadId: string): void {
-  if (!streamOwners.has(threadId)) {
+  if (!threadMirrors.ownerOf(threadId)) {
     throw new Error(`No IPC owner for thread ${threadId}`);
   }
 }
@@ -928,7 +917,7 @@ async function requestForWebview(
 
 async function handleExtensionFollowerRequest(method: string, params: JsonValue, signal: AbortSignal): Promise<JsonValue> {
   const threadId = requestThreadId({ params });
-  const ownerClientId = threadId ? streamOwners.get(threadId) : null;
+  const ownerClientId = threadId ? threadMirrors.ownerOf(threadId) : null;
   if (!ownerClientId) {
     throw new Error(`No IPC owner for thread ${threadId ?? "unknown"}`);
   }
@@ -1002,52 +991,24 @@ function clearIpcMirrorsIfDisconnected(status: string): void {
     return;
   }
 
-  streamOwners.clear();
-  mirroredConversations.clear();
-  mirroredRevisions.clear();
+  threadMirrors.clear();
   // Client ids are handed out per connection, so nothing that followed us over
   // the old socket exists any more; they announce again after reconnecting.
   streamFollowersByConversation.clear();
 }
 
 function applyConversationMirror(threadId: string, params: JsonObject, sourceClientId: string): void {
-  const outcome = applyStreamStateChange(threadId, params, sourceClientId, mirroredThread(threadId));
-  if (outcome.kind === "ignored") {
+  const outcome = threadMirrors.apply(threadId, params, sourceClientId);
+  if (outcome === "adopted") {
+    releaseDispatcherOwnership(threadId);
     return;
   }
 
-  if (outcome.kind === "patch-failed") {
+  if (outcome === "patch-failed") {
     // The extension warns and keeps the thread it has: the next snapshot is
     // what repairs a mirror, and until then a stale copy still answers.
-    console.warn(`Failed to apply IPC patches for ${threadId}: ${outcome.message}`);
-    return;
+    console.warn(`Failed to apply IPC patches for ${threadId}`);
   }
-
-  mirroredConversations.set(threadId, cloneJsonObject(outcome.conversation));
-  setMirroredRevision(threadId, outcome.revision);
-  if (outcome.kind === "adopted") {
-    streamOwners.set(threadId, sourceClientId);
-    releaseDispatcherOwnership(threadId);
-  }
-}
-
-function mirroredThread(threadId: string): MirroredThread | null {
-  const conversation = mirroredConversations.get(threadId);
-  const ownerClientId = streamOwners.get(threadId);
-  if (!conversation || !ownerClientId) {
-    return null;
-  }
-
-  return { conversation, revision: mirroredRevisions.get(threadId) ?? null, ownerClientId };
-}
-
-function setMirroredRevision(threadId: string, revision: number | null): void {
-  if (revision === null) {
-    mirroredRevisions.delete(threadId);
-    return;
-  }
-
-  mirroredRevisions.set(threadId, revision);
 }
 
 function cloneJsonObject(value: JsonObject): JsonObject {

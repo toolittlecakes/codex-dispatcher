@@ -1,7 +1,6 @@
 import { describe, expect, test } from "bun:test";
 import { AppServerError } from "../src/codex-app-server";
 import {
-  applyStreamStateChange,
   applyThreadSettingsNotification,
   applyThreadSettingsUpdate,
   buildDispatcherSnapshotParams,
@@ -345,69 +344,5 @@ describe("dispatcher owner IPC helpers", () => {
       id: "read-only",
       extends: null,
     });
-  });
-});
-
-describe("mirroring a thread another client owns", () => {
-  const snapshot = (revision: number) => ({
-    conversationId: "thread-1",
-    hostId: dispatcherIpcHostId,
-    change: { type: "snapshot", revision, conversationState: { id: "thread-1", turns: [{ id: "t1" }] } },
-  });
-  const patches = (baseRevision: number, revision: number, patches: unknown[]) => ({
-    conversationId: "thread-1",
-    hostId: dispatcherIpcHostId,
-    change: { type: "patches", baseRevision, revision, patches },
-  });
-  const mirrored = (revision: number | null, turns: unknown[] = [{ id: "t1" }]) => ({
-    conversation: { id: "thread-1", turns },
-    revision,
-    ownerClientId: "owner",
-  });
-
-  test("adopts a snapshot together with the client that sent it", () => {
-    expect(applyStreamStateChange("thread-1", snapshot(7) as never, "owner", null)).toEqual({
-      kind: "adopted",
-      conversation: { id: "thread-1", turns: [{ id: "t1" }] },
-      revision: 7,
-    });
-  });
-
-  test("applies patches that build on the revision it holds", () => {
-    const change = patches(7, 8, [{ op: "add", path: "/turns/1", value: { id: "t2" } }]);
-    expect(applyStreamStateChange("thread-1", change as never, "owner", mirrored(7) as never)).toEqual({
-      kind: "patched",
-      conversation: { id: "thread-1", turns: [{ id: "t1" }, { id: "t2" }] },
-      revision: 8,
-    });
-  });
-
-  test("ignores patches from a client that is not the owner it recorded", () => {
-    const change = patches(7, 8, [{ op: "add", path: "/turns/1", value: { id: "t2" } }]);
-    expect(applyStreamStateChange("thread-1", change as never, "someone-else", mirrored(7) as never)).toEqual({
-      kind: "ignored",
-    });
-  });
-
-  test("ignores patches built on a revision it does not hold", () => {
-    const change = patches(11, 12, [{ op: "add", path: "/turns/1", value: { id: "t2" } }]);
-    expect(applyStreamStateChange("thread-1", change as never, "owner", mirrored(7) as never)).toEqual({
-      kind: "ignored",
-    });
-  });
-
-  test("ignores patches for a thread it has no snapshot of", () => {
-    const change = patches(7, 8, [{ op: "add", path: "/turns/1", value: { id: "t2" } }]);
-    expect(applyStreamStateChange("thread-1", change as never, "owner", null)).toEqual({ kind: "ignored" });
-  });
-
-  // A patch that cannot be applied used to make the follower forget who owned
-  // the thread, and every follower request after that — stop above all — was
-  // refused with «No IPC owner». The mirror goes stale instead, and the next
-  // snapshot repairs it.
-  test("reports a patch it cannot apply without disowning the thread", () => {
-    const change = patches(7, 8, [{ op: "replace", path: "/turns/9/status", value: "done" }]);
-    const outcome = applyStreamStateChange("thread-1", change as never, "owner", mirrored(7) as never);
-    expect(outcome.kind).toBe("patch-failed");
   });
 });

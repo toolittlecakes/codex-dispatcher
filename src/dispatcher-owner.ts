@@ -1,73 +1,7 @@
 import type { JsonObject, JsonValue } from "./codex-app-server";
-import { applyJsonPatches } from "./json-patch";
-import { asJsonObject, isJsonObject } from "./shared";
+import { asJsonObject } from "./shared";
 
 export const dispatcherIpcHostId = "local";
-
-export type MirroredThread = { conversation: JsonObject; revision: number | null; ownerClientId: string };
-
-export type StreamStateOutcome =
-  | { kind: "ignored" }
-  | { kind: "adopted"; conversation: JsonObject; revision: number | null }
-  | { kind: "patched"; conversation: JsonObject; revision: number | null }
-  | { kind: "patch-failed"; message: string };
-
-// The follower half of the snapshot protocol above. Every client on the bus
-// broadcasts patches for the threads it owns, so a follower constantly sees
-// changes built on state it does not have; the extension answers those by
-// checking the sender against the owner its last snapshot named and the
-// patch's `baseRevision` against the revision it holds, and ignoring whatever
-// fails either test. Only a snapshot names an owner, and nothing here ever
-// unnames one — a mirror that cannot follow along waits for the next snapshot
-// rather than forgetting who to ask.
-export function applyStreamStateChange(
-  threadId: string,
-  params: JsonObject,
-  sourceClientId: string,
-  current: MirroredThread | null,
-): StreamStateOutcome {
-  const change = asJsonObject(params.change);
-  if (!change) {
-    return { kind: "ignored" };
-  }
-
-  if (change.type === "snapshot") {
-    const conversationState = asJsonObject(change.conversationState);
-    if (!conversationState) {
-      return { kind: "ignored" };
-    }
-
-    return {
-      kind: "adopted",
-      conversation: {
-        ...conversationState,
-        id: typeof conversationState.id === "string" ? conversationState.id : threadId,
-      },
-      revision: typeof change.revision === "number" ? change.revision : null,
-    };
-  }
-
-  if (
-    change.type !== "patches" ||
-    !Array.isArray(change.patches) ||
-    !current ||
-    current.ownerClientId !== sourceClientId ||
-    current.revision !== (typeof change.baseRevision === "number" ? change.baseRevision : null)
-  ) {
-    return { kind: "ignored" };
-  }
-
-  try {
-    const next = applyJsonPatches(current.conversation, change.patches);
-    if (!isJsonObject(next)) {
-      return { kind: "patch-failed", message: "patched conversation is not an object" };
-    }
-
-    return { kind: "patched", conversation: next, revision: typeof change.revision === "number" ? change.revision : null };
-  } catch (error) {
-    return { kind: "patch-failed", message: error instanceof Error ? error.message : String(error) };
-  }
-}
 
 // Followers key their state off the revision: they store the one that came with
 // the snapshot, refuse patches that do not build on it, and wait for a revision
