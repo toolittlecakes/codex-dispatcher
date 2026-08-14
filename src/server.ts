@@ -14,10 +14,12 @@ import {
   buildQueuedFollowUpsBroadcastParams,
   dispatcherIpcHostId,
   isNoActiveTurnError,
+  applyStreamStateChange,
   minimalOwnerConversationState,
   mismatchedTurnId,
   parseStreamFollowingChange,
 } from "./dispatcher-owner";
+import type { MirroredThread } from "./dispatcher-owner";
 import { ExtensionWebview } from "./extension-webview";
 import { applyJsonPatches, cloneJson } from "./json-patch";
 import { asJsonObject, isJsonObject, toError } from "./shared";
@@ -60,6 +62,7 @@ const extensionWebview = new ExtensionWebview({
 });
 const streamOwners = new Map<string, string>();
 const mirroredConversations = new Map<string, JsonObject>();
+const mirroredRevisions = new Map<string, number>();
 const dispatcherOwnedConversations = new Map<string, JsonObject>();
 const dispatcherOwnedRefreshTimers = new Map<string, ReturnType<typeof setTimeout>>();
 const dispatcherOwnedRevisions = new Map<string, number>();
@@ -270,13 +273,7 @@ function applyIpcBroadcastEffects(broadcastMessage: IpcBroadcastMessage): void {
       return;
     }
 
-    if (!applyConversationMirror(threadId, params)) {
-      streamOwners.delete(threadId);
-      return;
-    }
-
-    streamOwners.set(threadId, broadcastMessage.sourceClientId);
-    releaseDispatcherOwnership(threadId);
+    applyConversationMirror(threadId, params, broadcastMessage.sourceClientId);
     return;
   }
 
@@ -335,6 +332,7 @@ function applyIpcBroadcastEffects(broadcastMessage: IpcBroadcastMessage): void {
 
     streamOwners.delete(threadId);
     mirroredConversations.delete(threadId);
+    mirroredRevisions.delete(threadId);
   }
 }
 
@@ -1006,55 +1004,50 @@ function clearIpcMirrorsIfDisconnected(status: string): void {
 
   streamOwners.clear();
   mirroredConversations.clear();
+  mirroredRevisions.clear();
   // Client ids are handed out per connection, so nothing that followed us over
   // the old socket exists any more; they announce again after reconnecting.
   streamFollowersByConversation.clear();
 }
 
-function applyConversationMirror(threadId: string, params: JsonObject): boolean {
-  const change = asJsonObject(params.change);
-  if (!change) {
-    mirroredConversations.delete(threadId);
-    return false;
+function applyConversationMirror(threadId: string, params: JsonObject, sourceClientId: string): void {
+  const outcome = applyStreamStateChange(threadId, params, sourceClientId, mirroredThread(threadId));
+  if (outcome.kind === "ignored") {
+    return;
   }
 
-  if (change.type === "snapshot") {
-    const conversationState = asJsonObject(change.conversationState);
-    if (!conversationState) {
-      mirroredConversations.delete(threadId);
-      return false;
-    }
-
-    mirroredConversations.set(threadId, {
-      ...cloneJsonObject(conversationState),
-      id: typeof conversationState.id === "string" ? conversationState.id : threadId,
-    });
-    return true;
+  if (outcome.kind === "patch-failed") {
+    // The extension warns and keeps the thread it has: the next snapshot is
+    // what repairs a mirror, and until then a stale copy still answers.
+    console.warn(`Failed to apply IPC patches for ${threadId}: ${outcome.message}`);
+    return;
   }
 
-  if (change.type !== "patches" || !Array.isArray(change.patches)) {
-    mirroredConversations.delete(threadId);
-    return false;
+  mirroredConversations.set(threadId, cloneJsonObject(outcome.conversation));
+  setMirroredRevision(threadId, outcome.revision);
+  if (outcome.kind === "adopted") {
+    streamOwners.set(threadId, sourceClientId);
+    releaseDispatcherOwnership(threadId);
+  }
+}
+
+function mirroredThread(threadId: string): MirroredThread | null {
+  const conversation = mirroredConversations.get(threadId);
+  const ownerClientId = streamOwners.get(threadId);
+  if (!conversation || !ownerClientId) {
+    return null;
   }
 
-  const current = mirroredConversations.get(threadId);
-  if (!current) {
-    console.warn(`Received IPC patches before snapshot for ${threadId}`);
-    return false;
+  return { conversation, revision: mirroredRevisions.get(threadId) ?? null, ownerClientId };
+}
+
+function setMirroredRevision(threadId: string, revision: number | null): void {
+  if (revision === null) {
+    mirroredRevisions.delete(threadId);
+    return;
   }
 
-  try {
-    const next = applyJsonPatches(current, change.patches);
-    if (isJsonObject(next)) {
-      mirroredConversations.set(threadId, next);
-      return true;
-    }
-  } catch (error) {
-    console.warn(`Failed to apply IPC patches for ${threadId}: ${error instanceof Error ? error.message : String(error)}`);
-  }
-
-  mirroredConversations.delete(threadId);
-  return false;
+  mirroredRevisions.set(threadId, revision);
 }
 
 function cloneJsonObject(value: JsonObject): JsonObject {

@@ -146,4 +146,15 @@ Received IPC patches before snapshot for 019ffc74-…
 
 `applyIpcBroadcastEffects` на неудачном патче делает `streamOwners.delete(threadId)` (`src/server.ts:273`), то есть **забывает, кто владеет тредом**, и зеркало не восстанавливается: все следующие патчи падают уже в «before snapshot». После этого любой follower'ский запрос к владельцу — стоп, steer, компакт — получает `433 No IPC owner for thread …`, что и дало 4 из 6 отказов выше.
 
-Патчи при этом шлём не мы: диспетчер-владелец рассылает только снапшоты (`buildDispatcherSnapshotParams`), а `thread-stream-state-changed` с `type: "patches"` уходит на шину от самого вебвью через `broadcastForWebview`. Получается два источника состояния одного треда с разными базами — патчи вебвью поверх снапшота диспетчера. Это корневая причина, и чинится она на уровне того, кто имеет право объявлять состояние треда, а не подавлением ошибки патча.
+Патчи при этом шлём не мы: диспетчер-владелец рассылает только снапшоты (`buildDispatcherSnapshotParams`), а `thread-stream-state-changed` с `type: "patches"` уходит на шину от самого вебвью через `broadcastForWebview`.
+
+**Как это устроено в VS Code.** Патчи в экстеншене шлёт именно вебвью — `canBroadcastIpcStatePatches` = «моя роль по этому треду owner и у меня есть followers», — а extension host только перекладывает их на шину (`threadStreamStateChanged`). То есть трафик вебвью законен, и запрещать его было бы неправильно. Разбирает патч follower так:
+
+```js
+if (r?.role !== "follower" || r.ownerClientId !== n || this.streamRevisionByConversationId.get(e) !== t.baseRevision) return;
+try { setConversation(Hne(i, t.patches)) } catch (e) { $.warning("Failed to apply patches for", …) }
+```
+
+Три проверки перед применением — я follower, отправитель тот, кого назвал последний снапшот, и `baseRevision` совпадает с моей ревизией — и всё, что их не прошло, **молча игнорируется**. Владельца называет только снапшот, и ни одна ветка владельца не снимает; упавший патч — только warning, состояние остаётся прежним до следующего снапшота.
+
+**Исправлено по этому контракту** (`applyStreamStateChange` в `src/dispatcher-owner.ts`, вызов в `src/server.ts`): follower хранит ревизию зеркала, применяет патчи только от записанного владельца и только с совпадающей базой, а неудачный патч оставляет зеркало устаревшим и пишет предупреждение — владелец больше не теряется никогда. Повтор тех же 6 раундов по последней дельте на исправленной сборке: **6 из 6 → `200` с реальным `interruptedTurnId`** (было 2 из 6), в логе follower-диспетчера ноль `Failed to apply IPC patches`, ноль `Received IPC patches before snapshot`, ноль `No IPC owner`; `hostErrors` пуст с обеих сторон.
