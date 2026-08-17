@@ -1297,7 +1297,7 @@ select,
   };
   const postToWindow = (message) => window.postMessage(message, window.location.origin);
   let superseded = false;
-  const showSuperseded = () => {
+  const showOverlay = (message, buttonLabel) => {
     if (superseded) return;
     superseded = true;
     events.close();
@@ -1305,14 +1305,15 @@ select,
     overlay.setAttribute("data-codex-dispatcher-superseded", "");
     overlay.style.cssText = "position:fixed;inset:0;z-index:2147483647;display:flex;flex-direction:column;align-items:center;justify-content:center;gap:16px;padding:24px;text-align:center;background:rgba(0,0,0,.86);color:#fff;font:15px/1.45 system-ui,-apple-system,sans-serif";
     const text = document.createElement("div");
-    text.textContent = "Codex moved to another tab. Only one can drive the session.";
+    text.textContent = message;
     const button = document.createElement("button");
-    button.textContent = "Use this tab instead";
+    button.textContent = buttonLabel;
     button.style.cssText = "padding:10px 18px;border:0;border-radius:8px;font:inherit;cursor:pointer;background:#fff;color:#000";
     button.addEventListener("click", () => window.location.reload());
     overlay.append(text, button);
     (document.body || document.documentElement).appendChild(overlay);
   };
+  const showSuperseded = () => showOverlay("Codex moved to another tab. Only one can drive the session.", "Use this tab instead");
   const deliver = (messages) => {
     for (const message of messages || []) {
       // Ours, not the extension's: the host contract has no notion of a webview
@@ -1419,7 +1420,12 @@ select,
       readyState: events.readyState,
     });
     if (events.readyState === EventSource.CLOSED) {
+      // The browser only closes an EventSource for terminal answers, 401
+      // above all — a dispatcher restarted without a pinned token mints a new
+      // one, and this page's cookie is dead with the old one. Nothing here
+      // can recover that; what it can do is say so instead of hanging.
       console.error("[codex-extension-webview] event stream closed");
+      showOverlay("The connection to Codex was lost. If reloading does not bring it back, open a fresh link from the dispatcher.", "Reload");
     }
   };
 })();

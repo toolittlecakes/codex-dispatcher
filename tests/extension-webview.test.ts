@@ -275,6 +275,11 @@ describe("extension webview", () => {
       const first = new TextDecoder().decode((await reader.read()).value);
       await reader.cancel();
       expect(first).toContain(`data: ${JSON.stringify({ type: "dispatcher-host-instance", instanceId: embedded })}`);
+      // No SSE id on this frame is load-bearing: an id would advance the
+      // browser's Last-Event-ID and pull the event into the replay stream.
+      const instanceFrame = first.split("\n\n").find((frame) => frame.includes("dispatcher-host-instance"));
+      expect(instanceFrame).toBeDefined();
+      expect(instanceFrame).not.toContain("id:");
 
       // Another process would embed another id, which is the whole signal.
       const restarted = new ExtensionWebview({
