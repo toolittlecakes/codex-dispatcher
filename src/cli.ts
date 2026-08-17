@@ -1,13 +1,12 @@
 #!/usr/bin/env bun
 
-import { randomBytes } from "node:crypto";
 import { spawn, type ChildProcess } from "node:child_process";
 import { chmodSync, existsSync, renameSync, unlinkSync, writeFileSync } from "node:fs";
 import { createServer } from "node:net";
 import { dirname, join, resolve } from "node:path";
 import packageJson from "../package.json" with { type: "json" };
 import { resolveCodexCliPath } from "./codex-app-server";
-import { readDispatcherConfig, writeDispatcherConfig, type DispatcherConfig } from "./dispatcher-config";
+import { ensureWebviewToken, readDispatcherConfig, writeDispatcherConfig, type DispatcherConfig } from "./dispatcher-config";
 import { resolveExtensionWebviewRoot, verifiedExtensionVersion } from "./extension-webview";
 import { buildGitHubDeviceCodeBody, buildGitHubDeviceTokenBody } from "./github-oauth";
 import { startRelayClient, type RelayClient } from "./relay-client";
@@ -88,7 +87,7 @@ try {
 
   const webviewRoot = await ensureCodexExtensionWebviewRoot(options.installExtension);
   const port = options.port ?? await findOpenPort(defaultPort);
-  const token = randomBytes(18).toString("base64url");
+  const token = ensureWebviewToken();
   const relayConfig = options.relay ? requireRelayConfig(options) : null;
   // The relay and the tunnel terminate TLS themselves and reach the dispatcher
   // over loopback; without one of them the phone talks to it directly, and only
@@ -434,7 +433,7 @@ async function runRelayLogin(options: CliOptions): Promise<void> {
   console.log("");
   const githubToken = await pollGitHubDeviceToken(clientId, deviceCode);
   const relayConfig = await registerCliWithRelay(relayUrl, githubToken);
-  writeDispatcherConfig({ relay: relayConfig });
+  writeDispatcherConfig({ ...readDispatcherConfig(), relay: relayConfig });
   console.log(`Logged in as @${relayConfig.githubLogin}`);
   console.log(`Stable URL: ${stableRelayUrl(relayConfig)}`);
 }

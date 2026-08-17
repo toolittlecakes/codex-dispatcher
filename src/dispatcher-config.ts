@@ -1,9 +1,11 @@
+import { randomBytes } from "node:crypto";
 import { existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import { homedir } from "node:os";
 import { dirname, join } from "node:path";
 import { isRecord } from "./shared";
 
 export type DispatcherConfig = {
+  webviewToken?: string;
   relay?: {
     url: string;
     userId: string;
@@ -35,24 +37,42 @@ function parseDispatcherConfig(value: unknown): DispatcherConfig {
   if (!isRecord(value)) {
     throw new Error("Invalid codex-dispatcher config: expected object.");
   }
+  const config: DispatcherConfig = {};
+  if (value.webviewToken !== undefined) {
+    config.webviewToken = requiredString(value.webviewToken, "webviewToken");
+  }
   const relay = value.relay;
   if (relay === undefined) {
-    return {};
+    return config;
   }
   if (!isRecord(relay)) {
     throw new Error("Invalid codex-dispatcher config: relay must be an object.");
   }
-  const config: DispatcherConfig = {
-    relay: {
+  config.relay = {
       url: requiredString(relay.url, "relay.url"),
       userId: requiredString(relay.userId, "relay.userId"),
       githubLogin: requiredString(relay.githubLogin, "relay.githubLogin"),
       slug: requiredString(relay.slug, "relay.slug"),
       deviceId: requiredString(relay.deviceId, "relay.deviceId"),
       token: requiredString(relay.token, "relay.token"),
-    },
   };
   return config;
+}
+
+// The phone bookmarks a ?token= link and its cookie carries the same value, so
+// a token minted per process makes every dispatcher restart a dead page that
+// only a freshly copied link can revive. One token per machine, held next to
+// the relay login at 0600, is what lets the LAN link and the page outlive the
+// process the way the relay path already does.
+export function ensureWebviewToken(path = dispatcherConfigPath()): string {
+  const config = readDispatcherConfig(path);
+  if (config.webviewToken) {
+    return config.webviewToken;
+  }
+
+  const token = randomBytes(18).toString("base64url");
+  writeDispatcherConfig({ ...config, webviewToken: token }, path);
+  return token;
 }
 
 function requiredString(value: unknown, key: string): string {
