@@ -67,7 +67,12 @@ async function openEventStream(webview: ExtensionWebview, clientId: string, last
           }
           const data = frame.split("\n").find((line) => line.startsWith("data: "));
           if (data) {
-            messages.push(JSON.parse(data.slice(6)) as JsonRecord);
+            const message = JSON.parse(data.slice(6)) as JsonRecord;
+            // Connection plumbing, not stream content: every connection opens
+            // with it, and the tests here are about what follows.
+            if (message.type !== "dispatcher-host-instance") {
+              messages.push(message);
+            }
           }
         }
       }
@@ -229,6 +234,58 @@ describe("extension webview", () => {
       expect(html).toContain('rel="manifest" href="/manifest.webmanifest"');
       expect(html).toContain('rel="apple-touch-icon" href="/icon.png"');
       expect(html).toContain('navigator.serviceWorker.register("/sw.js"');
+    } finally {
+      if (previousRoot === undefined) {
+        delete process.env.CODEX_EXTENSION_WEBVIEW_ROOT;
+      } else {
+        process.env.CODEX_EXTENSION_WEBVIEW_ROOT = previousRoot;
+      }
+      rmSync(root, { recursive: true, force: true });
+    }
+  });
+
+  // The page's capnweb sessions live in the process that served it, so a page
+  // that outlives a dispatcher restart can only hang. The id in the page and
+  // the id on every stream connection are how it finds out and reloads itself,
+  // the way VS Code force-reloads webviews when the extension host restarts.
+  test("tells the page which host instance it is talking to", async () => {
+    const previousRoot = process.env.CODEX_EXTENSION_WEBVIEW_ROOT;
+    const root = mkdtempSync(join(tmpdir(), "codex-webview-instance-"));
+    process.env.CODEX_EXTENSION_WEBVIEW_ROOT = root;
+    writeFileSync(join(root, "index.html"), "<html><head></head><body></body></html>");
+
+    try {
+      const webview = new ExtensionWebview({
+        appServer: {} as never,
+        defaultCwd: "/repo",
+        getToken: () => "secret",
+      });
+
+      const html = await (
+        await webview.fetch(new Request("http://localhost/?token=secret"), new URL("http://localhost/?token=secret"))
+      ).text();
+      const embedded = /const hostInstanceId = "([0-9a-f-]+)"/.exec(html)?.[1];
+      expect(embedded).toBeDefined();
+
+      const streamResponse = await webview.fetch(
+        new Request("http://localhost/events", { headers: { cookie: "codex_dispatcher_webview=secret" } }),
+        new URL("http://localhost/events"),
+      );
+      const reader = streamResponse.body!.getReader();
+      const first = new TextDecoder().decode((await reader.read()).value);
+      await reader.cancel();
+      expect(first).toContain(`data: ${JSON.stringify({ type: "dispatcher-host-instance", instanceId: embedded })}`);
+
+      // Another process would embed another id, which is the whole signal.
+      const restarted = new ExtensionWebview({
+        appServer: {} as never,
+        defaultCwd: "/repo",
+        getToken: () => "secret",
+      });
+      const restartedHtml = await (
+        await restarted.fetch(new Request("http://localhost/?token=secret"), new URL("http://localhost/?token=secret"))
+      ).text();
+      expect(/const hostInstanceId = "([0-9a-f-]+)"/.exec(restartedHtml)?.[1]).not.toBe(embedded);
     } finally {
       if (previousRoot === undefined) {
         delete process.env.CODEX_EXTENSION_WEBVIEW_ROOT;
@@ -509,7 +566,7 @@ describe("extension webview", () => {
       }
       await reader?.cancel();
 
-      expect(text).toContain(": connected");
+      expect(text).toContain("dispatcher-host-instance");
       expect(text).toContain(`data: ${JSON.stringify(replayMessage)}`);
       expect(text).toMatch(/id: [0-9a-f-]+\.1\n/);
     } finally {

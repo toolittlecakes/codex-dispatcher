@@ -149,6 +149,11 @@ export class ExtensionWebview {
   // apart. The tab that opened a stream last is the one webview we admit.
   private activeClientId: string | null = null;
   private readonly startedAt = new Date().toISOString();
+  // Everything the page set up — capnweb RPC sessions above all — lived in the
+  // process that served it, so a page from another life can only hang. VS Code
+  // answers an extension-host restart by force-reloading every webview; the id
+  // is how a page finds out its host is not the one that rendered it.
+  private readonly hostInstanceId = crypto.randomUUID();
   private readonly messageCounts = new Map<string, number>();
   private readonly recentMessages: JsonObject[] = [];
   private readonly hostErrors: JsonObject[] = [];
@@ -938,7 +943,11 @@ select,
           }
         }, 5_000);
         streamController = controller;
-        controller.enqueue(encoder.encode(": connected\n\n"));
+        // No SSE id on purpose: this belongs to the connection, not the
+        // replayable stream, and must not advance the browser's Last-Event-ID.
+        controller.enqueue(
+          encoder.encode(`data: ${JSON.stringify({ type: "dispatcher-host-instance", instanceId: this.hostInstanceId })}\n\n`),
+        );
 
         if (!holdsSeat) {
           // Its buffer stopped being the whole story the moment another webview
@@ -1272,6 +1281,7 @@ select,
   const hostMessageUrl = ${JSON.stringify(`${routePrefix}/host-message`)};
   // Identifies this webview across event stream reconnects so buffered replies survive.
   const clientId = (crypto.randomUUID?.() ?? String(Date.now()) + Math.random().toString(16).slice(2));
+  const hostInstanceId = ${JSON.stringify(this.hostInstanceId)};
   const eventsUrl = ${JSON.stringify(`${routePrefix}/events?client=`)} + encodeURIComponent(clientId);
   const vscodeStateKey = "codex-extension-webview:vscode-state";
   const maxMessages = 500;
@@ -1309,6 +1319,16 @@ select,
       // being replaced, so this one stops here.
       if (message && message.type === "dispatcher-webview-superseded") {
         showSuperseded();
+        continue;
+      }
+      // The host that answered is not the one that rendered this page, so
+      // every session the page holds is gone with the old process. VS Code
+      // reloads its webviews on an extension-host restart; so do we.
+      if (message && message.type === "dispatcher-host-instance") {
+        if (message.instanceId !== hostInstanceId) {
+          events.close();
+          window.location.reload();
+        }
         continue;
       }
       remember(window.__codexHostAdapterInboundMessages, message);
