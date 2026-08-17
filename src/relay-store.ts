@@ -1,6 +1,7 @@
 import { existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import { dirname } from "node:path";
 import { RelayState, type RelayStateSnapshot } from "./relay-state";
+import { isRecord } from "./shared";
 
 export function readRelayState(path: string): RelayState {
   if (!existsSync(path)) {
@@ -95,8 +96,4 @@ function requiredArray(value: unknown, key: string): unknown[] {
     throw new Error(`Invalid relay state: ${key} must be an array.`);
   }
   return value;
-}
-
-function isRecord(value: unknown): value is Record<string, unknown> {
-  return typeof value === "object" && value !== null && !Array.isArray(value);
 }

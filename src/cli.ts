@@ -8,9 +8,10 @@ import { dirname, join, resolve } from "node:path";
 import packageJson from "../package.json" with { type: "json" };
 import { resolveCodexCliPath } from "./codex-app-server";
 import { readDispatcherConfig, writeDispatcherConfig, type DispatcherConfig } from "./dispatcher-config";
-import { resolveExtensionWebviewRoot } from "./extension-webview";
+import { resolveExtensionWebviewRoot, verifiedExtensionVersion } from "./extension-webview";
 import { buildGitHubDeviceCodeBody, buildGitHubDeviceTokenBody } from "./github-oauth";
 import { startRelayClient, type RelayClient } from "./relay-client";
+import { isRecord } from "./shared";
 
 type CliCommand = "serve" | "doctor" | "login" | "update";
 
@@ -88,9 +89,12 @@ try {
   const webviewRoot = await ensureCodexExtensionWebviewRoot(options.installExtension);
   const port = options.port ?? await findOpenPort(defaultPort);
   const token = randomBytes(18).toString("base64url");
-  const localTarget = `http://localhost:${port}`;
   const relayConfig = options.relay ? requireRelayConfig(options) : null;
-  const stableRemoteUrl = relayConfig ? stableRelayUrl(relayConfig) : null;
+  // The relay and the tunnel terminate TLS themselves and reach the dispatcher
+  // over loopback; without one of them the phone talks to it directly, and only
+  // https gives the webview the secure context it needs to boot.
+  const terminatesTlsUpstream = relayConfig !== null || options.tunnel !== null;
+  const localTarget = `${terminatesTlsUpstream ? "http" : "https"}://localhost:${port}`;
 
   console.log(`Codex extension webview: ${webviewRoot}`);
 
@@ -102,8 +106,8 @@ try {
     cwd: options.cwd,
     host: options.host,
     port,
-    remoteUrl: stableRemoteUrl ?? tunnelStart?.url ?? null,
     token,
+    tls: !terminatesTlsUpstream,
   });
 
   if (relayConfig) {
@@ -128,6 +132,7 @@ try {
     console.log(`Phone:  ${extensionUrl(tunnelStart.url, token)}`);
   } else {
     console.log("Phone:  use the LAN URL printed by dispatcher from a device on the same network");
+    console.log("        (self-signed certificate: accept it once, against the fingerprint above)");
   }
   console.log("");
 } catch (error) {
@@ -578,14 +583,22 @@ async function runDoctor(options: CliOptions): Promise<boolean> {
   const codexCliPath = resolveCodexCliPath();
   checks.push(await checkExecutable("Codex CLI", codexCliPath, ["--version"]));
 
-  const webviewRoot = resolveExtensionWebviewRoot();
+  // An unsupported installed version is a diagnosis, not a crash: doctor is
+  // exactly where the operator should read that message.
+  let webviewRoot: string | null = null;
+  let unsupportedExtension: string | null = null;
+  try {
+    webviewRoot = resolveExtensionWebviewRoot();
+  } catch (error) {
+    unsupportedExtension = error instanceof Error ? error.message : String(error);
+  }
   const codeCli = await checkExecutable("VS Code CLI", "code", ["--version"]);
   checks.push({
     label: "Codex VS Code extension webview",
-    ok: webviewRoot !== null || (options.installExtension && codeCli.ok),
-    detail: webviewRoot ?? (
+    ok: unsupportedExtension === null && (webviewRoot !== null || (options.installExtension && codeCli.ok)),
+    detail: unsupportedExtension ?? webviewRoot ?? (
       options.installExtension && codeCli.ok
-        ? `not installed yet; serve will install ${extensionId}`
+        ? `not installed yet; serve will install ${extensionId}@${verifiedExtensionVersion}`
         : "not found; install the extension or set CODEX_EXTENSION_WEBVIEW_ROOT"
     ),
   });
@@ -599,6 +612,19 @@ async function runDoctor(options: CliOptions): Promise<boolean> {
       ok: true,
       detail: "disabled by --no-tunnel",
     });
+  }
+
+  // Serving the LAN directly means serving it over TLS — a phone gets no
+  // `crypto.randomUUID` otherwise and the webview dies on boot — and the
+  // certificate for it is issued by openssl at startup.
+  if (options.relay || options.tunnel !== null) {
+    checks.push({
+      label: "OpenSSL",
+      ok: true,
+      detail: options.relay ? "not needed; the relay terminates TLS" : "not needed; the tunnel terminates TLS",
+    });
+  } else {
+    checks.push(await checkExecutable("OpenSSL", "openssl", ["version"]));
   }
 
   checks.push({
@@ -637,8 +663,8 @@ async function ensureCodexExtensionWebviewRoot(installMissing: boolean): Promise
     );
   }
 
-  console.log(`Codex VS Code extension was not found. Installing ${extensionId} with the VS Code CLI...`);
-  await runCommand("code", ["--install-extension", extensionId]);
+  console.log(`Codex VS Code extension was not found. Installing ${extensionId}@${verifiedExtensionVersion} with the VS Code CLI...`);
+  await runCommand("code", ["--install-extension", `${extensionId}@${verifiedExtensionVersion}`]);
 
   const installed = resolveExtensionWebviewRoot();
   if (!installed) {
@@ -697,8 +723,8 @@ function startDispatcher(options: {
   cwd: string;
   host: string;
   port: number;
-  remoteUrl: string | null;
   token: string;
+  tls: boolean;
 }): Promise<ChildProcess> {
   return new Promise((resolve, reject) => {
     const launch = serverLaunchCommand();
@@ -708,9 +734,9 @@ function startDispatcher(options: {
         ...process.env,
         CODEX_DISPATCHER_CWD: options.cwd,
         DISPATCHER_TOKEN: options.token,
+        DISPATCHER_TLS: options.tls ? "on" : "off",
         HOST: options.host,
         PORT: String(options.port),
-        ...(options.remoteUrl ? { DISPATCHER_REMOTE_URL: options.remoteUrl } : {}),
       },
     });
 
@@ -880,10 +906,6 @@ function requiredString(value: unknown, key: string): string {
     throw new Error(`${key} must be a non-empty string.`);
   }
   return value;
-}
-
-function isRecord(value: unknown): value is Record<string, unknown> {
-  return typeof value === "object" && value !== null && !Array.isArray(value);
 }
 
 function sleep(ms: number): Promise<void> {

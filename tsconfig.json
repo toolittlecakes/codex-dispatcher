@@ -12,5 +12,5 @@
     "exactOptionalPropertyTypes": true,
     "skipLibCheck": true
   },
-  "include": ["src/**/*.ts", "public/json-patch.js"]
+  "include": ["src/**/*.ts"]
 }

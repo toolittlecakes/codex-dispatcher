@@ -1,9 +1,11 @@
 import { randomBytes } from "node:crypto";
-import { buildGitHubAuthorizeRequest, buildGitHubWebTokenBody } from "./github-oauth";
+import { buildGitHubAuthorizeRequest, buildGitHubWebTokenBody, pruneExpiredOAuthStates } from "./github-oauth";
+import { pwaPublicPaths } from "./pwa";
 import { isRelayTlsDomainAllowed, slugFromRelayHostname } from "./relay-host";
 import { decodeRelayFrame, encodeRelayFrame, type RelayFrame } from "./relay-protocol";
 import { readRelayState, writeRelayState } from "./relay-store";
 import type { GitHubIdentity, RelayDispatcherSession } from "./relay-state";
+import { cookieValues, isRecord, jsonResponse } from "./shared";
 
 type DispatcherWsData = {
   kind: "dispatcher";
@@ -91,8 +93,8 @@ const relayServer = Bun.serve<DispatcherWsData>({
       state.disconnectDispatcher(session.userId, session.id);
       closePendingRequestsForDispatcher(session.id);
     },
-    message(_ws, raw) {
-      handleDispatcherFrame(raw.toString());
+    message(ws, raw) {
+      handleDispatcherFrame(ws, raw.toString());
     },
   },
 });
@@ -182,6 +184,7 @@ function handleDispatcherConnect(
 }
 
 function handleBrowserLoginStart(url: URL): Response {
+  pruneExpiredOAuthStates(pendingOAuthByState, Date.now());
   const returnTo = safeReturnPath(url.searchParams.get("returnTo") ?? "/");
   const auth = buildGitHubAuthorizeRequest({
     clientId: githubClientId,
@@ -198,13 +201,16 @@ function handleBrowserLoginStart(url: URL): Response {
 }
 
 async function handleBrowserLoginCallback(request: Request, url: URL): Promise<Response> {
+  // Pruning before the lookup is what expires an abandoned login: a state that
+  // outlived its TTL is gone by the time the callback asks for it.
+  pruneExpiredOAuthStates(pendingOAuthByState, Date.now());
   const stateParam = url.searchParams.get("state") ?? "";
   const code = url.searchParams.get("code") ?? "";
-  const cookieState = cookieValue(request.headers.get("cookie"), "codex_dispatcher_oauth_state");
+  const cookieStates = cookieValues(request.headers.get("cookie"), "codex_dispatcher_oauth_state");
   const pending = pendingOAuthByState.get(stateParam);
   pendingOAuthByState.delete(stateParam);
 
-  if (!pending || !code || cookieState !== stateParam) {
+  if (!pending || !code || !cookieStates.includes(stateParam)) {
     return new Response("Invalid GitHub login state.", { status: 400 });
   }
 
@@ -232,15 +238,20 @@ async function proxyBrowserRequest(request: Request, url: URL): Promise<Response
     return new Response("Unknown dispatcher user.", { status: 404 });
   }
 
-  const browserToken = cookieValue(request.headers.get("cookie"), "codex_dispatcher_session");
-  const browserUser = browserToken ? state.authenticateBrowserSession(browserToken, Date.now()) : null;
-  if (browserToken && !browserUser) {
-    persistRelayState();
-  }
-  if (!browserToken || browserUser?.id !== user.id) {
-    const loginUrl = new URL("/auth/github/start", publicBaseUrl);
-    loginUrl.searchParams.set("returnTo", `${url.pathname}${url.search}`);
-    return redirectResponse(loginUrl.toString());
+  if (!pwaPublicPaths.has(url.pathname)) {
+    const browserTokens = cookieValues(request.headers.get("cookie"), "codex_dispatcher_session");
+    const now = Date.now();
+    const browserUser = browserTokens
+      .map((token) => state.authenticateBrowserSession(token, now))
+      .find((session) => session?.id === user.id) ?? null;
+    if (browserTokens.length > 0 && !browserUser) {
+      persistRelayState();
+    }
+    if (browserUser?.id !== user.id) {
+      const loginUrl = new URL("/auth/github/start", publicBaseUrl);
+      loginUrl.searchParams.set("returnTo", `${url.pathname}${url.search}`);
+      return redirectResponse(loginUrl.toString());
+    }
   }
 
   const dispatcher = state.activeDispatcherForSlug(slug);
@@ -293,12 +304,17 @@ async function proxyThroughDispatcher(
   });
   request.signal.addEventListener("abort", () => cancelPendingRequest(requestId), { once: true });
 
+  // TLS ends here; the dispatcher only learns the browser's scheme from this
+  // header, and a client-supplied one must not be able to lie about it.
+  const forwardedHeaders = new Headers(request.headers);
+  forwardedHeaders.set("x-forwarded-proto", publicBase.protocol === "https:" ? "https" : "http");
+
   ws.send(encodeRelayFrame({
     type: "http-request",
     requestId,
     method: request.method,
     path: `${url.pathname}${url.search}`,
-    headers: Array.from(request.headers.entries()),
+    headers: Array.from(forwardedHeaders.entries()),
     bodyBase64,
   }));
 
@@ -316,11 +332,18 @@ function cancelPendingRequest(requestId: string): void {
   pendingRequestsById.delete(requestId);
 }
 
-function handleDispatcherFrame(raw: string): void {
-  const frame = decodeRelayFrame(raw);
+function handleDispatcherFrame(ws: Bun.ServerWebSocket<DispatcherWsData>, raw: string): void {
+  let frame: RelayFrame;
+  try {
+    frame = decodeRelayFrame(raw);
+  } catch {
+    ws.close();
+    return;
+  }
+
   switch (frame.type) {
     case "http-response-start": {
-      const pending = pendingRequestsById.get(frame.requestId);
+      const pending = pendingRequestForDispatcher(ws, frame.requestId);
       if (!pending) {
         return;
       }
@@ -343,7 +366,7 @@ function handleDispatcherFrame(raw: string): void {
       return;
     }
     case "http-response-chunk": {
-      const pending = pendingRequestsById.get(frame.requestId);
+      const pending = pendingRequestForDispatcher(ws, frame.requestId);
       if (!pending?.controller || pending.closed) {
         return;
       }
@@ -357,7 +380,7 @@ function handleDispatcherFrame(raw: string): void {
       return;
     }
     case "http-response-end": {
-      const pending = pendingRequestsById.get(frame.requestId);
+      const pending = pendingRequestForDispatcher(ws, frame.requestId);
       if (!pending?.controller || pending.closed) {
         return;
       }
@@ -371,12 +394,20 @@ function handleDispatcherFrame(raw: string): void {
       return;
     }
     case "http-response-error": {
-      const pending = pendingRequestsById.get(frame.requestId);
-      if (!pending) {
+      const pending = pendingRequestForDispatcher(ws, frame.requestId);
+      if (!pending || pending.closed) {
         return;
       }
       pendingRequestsById.delete(frame.requestId);
       pending.closed = true;
+      if (pending.controller) {
+        try {
+          pending.controller.error(new Error(frame.error));
+        } catch {
+          // The browser side may already have closed the stream.
+        }
+        return;
+      }
       pending.reject(new Error(frame.error));
       return;
     }
@@ -385,6 +416,18 @@ function handleDispatcherFrame(raw: string): void {
     default:
       return;
   }
+}
+
+function pendingRequestForDispatcher(
+  ws: Bun.ServerWebSocket<DispatcherWsData>,
+  requestId: string,
+): PendingRequest | null {
+  const session = ws.data.session;
+  const pending = pendingRequestsById.get(requestId);
+  if (!session || !pending || pending.dispatcherSessionId !== session.id) {
+    return null;
+  }
+  return pending;
 }
 
 function closePendingRequestsForDispatcher(sessionId: string): void {
@@ -471,13 +514,6 @@ function safeReturnPath(value: string): string {
   return value.startsWith("/") && !value.startsWith("//") ? value : "/";
 }
 
-function jsonResponse(value: unknown, status = 200): Response {
-  return new Response(JSON.stringify(value), {
-    status,
-    headers: { "content-type": "application/json" },
-  });
-}
-
 function redirectResponse(location: string, headers?: Record<string, string | string[]>): Response {
   const responseHeaders = new Headers({ location });
   for (const [key, value] of Object.entries(headers ?? {})) {
@@ -504,19 +540,6 @@ function expiredCookie(name: string): string {
   return `${name}=; Max-Age=0; Path=/; HttpOnly; SameSite=Lax${secure}${domain}`;
 }
 
-function cookieValue(header: string | null, name: string): string | null {
-  if (!header) {
-    return null;
-  }
-  for (const part of header.split(";")) {
-    const [rawKey, ...rawValue] = part.trim().split("=");
-    if (rawKey === name) {
-      return decodeURIComponent(rawValue.join("="));
-    }
-  }
-  return null;
-}
-
 function requiredEnv(name: string): string {
   const value = process.env[name];
   if (!value) {
@@ -531,8 +554,4 @@ function persistRelayState(): void {
 
 function secureToken(): string {
   return randomBytes(24).toString("base64url");
-}
-
-function isRecord(value: unknown): value is Record<string, unknown> {
-  return typeof value === "object" && value !== null && !Array.isArray(value);
 }

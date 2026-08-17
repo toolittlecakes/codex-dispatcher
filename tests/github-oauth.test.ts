@@ -4,6 +4,8 @@ import {
   buildGitHubDeviceCodeBody,
   buildGitHubDeviceTokenBody,
   buildGitHubWebTokenBody,
+  oauthStateTtlMs,
+  pruneExpiredOAuthStates,
 } from "../src/github-oauth";
 
 describe("GitHub OAuth helpers", () => {
@@ -54,5 +56,19 @@ describe("GitHub OAuth helpers", () => {
       redirect_uri: "https://relay.example.test/auth/github/callback",
       code_verifier: "verifier",
     });
+  });
+
+  test("drops login states nobody came back for", () => {
+    const now = Date.now();
+    const states = new Map([
+      ["abandoned", { createdAt: now - oauthStateTtlMs }],
+      ["in-flight", { createdAt: now - 1_000 }],
+    ]);
+
+    pruneExpiredOAuthStates(states, now);
+
+    // The callback looks the state up after pruning, so expiry and cleanup are
+    // the same act: an abandoned login can no longer be completed.
+    expect([...states.keys()]).toEqual(["in-flight"]);
   });
 });

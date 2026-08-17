@@ -1,6 +1,8 @@
 import { spawn, type ChildProcessWithoutNullStreams } from "node:child_process";
 import { existsSync } from "node:fs";
 import { createInterface } from "node:readline";
+import packageJson from "../package.json" with { type: "json" };
+import { toError } from "./shared";
 
 export type JsonValue =
   | string
@@ -28,12 +30,13 @@ export type AppServerRequest = {
   params: JsonValue;
 };
 
+export type ServerRequestResponse = { result: JsonValue } | { error: JsonValue };
+
 export type CodexAppServerEvent =
   | { type: "status"; status: "starting" | "ready" | "exited"; detail?: string }
   | { type: "stderr"; text: string }
   | { type: "notification"; notification: RpcMessage }
-  | { type: "serverRequest"; request: AppServerRequest }
-  | { type: "serverRequestResolved"; id: string };
+  | { type: "serverRequest"; request: AppServerRequest };
 
 type PendingRequest = {
   method: string;
@@ -56,6 +59,23 @@ export function resolveCodexCliPath(): string {
   return "codex";
 }
 
+// Callers that have to tell one failure from another — a turn that ended before
+// the stop reached it, say — need the app server's own words, so they survive
+// the method prefix that makes the message readable in a log.
+export class AppServerError extends Error {
+  constructor(
+    readonly method: string,
+    readonly reason: string,
+    // What the app server actually sent. VS Code forwards this object to the
+    // webview untouched, so anything we synthesise instead is a different
+    // error than the one the webview is written against.
+    readonly payload: JsonValue,
+  ) {
+    super(`${method}: ${reason}`);
+    this.name = "AppServerError";
+  }
+}
+
 export class CodexAppServer {
   readonly codexCliPath: string;
 
@@ -76,10 +96,6 @@ export class CodexAppServer {
 
   getPendingServerRequests(): AppServerRequest[] {
     return Array.from(this.serverRequests.values());
-  }
-
-  getPendingServerRequest(id: string): AppServerRequest | null {
-    return this.serverRequests.get(id) ?? null;
   }
 
   onEvent(listener: (event: CodexAppServerEvent) => void): () => void {
@@ -123,7 +139,7 @@ export class CodexAppServer {
       clientInfo: {
         name: "codex_mobile_dispatcher",
         title: "Codex Mobile Dispatcher",
-        version: "0.0.1",
+        version: packageJson.version,
       },
       capabilities: {
         experimentalApi: true,
@@ -154,15 +170,14 @@ export class CodexAppServer {
     this.write({ method, params });
   }
 
-  respondToServerRequest(id: string, result: JsonValue): void {
+  respondToServerRequest(id: string, response: ServerRequestResponse): void {
     const request = this.serverRequests.get(id);
     if (!request) {
       throw new Error(`No pending app-server request with id ${id}`);
     }
 
-    this.write({ id: request.id, result });
+    this.write("error" in response ? { id: request.id, error: response.error } : { id: request.id, result: response.result });
     this.serverRequests.delete(id);
-    this.emit({ type: "serverRequestResolved", id });
   }
 
   stop(): void {
@@ -229,7 +244,7 @@ export class CodexAppServer {
 
     this.pending.delete(key);
     if ("error" in message && message.error !== undefined && message.error !== null) {
-      pending.reject(new Error(formatAppServerError(pending.method, message.error)));
+      pending.reject(new AppServerError(pending.method, appServerErrorReason(message.error), message.error));
       return;
     }
 
@@ -250,17 +265,13 @@ export class CodexAppServer {
   }
 }
 
-function formatAppServerError(method: string, error: JsonValue): string {
+function appServerErrorReason(error: JsonValue): string {
   if (typeof error === "object" && error !== null && !Array.isArray(error)) {
     const message = error.message;
     if (typeof message === "string") {
-      return `${method}: ${message}`;
+      return message;
     }
   }
 
-  return `${method}: ${JSON.stringify(error)}`;
-}
-
-function toError(error: unknown): Error {
-  return error instanceof Error ? error : new Error(String(error));
+  return JSON.stringify(error);
 }

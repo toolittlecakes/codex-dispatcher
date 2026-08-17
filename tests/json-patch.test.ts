@@ -1,5 +1,5 @@
 import { describe, expect, test } from "bun:test";
-import { applyJsonPatches } from "../public/json-patch.js";
+import { applyJsonPatches } from "../src/json-patch";
 
 describe("applyJsonPatches", () => {
   test("applies immer-style array add, replace, and remove patches", () => {
@@ -54,6 +54,18 @@ describe("applyJsonPatches", () => {
     expect(() => applyJsonPatches({ turns: [] }, [{ op: "replace", path: ["turns", 0, "status"], value: "done" }])).toThrow(
       "Patch path does not exist",
     );
+  });
+
+  test("rejects non-canonical array indexes while walking down a path", () => {
+    // A coerced index would patch turns[0] instead of rejecting the path, and
+    // the mirror would keep serving the wrongly patched thread to followers.
+    for (const index of ["", "01", " 1", "-0"]) {
+      expect(() =>
+        applyJsonPatches({ turns: [{ status: "queued" }] }, [
+          { op: "replace", path: ["turns", index, "status"], value: "done" },
+        ]),
+      ).toThrow("Array patch key is not a valid index");
+    }
   });
 
   test("rejects prototype pollution paths", () => {

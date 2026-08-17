@@ -67,7 +67,7 @@ Local: http://localhost:<port>/?token=<token>
 Open from phone: http://<lan-ip>:<port>/?token=<token>
 ```
 
-Open the LAN URL from a phone on the same network. The first request uses the URL token to set an HttpOnly `codex_dispatcher_session` cookie. After that, the extension host endpoints use the cookie and the browser URL is scrubbed with `history.replaceState`.
+Open the LAN URL from a phone on the same network. The first request uses the URL token to set an HttpOnly `codex_dispatcher_webview` cookie. After that, the extension host endpoints use the cookie and the browser URL is scrubbed with `history.replaceState`.
 
 The explicit local-only flag is still accepted:
 

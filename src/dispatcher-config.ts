@@ -1,6 +1,7 @@
 import { existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import { homedir } from "node:os";
 import { dirname, join } from "node:path";
+import { isRecord } from "./shared";
 
 export type DispatcherConfig = {
   relay?: {
@@ -59,8 +60,4 @@ function requiredString(value: unknown, key: string): string {
     throw new Error(`Invalid codex-dispatcher config: ${key} must be a non-empty string.`);
   }
   return value;
-}
-
-function isRecord(value: unknown): value is Record<string, unknown> {
-  return typeof value === "object" && value !== null && !Array.isArray(value);
 }

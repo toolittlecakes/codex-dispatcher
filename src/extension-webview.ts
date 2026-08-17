@@ -1,8 +1,29 @@
-import { existsSync, mkdirSync, readFileSync, readdirSync, writeFileSync } from "node:fs";
+import { createHash, timingSafeEqual } from "node:crypto";
+import { existsSync, readFileSync, readdirSync } from "node:fs";
 import { homedir, platform, release } from "node:os";
 import { basename, dirname, join, resolve, sep } from "node:path";
-import type { CodexAppServer, CodexAppServerEvent, JsonObject, JsonValue } from "./codex-app-server";
+import { AppServerError } from "./codex-app-server";
+import type {
+  CodexAppServer,
+  CodexAppServerEvent,
+  JsonObject,
+  JsonValue,
+  ServerRequestResponse,
+} from "./codex-app-server";
 import type { IpcBroadcastMessage } from "./codex-ipc";
+import {
+  pwaHeadTags,
+  pwaIconFilePath,
+  pwaIconPath,
+  pwaManifest,
+  pwaManifestPath,
+  pwaServiceWorkerPath,
+  pwaServiceWorkerSource,
+} from "./pwa";
+import { readSettingDefinitions, type SettingDefinitions } from "./extension-settings";
+import { ExtensionState, extensionStatePath } from "./extension-state";
+import { cookieValues, isRecord, jsonResponse } from "./shared";
+import { WebviewRpcSession, parseRpcConnect, parseRpcMessage, type WebviewIpcCoordination } from "./webview-rpc";
 
 type HostMessage = JsonObject & {
   type?: string;
@@ -26,17 +47,30 @@ type ExtensionWebviewOptions = {
   getEventReplayMessages?: () => JsonObject[];
   statePath?: string;
   assertThreadFollowerOwner?: (conversationId: string) => Promise<void> | void;
-  handleIpcRequest?: (method: string, params: JsonValue, targetClientId?: string) => Promise<JsonValue>;
   getThreadRole?: (conversationId: string) => string | Promise<string>;
-  handleFollowerRequest?: (method: string, params: JsonValue) => Promise<JsonValue>;
-  handleThreadStreamSnapshotRequest?: (hostId: string, conversationId: string) => Promise<void> | void;
+  handleFollowerRequest?: (method: string, params: JsonValue, signal: AbortSignal) => Promise<JsonValue>;
+  ipcCoordination?: WebviewIpcCoordination;
+  // Who is on the bus and which threads are whose. The webview's own traffic
+  // says nothing about either, and that is exactly what a follower session that
+  // silently does nothing looks like from here.
+  getBridgeState?: () => JsonObject;
+  onThreadActivity?: (method: string, conversationId: string, thread?: JsonObject) => void;
 };
 
-type SseClient = {
+// One ordered delivery channel per webview instance. VS Code hands the webview a
+// single FIFO postMessage pipe; responses and broadcasts arriving over separate
+// transports could otherwise be observed out of causal order.
+type StreamClient = {
   id: string;
-  controller: ReadableStreamDefaultController<Uint8Array>;
-  heartbeat: ReturnType<typeof setInterval>;
+  epoch: string;
+  controller: ReadableStreamDefaultController<Uint8Array> | null;
+  heartbeat: ReturnType<typeof setInterval> | null;
+  seq: number;
+  buffer: { id: number; payload: JsonObject }[];
+  detachedAt: number | null;
 };
+
+type AuthTokenReader = (refreshToken: boolean) => Promise<string | null>;
 
 type FetchResponseOptions = {
   requestId: string | undefined;
@@ -45,87 +79,53 @@ type FetchResponseOptions = {
   status?: number;
 };
 
-type PersistentExtensionState = {
-  globalState: JsonObject;
-  persistedAtomState: JsonObject;
-};
-
 const routePrefix = "";
-const authCookieName = "codex_dispatcher_session";
+// Distinct from the relay's own `codex_dispatcher_session`: the relay sets that
+// one on `.<relay domain>`, so a same-named cookie from us would be sent
+// alongside it and the relay would read whichever the browser listed first.
+const authCookieName = "codex_dispatcher_webview";
 const encoder = new TextEncoder();
 const maxDiagnosticMessages = 200;
-const globalState = new Map<string, JsonValue>();
-const persistedAtomState = new Map<string, JsonValue>();
-const sharedObjectState = new Map<string, JsonValue>();
-let activeExtensionStatePath = extensionStatePath();
+// The webview only settles a pending fetch when a fetch-response arrives, and that
+// response rides back in the /host-message POST body. Relay-proxied requests are
+// given up on after 30s (relay-server startTimeout) and the connection is idle-closed
+// after 60s, so a host fetch that outlives either would leave the webview waiting
+// forever. Stay under the strictest link in that chain.
+const externalFetchTimeoutMs = 25_000;
+// `Tf`, `bst`, `Sst` and `Pf` in out/extension.js: the retry budget the backend
+// is tuned for, and the originator it recognises this client by.
+const externalFetchAttempts = 3;
+const externalFetchBaseBackoffMs = 300;
+const externalFetchMaxBackoffMs = 2_000;
+const chatgptOriginator = "codex_vscode";
+// `VGe`: the only response headers a stream reports back.
+const streamReportedHeaders = [
+  "s-cf-origin-ttfb-msec",
+  "s-cf-quic-rtt-msec",
+  "s-cf-tcp-rtt-msec",
+  "s-sa-server-ttfb-msec",
+  "x-oai-request-id",
+];
+// `Ee.LOCAL_PROJECTS` / `Ee.SELECTED_PROJECT` in out/extension.js.
+const localProjectsStateKey = "local-projects";
+const selectedProjectStateKey = "selected-project";
+const maxReplayEvents = 500;
+const detachedClientRetentionMs = 5 * 60_000;
+// The follower endpoints the webview actually calls (its `requestThreadFollower`
+// switch). Names it no longer knows would sit here answering nobody.
 const hostFollowerEndpointMethods: Record<string, string> = {
   "thread-follower-start-turn-for-host": "thread-follower-start-turn",
+  "thread-follower-load-complete-history-for-host": "thread-follower-load-complete-history",
   "thread-follower-steer-turn-for-host": "thread-follower-steer-turn",
   "thread-follower-interrupt-turn-for-host": "thread-follower-interrupt-turn",
   "thread-follower-compact-thread-for-host": "thread-follower-compact-thread",
-  "thread-follower-set-model-and-reasoning-for-host": "thread-follower-set-model-and-reasoning",
-  "thread-follower-set-collaboration-mode-for-host": "thread-follower-set-collaboration-mode",
+  "thread-follower-update-thread-settings-for-host": "thread-follower-update-thread-settings",
   "thread-follower-edit-last-user-turn-for-host": "thread-follower-edit-last-user-turn",
   "thread-follower-command-approval-decision-for-host": "thread-follower-command-approval-decision",
   "thread-follower-file-approval-decision-for-host": "thread-follower-file-approval-decision",
   "thread-follower-permissions-request-approval-response-for-host": "thread-follower-permissions-request-approval-response",
   "thread-follower-submit-user-input-for-host": "thread-follower-submit-user-input",
   "thread-follower-submit-mcp-server-elicitation-response-for-host": "thread-follower-submit-mcp-server-elicitation-response",
-  "thread-follower-set-queued-follow-ups-state-for-host": "thread-follower-set-queued-follow-ups-state",
-};
-const followerRequestTypes: Record<string, { method: string; responseType: string }> = {
-  "thread-follower-start-turn-request": {
-    method: "thread-follower-start-turn",
-    responseType: "thread-follower-start-turn-response",
-  },
-  "thread-follower-compact-thread-request": {
-    method: "thread-follower-compact-thread",
-    responseType: "thread-follower-compact-thread-response",
-  },
-  "thread-follower-steer-turn-request": {
-    method: "thread-follower-steer-turn",
-    responseType: "thread-follower-steer-turn-response",
-  },
-  "thread-follower-interrupt-turn-request": {
-    method: "thread-follower-interrupt-turn",
-    responseType: "thread-follower-interrupt-turn-response",
-  },
-  "thread-follower-set-model-and-reasoning-request": {
-    method: "thread-follower-set-model-and-reasoning",
-    responseType: "thread-follower-set-model-and-reasoning-response",
-  },
-  "thread-follower-set-collaboration-mode-request": {
-    method: "thread-follower-set-collaboration-mode",
-    responseType: "thread-follower-set-collaboration-mode-response",
-  },
-  "thread-follower-edit-last-user-turn-request": {
-    method: "thread-follower-edit-last-user-turn",
-    responseType: "thread-follower-edit-last-user-turn-response",
-  },
-  "thread-follower-command-approval-decision-request": {
-    method: "thread-follower-command-approval-decision",
-    responseType: "thread-follower-command-approval-decision-response",
-  },
-  "thread-follower-file-approval-decision-request": {
-    method: "thread-follower-file-approval-decision",
-    responseType: "thread-follower-file-approval-decision-response",
-  },
-  "thread-follower-permissions-request-approval-response-request": {
-    method: "thread-follower-permissions-request-approval-response",
-    responseType: "thread-follower-permissions-request-approval-response-response",
-  },
-  "thread-follower-submit-user-input-request": {
-    method: "thread-follower-submit-user-input",
-    responseType: "thread-follower-submit-user-input-response",
-  },
-  "thread-follower-submit-mcp-server-elicitation-response-request": {
-    method: "thread-follower-submit-mcp-server-elicitation-response",
-    responseType: "thread-follower-submit-mcp-server-elicitation-response-response",
-  },
-  "thread-follower-set-queued-follow-ups-state-request": {
-    method: "thread-follower-set-queued-follow-ups-state",
-    responseType: "thread-follower-set-queued-follow-ups-state-response",
-  },
 };
 
 export class ExtensionWebview {
@@ -134,21 +134,28 @@ export class ExtensionWebview {
   private readonly getToken: () => string;
   private readonly getEventReplayMessages: (() => JsonObject[]) | undefined;
   private readonly assertThreadFollowerOwner: ((conversationId: string) => Promise<void> | void) | undefined;
-  private readonly handleIpcRequest:
-    | ((method: string, params: JsonValue, targetClientId?: string) => Promise<JsonValue>)
-    | undefined;
   private readonly getThreadRole: ((conversationId: string) => string | Promise<string>) | undefined;
-  private readonly handleFollowerRequest: ((method: string, params: JsonValue) => Promise<JsonValue>) | undefined;
-  private readonly handleThreadStreamSnapshotRequest:
-    | ((hostId: string, conversationId: string) => Promise<void> | void)
-    | undefined;
-  private readonly clients = new Map<string, SseClient>();
+  private readonly handleFollowerRequest: ((method: string, params: JsonValue, signal: AbortSignal) => Promise<JsonValue>) | undefined;
+  private readonly ipcCoordination: WebviewIpcCoordination | undefined;
+  private readonly getBridgeState: (() => JsonObject) | undefined;
+  private readonly onThreadActivity: ((method: string, conversationId: string, thread?: JsonObject) => void) | undefined;
+  private readonly clients = new Map<string, StreamClient>();
+  private readonly externalFetches = new Map<string, AbortController>();
+  private readonly externalFetchStreams = new Map<string, AbortController>();
+  // One RPC session per webview, exactly as VS Code keys them by webview.
+  private readonly rpcSessions = new Map<string, WebviewRpcSession>();
+  // VS Code hosts exactly one webview, and the extension is written for that:
+  // an approval it answers twice is an error, and per-tab host replies drift
+  // apart. The tab that opened a stream last is the one webview we admit.
+  private activeClientId: string | null = null;
   private readonly startedAt = new Date().toISOString();
   private readonly messageCounts = new Map<string, number>();
   private readonly recentMessages: JsonObject[] = [];
   private readonly hostErrors: JsonObject[] = [];
   private readonly experimentalEnablementSetResults = new Map<string, JsonValue>();
   private readonly webviewRoot: string | null;
+  private readonly state: ExtensionState;
+  private settingDefinitionsCache: SettingDefinitions | null = null;
 
   constructor(options: ExtensionWebviewOptions) {
     this.appServer = options.appServer;
@@ -156,21 +163,36 @@ export class ExtensionWebview {
     this.getToken = options.getToken;
     this.getEventReplayMessages = options.getEventReplayMessages;
     this.assertThreadFollowerOwner = options.assertThreadFollowerOwner;
-    this.handleIpcRequest = options.handleIpcRequest;
     this.getThreadRole = options.getThreadRole;
     this.handleFollowerRequest = options.handleFollowerRequest;
-    this.handleThreadStreamSnapshotRequest = options.handleThreadStreamSnapshotRequest;
-    loadPersistentExtensionState(options.statePath ?? extensionStatePath());
+    this.ipcCoordination = options.ipcCoordination;
+    this.getBridgeState = options.getBridgeState;
+    this.onThreadActivity = options.onThreadActivity;
+    this.state = new ExtensionState(options.statePath ?? extensionStatePath());
     this.webviewRoot = resolveExtensionWebviewRoot();
-  }
-
-  canHandle(pathname: string): boolean {
-    return pathname.startsWith("/");
   }
 
   async fetch(request: Request, url: URL): Promise<Response> {
     if (!this.webviewRoot) {
       return new Response("Codex VS Code extension webview was not found.", { status: 404 });
+    }
+
+    // The install metadata carries no secrets and the browser fetches the
+    // manifest without our session cookie, so it stays outside the token gate.
+    if (url.pathname === pwaManifestPath) {
+      return new Response(pwaManifest(), {
+        headers: { "content-type": "application/manifest+json; charset=utf-8" },
+      });
+    }
+
+    if (url.pathname === pwaServiceWorkerPath) {
+      return new Response(pwaServiceWorkerSource, {
+        headers: { "content-type": "text/javascript; charset=utf-8", "service-worker-allowed": "/" },
+      });
+    }
+
+    if (url.pathname === pwaIconPath) {
+      return serveFile(pwaIconFilePath(this.webviewRoot));
     }
 
     if (!this.isAuthorized(request, url)) {
@@ -182,7 +204,7 @@ export class ExtensionWebview {
     }
 
     if (url.pathname === `${routePrefix}/events`) {
-      return this.openEventStream();
+      return this.openEventStream(request);
     }
 
     if (url.pathname === `${routePrefix}/debug`) {
@@ -190,20 +212,23 @@ export class ExtensionWebview {
     }
 
     if (url.pathname === routePrefix || url.pathname === `${routePrefix}/` || url.pathname === `${routePrefix}/index.html`) {
-      return this.serveIndex(url);
+      return this.serveIndex(request, url);
     }
 
     return this.serveAsset(url.pathname);
   }
 
   handleIpcBroadcast(broadcastMessage: IpcBroadcastMessage): void {
-    this.broadcast({
-      type: "ipc-broadcast",
-      method: broadcastMessage.method,
-      sourceClientId: broadcastMessage.sourceClientId,
-      version: broadcastMessage.version,
-      params: broadcastMessage.params,
-    });
+    this.recordMessage("outbound", { type: "ipc-broadcast", method: broadcastMessage.method });
+    this.pruneDetachedClients();
+    for (const [clientId, session] of this.rpcSessions) {
+      if (!this.clients.has(clientId)) {
+        session.dispose();
+        this.rpcSessions.delete(clientId);
+        continue;
+      }
+      session.deliverBroadcast(broadcastMessage);
+    }
   }
 
   handleAppServerEvent(event: CodexAppServerEvent): void {
@@ -240,13 +265,13 @@ export class ExtensionWebview {
   private isAuthorized(request: Request, url: URL): boolean {
     const token = this.getToken();
     return (
-      url.searchParams.get("token") === token ||
-      request.headers.get("x-dispatcher-token") === token ||
-      cookieValue(request.headers.get("cookie"), authCookieName) === token
+      secretEquals(url.searchParams.get("token"), token) ||
+      secretEquals(request.headers.get("x-dispatcher-token"), token) ||
+      cookieValues(request.headers.get("cookie"), authCookieName).some((value) => secretEquals(value, token))
     );
   }
 
-  private async serveIndex(url: URL): Promise<Response> {
+  private async serveIndex(request: Request, url: URL): Promise<Response> {
     const indexPath = join(this.webviewRoot!, "index.html");
     let html = await Bun.file(indexPath).text();
     html = html.replace("<!-- PROD_BASE_TAG_HERE -->", `<base href="${routePrefix}/">`);
@@ -257,11 +282,14 @@ export class ExtensionWebview {
     } else {
       html = html.replace("<head>", `<head>\n${this.buildViewportMeta()}`);
     }
-    html = html.replace("<head>", `<head>\n${this.buildViewportStyle()}\n${this.buildShim(url.searchParams.get("token") ?? "")}`);
+    html = html.replace(
+      "<head>",
+      `<head>\n${pwaHeadTags()}\n${this.buildViewportStyle()}\n${this.buildShim(url.searchParams.get("token") ?? "")}`,
+    );
 
     const headers = new Headers({ "content-type": "text/html; charset=utf-8" });
-    if (url.searchParams.get("token") === this.getToken()) {
-      headers.append("set-cookie", authCookie(this.getToken()));
+    if (secretEquals(url.searchParams.get("token"), this.getToken())) {
+      headers.append("set-cookie", authCookie(this.getToken(), isSecureRequest(request, url)));
     }
 
     return new Response(html, { headers });
@@ -277,16 +305,7 @@ export class ExtensionWebview {
       return new Response("Not found", { status: 404 });
     }
 
-    const file = Bun.file(assetPath);
-    if (!(await file.exists())) {
-      return new Response("Not found", { status: 404 });
-    }
-
-    return new Response(file, {
-      headers: {
-        "content-type": contentType(assetPath),
-      },
-    });
+    return serveFile(assetPath);
   }
 
   private buildViewportStyle(): string {
@@ -368,20 +387,43 @@ select,
   }
 
   private async handleHostMessage(request: Request): Promise<Response> {
-    let message: HostMessage;
+    const client = this.clientFor(clientIdFromRequest(request));
+
+    let batch: HostMessage[];
     try {
-      message = (await request.json()) as HostMessage;
+      batch = parseHostMessageBatch(await request.json());
     } catch {
-      return jsonResponse({ messages: [makeFetchResponse({ requestId: undefined, error: "Invalid JSON", status: 400 })] }, 400);
+      this.send(client, { type: "host-message-error", error: "Malformed host-message batch", sourceType: "unknown" });
+      return jsonResponse({ accepted: false }, 400);
     }
 
-    this.recordMessage("inbound", message);
+    // Checked after the body is read, not before: another tab can take the seat
+    // while we await it, and a batch dispatched past that point would drive the
+    // session from two webviews at once.
+    if (this.activeClientId !== null && this.activeClientId !== client.id) {
+      this.send(client, { type: "dispatcher-webview-superseded" });
+      return jsonResponse({ accepted: false, error: "superseded" }, 409);
+    }
+
+    // VS Code invokes the extension's message handler in send order but never
+    // waits for it, so start each message in order and let the slow ones (an
+    // external fetch) finish behind the messages that came after them.
+    for (const message of batch) {
+      this.recordMessage("inbound", message);
+      void this.dispatchHostMessage(client, message);
+    }
+    return jsonResponse({ accepted: true });
+  }
+
+  private async dispatchHostMessage(client: StreamClient, message: HostMessage): Promise<void> {
     try {
-      const messages = await this.routeHostMessage(message);
-      for (const outbound of messages) {
-        this.recordMessage("outbound", outbound);
+      if (this.routeRpcMessage(client, message)) {
+        return;
       }
-      return jsonResponse({ messages });
+      for (const outbound of await this.routeHostMessage(message)) {
+        this.recordMessage("outbound", outbound);
+        this.send(client, outbound);
+      }
     } catch (error) {
       const hostError = {
         type: "host-message-error",
@@ -389,8 +431,48 @@ select,
         sourceType: typeof message.type === "string" ? message.type : "unknown",
       };
       this.remember(this.hostErrors, hostError);
-      return jsonResponse({ messages: [hostError] }, 500);
+      this.send(client, hostError);
     }
+  }
+
+  // Not part of the message table below: an RPC frame belongs to one webview's
+  // session, and the table answers without knowing which webview asked.
+  private routeRpcMessage(client: StreamClient, message: HostMessage): boolean {
+    const sessionId = parseRpcConnect(message);
+    if (sessionId !== null) {
+      if (!this.ipcCoordination) {
+        throw new Error("IPC coordination is unavailable");
+      }
+      // A reconnecting webview opens a new session and abandons the old one;
+      // keeping both would double every broadcast into the same tab.
+      this.rpcSessions.get(client.id)?.dispose();
+      this.rpcSessions.set(
+        client.id,
+        new WebviewRpcSession(
+          sessionId,
+          this.ipcCoordination,
+          (outbound) => {
+            this.send(client, outbound);
+          },
+          (error) => {
+            this.remember(this.hostErrors, { type: "webview-rpc-error", error: error.message });
+          },
+        ),
+      );
+      return true;
+    }
+
+    const frame = parseRpcMessage(message);
+    if (!frame) {
+      return false;
+    }
+
+    const session = this.rpcSessions.get(client.id);
+    if (!session || session.sessionId !== frame.sessionId) {
+      throw new Error(`No webview RPC session ${frame.sessionId}`);
+    }
+    session.accept(frame.message);
+    return true;
   }
 
   private async routeHostMessage(message: HostMessage): Promise<JsonObject[]> {
@@ -399,14 +481,14 @@ select,
         return [
           { type: "chat-font-settings", chatFontSize: null, chatCodeFontSize: null },
           { type: "custom-prompts-updated", prompts: [] },
-          { type: "persisted-atom-sync", state: persistedStateObject() },
+          { type: "persisted-atom-sync", state: this.state.persistedAtoms() },
         ];
 
       case "persisted-atom-sync-request":
-        return [{ type: "persisted-atom-sync", state: persistedStateObject() }];
+        return [{ type: "persisted-atom-sync", state: this.state.persistedAtoms() }];
 
       case "persisted-atom-update":
-        updatePersistedAtomState(message);
+        this.state.applyAtomUpdate(message);
         this.broadcast({
           type: "persisted-atom-updated",
           key: typeof message.key === "string" ? message.key : "",
@@ -415,14 +497,30 @@ select,
         });
         return [];
 
-      case "persisted-atom-reset":
-        persistedAtomState.clear();
-        writePersistentExtensionState();
-        this.broadcast({ type: "persisted-atom-sync", state: {} });
-        return [];
-
       case "fetch":
         return [await this.handleFetchMessage(message)];
+
+      // `cP.cancel`: the webview gives up on a backend call the moment its own
+      // signal aborts, so a proxy that keeps fetching is burning the account's
+      // rate limit on an answer nobody is waiting for.
+      case "cancel-fetch":
+        if (typeof message.requestId === "string") {
+          this.externalFetches.get(message.requestId)?.abort();
+        }
+        return [];
+
+      // `cP.stream`: unlike a fetch, a stream has no reply to carry an answer —
+      // the webview settles it only on `fetch-stream-complete` or
+      // `-error`, so a host that says nothing leaves it waiting forever.
+      case "fetch-stream":
+        this.startExternalFetchStream(message);
+        return [];
+
+      case "cancel-fetch-stream":
+        if (typeof message.requestId === "string") {
+          this.externalFetchStreams.get(message.requestId)?.abort();
+        }
+        return [];
 
       case "mcp-request":
       case "thread-prewarm-start":
@@ -448,8 +546,8 @@ select,
       case "shared-object-set":
         if (typeof message.key === "string") {
           const nextValue = message.value ?? null;
-          if (!jsonValuesEqual(sharedObjectValue(message.key), nextValue)) {
-            sharedObjectState.set(message.key, nextValue);
+          if (!jsonValuesEqual(this.state.sharedObjectValue(message.key), nextValue)) {
+            this.state.setSharedObject(message.key, nextValue);
             this.broadcast(this.sharedObjectUpdateMessage(message.key));
           }
         }
@@ -463,104 +561,186 @@ select,
         return [];
 
       default:
-        if (message.type && message.type in followerRequestTypes) {
-          return [await this.handleThreadFollowerRequest(message)];
-        }
-        if (message.type === "thread-role-request") {
-          return [await this.handleThreadRoleRequest(message)];
-        }
-        if (message.type === "thread-stream-snapshot-request") {
-          await this.handleThreadStreamSnapshotMessage(message);
-          return [];
-        }
-        if (message.type === "thread-stream-resume-request") {
-          return [];
-        }
         return [];
     }
   }
 
-  private async handleThreadFollowerRequest(message: HostMessage): Promise<JsonObject> {
-    const requestType = message.type ?? "";
-    const request = followerRequestTypes[requestType];
-    const requestId = typeof message.requestId === "string" ? message.requestId : "";
-    if (!request) {
-      return { type: "thread-follower-request-response", requestId, error: `Unsupported follower request: ${requestType}` };
-    }
-
-    try {
-      if (!this.handleFollowerRequest) {
-        throw new Error("IPC follower bridge is unavailable");
-      }
-      const result = await this.handleFollowerRequest(request.method, message.params ?? {});
-      return { type: request.responseType, requestId, result };
-    } catch (error) {
-      return {
-        type: request.responseType,
-        requestId,
-        error: error instanceof Error ? error.message : String(error),
-      };
-    }
-  }
-
-  private async handleThreadRoleRequest(message: HostMessage): Promise<JsonObject> {
-    const requestId = typeof message.requestId === "string" ? message.requestId : "";
-    const conversationId = typeof message.conversationId === "string" ? message.conversationId : "";
-    try {
-      const role = this.getThreadRole ? await this.getThreadRole(conversationId) : "follower";
-      return { type: "thread-role-response", requestId, role };
-    } catch (error) {
-      return {
-        type: "thread-role-response",
-        requestId,
-        role: "follower",
-        error: error instanceof Error ? error.message : String(error),
-      };
-    }
-  }
-
-  private async handleThreadStreamSnapshotMessage(message: HostMessage): Promise<void> {
-    if (!this.handleThreadStreamSnapshotRequest) {
-      return;
-    }
-    if (typeof message.hostId !== "string" || typeof message.conversationId !== "string") {
-      return;
-    }
-    await this.handleThreadStreamSnapshotRequest(message.hostId, message.conversationId);
-  }
-
   private async handleFetchMessage(message: HostMessage): Promise<JsonObject> {
     const requestId = typeof message.requestId === "string" ? message.requestId : undefined;
+    // The controller is registered before the `vscode://codex` branch, as it is
+    // in the bundle: a follower call waits on another client of the bus, which
+    // is exactly the wait a cancel needs to be able to cut.
+    const cancel = new AbortController();
+    if (requestId) {
+      this.externalFetches.set(requestId, cancel);
+    }
     try {
       if (typeof message.url === "string" && message.url.startsWith("vscode://codex/")) {
         const endpoint = parseVSCodeCodexEndpoint(message.url);
         const body = parseOptionalBody(message.body);
-        if (endpoint === "ipc-request") {
-          const result = await this.handleVSCodeIpcRequest(body);
-          return makeFetchResponse({ requestId, result });
-        }
-        const hostResult = await this.handleVSCodeHostRequest(endpoint, body);
+        const hostResult = await this.handleVSCodeHostRequest(endpoint, body, cancel.signal);
         if (hostResult.handled) {
           return makeFetchResponse({ requestId, result: hostResult.result });
         }
-        const result = await handleVSCodeRequest(endpoint, body, this.defaultCwd);
+        const result = await handleVSCodeRequest(endpoint, body, this.defaultCwd, this.webviewRoot);
         return makeFetchResponse({ requestId, result });
       }
 
-      return await handleExternalFetch(message, requestId);
+      return await handleExternalFetch(message, requestId, (refreshToken) => this.readAuthToken(refreshToken), {
+        userAgent: this.backendUserAgent(),
+        cancelSignal: cancel.signal,
+      });
     } catch (error) {
       return makeFetchResponse({
         requestId,
         error: error instanceof Error ? error.message : String(error),
-        status: 501,
+        status: 433,
       });
+    } finally {
+      if (requestId) {
+        this.externalFetches.delete(requestId);
+      }
     }
+  }
+
+  private startExternalFetchStream(message: HostMessage): void {
+    const requestId = requireString(message.requestId, "fetch-stream requestId");
+    const cancel = new AbortController();
+    this.externalFetchStreams.set(requestId, cancel);
+
+    void handleExternalFetchStream(
+      message,
+      requestId,
+      (refreshToken) => this.readAuthToken(refreshToken),
+      { userAgent: this.backendUserAgent(), cancelSignal: cancel.signal },
+      (event) => this.broadcast(event),
+    )
+      .catch((error: unknown) => {
+        this.broadcast({
+          type: "fetch-stream-error",
+          requestId,
+          error: error instanceof Error ? error.message : String(error),
+        });
+      })
+      .finally(() => {
+        this.externalFetchStreams.delete(requestId);
+      });
+  }
+
+  // `setUserAgent(initializeResult.userAgent ?? Pf)`: the app server names the
+  // client, and only falls back to the bare originator when it does not. Before
+  // it has answered, the extension sends no header at all — but a missing header
+  // is not a missing name here: Bun would put `Bun/<version>` on the wire, so the
+  // extension's own fallback is the closer thing to say.
+  private backendUserAgent(): string {
+    const userAgent = asObject(this.appServer.initialized)?.userAgent;
+    return typeof userAgent === "string" && userAgent.length > 0 ? userAgent : chatgptOriginator;
+  }
+
+  // Read once, on the first setting a webview asks for, out of the bundle whose
+  // webview we are serving: a table copied into this repository would drift from
+  // whichever extension version is actually installed, and the drift would be
+  // invisible — wrong defaults look exactly like a user's choices.
+  private settingDefinitions(): SettingDefinitions {
+    if (!this.settingDefinitionsCache) {
+      if (!this.webviewRoot) {
+        throw new Error("Codex VS Code extension was not found, so its settings cannot be read.");
+      }
+      this.settingDefinitionsCache = readSettingDefinitions(join(dirname(this.webviewRoot), "out", "extension.js"));
+    }
+    return this.settingDefinitionsCache;
+  }
+
+  // A setting with no default in the table has none to send: the extension
+  // answers `stored ?? undefined` there, and undefined is a key the webview
+  // never receives rather than a null it would store.
+  private settingDefault(key: string): JsonValue | undefined {
+    const definitions = this.settingDefinitions();
+    if (!definitions.has(key)) {
+      throw new Error(`Unknown setting: ${key}`);
+    }
+    return definitions.get(key);
   }
 
   private async handleVSCodeHostRequest(
     endpoint: string,
     body: JsonValue,
+    signal: AbortSignal,
   ): Promise<{ handled: true; result: JsonValue } | { handled: false }> {
+    // Memento storage belongs to this host's state, not to the stateless
+    // endpoint table below it.
+    if (endpoint === "get-global-state") {
+      const key = asObject(body)?.key;
+      if (typeof key !== "string") {
+        return { handled: true, result: { value: null } };
+      }
+
+      // The extension does not store the open project — it derives one from the
+      // window's workspace folders every time it is asked (`$W(Ib())`). Answer
+      // from our own workspace or the composer has no cwd to run a turn in and
+      // refuses to send anything at all.
+      const project = workspaceProject([this.defaultCwd]);
+      if (key === localProjectsStateKey) {
+        return { handled: true, result: { value: project ? { [String(project.id)]: project } : {} } };
+      }
+      if (key === selectedProjectStateKey) {
+        const stored = asObject(this.state.globalValue(key));
+        if (stored?.type === "remote" && typeof stored.projectId === "string") {
+          return { handled: true, result: { value: stored } };
+        }
+        return {
+          handled: true,
+          result: { value: project ? { type: "local", projectId: project.id } : null },
+        };
+      }
+
+      return { handled: true, result: { value: this.state.globalValue(key) } };
+    }
+
+    if (endpoint === "set-global-state") {
+      const params = asObject(body);
+      if (typeof params?.key === "string") {
+        this.state.setGlobalValue(params.key, params.value ?? null);
+      }
+      return { handled: true, result: { success: true } };
+    }
+
+    // Which of VS Code's three stores a setting lives in is the extension's
+    // business, not the webview's: the webview reads and writes every setting
+    // through these three endpoints and never looks at the storage kind. So one
+    // store answers all of them — but the value it answers with is
+    // `stored ?? default`, exactly as the extension's `getSettingValue` does,
+    // because the webview's hook for a setting's *configured* value has no
+    // fallback of its own and reads a missing key as a deliberate one.
+    if (endpoint === "get-settings") {
+      const values: JsonObject = {};
+      for (const [key, fallback] of this.settingDefinitions()) {
+        const value = this.state.storedSetting(key) ?? fallback;
+        if (value !== undefined) {
+          values[key] = value;
+        }
+      }
+      return { handled: true, result: { values } };
+    }
+
+    if (endpoint === "get-setting") {
+      const key = requireString(requireObject(body, "get-setting params").key, "key");
+      // The table is consulted first, as the extension does: a value left in our
+      // store by a version that still had the setting is not an answer.
+      const fallback = this.settingDefault(key);
+      return { handled: true, result: { value: this.state.storedSetting(key) ?? fallback ?? null } };
+    }
+
+    if (endpoint === "set-setting") {
+      const params = requireObject(body, "set-setting params");
+      const key = requireString(params.key, "key");
+      // The same refusal the extension gives a key its table does not have; the
+      // webview answers it by rolling back the change it already drew.
+      this.settingDefault(key);
+      this.state.setSetting(key, params.value ?? null);
+      return { handled: true, result: { success: true } };
+    }
+
     if (endpoint === "thread-role-for-host") {
       const params = requireObject(body, "thread-role-for-host params");
       const conversationId = requireString(params.conversationId, "conversationId");
@@ -586,13 +766,22 @@ select,
 
     return {
       handled: true,
-      result: await this.handleFollowerRequest(followerMethod, stripHostId(requireObject(body, `${endpoint} params`))),
+      result: await this.handleFollowerRequest(followerMethod, stripHostId(requireObject(body, `${endpoint} params`)), signal),
     };
+  }
+
+  // The extension asks the app server for the account token instead of reading
+  // the credentials itself (`p1.getToken` → `getAuthStatus{includeToken}`), so
+  // the refresh happens in the one process that owns the login.
+  private async readAuthToken(refreshToken: boolean): Promise<string | null> {
+    const status = asObject(await this.appServer.request("getAuthStatus", { includeToken: true, refreshToken }));
+    const token = status?.authToken;
+    return typeof token === "string" ? token : null;
   }
 
   private async handleMcpRequest(message: HostMessage): Promise<JsonObject> {
     const request = asObject(message.request);
-    if (!request || typeof request.id !== "string" || typeof request.method !== "string") {
+    if (!request || !isRpcId(request.id) || typeof request.method !== "string") {
       return {
         type: "mcp-response",
         hostId: "local",
@@ -607,18 +796,30 @@ select,
       const originalParams = request.params ?? {};
       const params = normalizeAppServerRequestParams(request.method, originalParams);
       const result = await this.handleAppServerRequest(request.method, params, originalParams);
+      const startedThread = asObject(asObject(result)?.thread);
+      const threadId = appServerThreadId(params, result);
+      if (threadId) {
+        this.onThreadActivity?.(request.method, threadId, startedThread ?? undefined);
+      }
       return {
         type: "mcp-response",
         hostId: "local",
         message: { id: request.id, result },
       };
     } catch (error) {
+      // The app server's error goes to the webview exactly as it arrived, the
+      // way VS Code forwards it: the webview matches on its wording — «no
+      // active turn to interrupt» is how it recognises a turn that ended
+      // before the stop reached it — and our method prefix hides that.
       return {
         type: "mcp-response",
         hostId: "local",
         message: {
           id: request.id,
-          error: { message: error instanceof Error ? error.message : String(error) },
+          error:
+            error instanceof AppServerError
+              ? error.payload
+              : { message: error instanceof Error ? error.message : String(error) },
         },
       };
     }
@@ -643,17 +844,6 @@ select,
     return result;
   }
 
-  private async handleVSCodeIpcRequest(body: JsonValue): Promise<JsonValue> {
-    if (!this.handleIpcRequest) {
-      throw new Error("IPC request bridge is unavailable");
-    }
-
-    const params = requireObject(body, "ipc-request params");
-    const method = requireString(params.method, "method");
-    const targetClientId = typeof params.targetClientId === "string" ? params.targetClientId : undefined;
-    return this.handleIpcRequest(method, params.params ?? {}, targetClientId);
-  }
-
   private handleMcpNotification(message: HostMessage): void {
     const request = asObject(message.request);
     if (!request || typeof request.method !== "string") {
@@ -664,10 +854,10 @@ select,
 
   private handleMcpResponse(message: HostMessage): void {
     const response = asObject(message.response);
-    if (!response || (typeof response.id !== "string" && typeof response.id !== "number")) {
+    if (!response || !isRpcId(response.id)) {
       throw new Error("Invalid mcp-response payload");
     }
-    this.appServer.respondToServerRequest(String(response.id), response.result ?? null);
+    this.appServer.respondToServerRequest(String(response.id), serverRequestResponse(response));
   }
 
   private handleWorkerRequest(message: HostMessage): JsonObject {
@@ -715,37 +905,69 @@ select,
     return {
       type: "shared-object-updated",
       key: objectKey,
-      value: sharedObjectValue(objectKey),
+      value: this.state.sharedObjectValue(objectKey),
     };
   }
 
-  private openEventStream(): Response {
-    let clientId = "";
+  private openEventStream(request: Request): Response {
+    // Prune first: collecting a record right after handing it out would leave
+    // this stream attached to an orphan that broadcasts no longer reach.
+    this.pruneDetachedClients();
+    const client = this.clientFor(clientIdFromRequest(request));
+    const resumeFrom = parseResumePoint(client, request.headers.get("last-event-id"));
+    // Only a page load takes the seat. A browser reconnect continues a stream
+    // this webview already had, and treating it as a new webview would let a
+    // backgrounded tab whose SSE dropped steal the session back from the tab
+    // the user is actually looking at.
+    if (resumeFrom === null) {
+      this.makeActive(client);
+    }
+    const holdsSeat = this.activeClientId === client.id;
+
+    let streamController: ReadableStreamDefaultController<Uint8Array> | null = null;
     const stream = new ReadableStream<Uint8Array>({
       start: (controller) => {
-        clientId = crypto.randomUUID();
-        const heartbeat = setInterval(() => {
+        this.detachClient(client);
+        client.controller = controller;
+        client.detachedAt = null;
+        client.heartbeat = setInterval(() => {
           try {
             controller.enqueue(encoder.encode(": heartbeat\n\n"));
           } catch {
-            clearInterval(heartbeat);
-            this.clients.delete(clientId);
+            this.detachIfCurrent(client, controller);
           }
         }, 5_000);
-        this.clients.set(clientId, { id: clientId, controller, heartbeat });
+        streamController = controller;
         controller.enqueue(encoder.encode(": connected\n\n"));
+
+        if (!holdsSeat) {
+          // Its buffer stopped being the whole story the moment another webview
+          // took over, so there is nothing safe to resume into: say why and let
+          // the tab reload if the user wants it back.
+          this.send(client, { type: "dispatcher-webview-superseded" });
+          return;
+        }
+
+        const missed = bufferedAfter(client, resumeFrom);
+        for (const event of missed ?? []) {
+          controller.enqueue(encodeSseMessage(client, event.payload, event.id));
+        }
+        if (resumeFrom !== null && missed) {
+          return;
+        }
+
+        // A stream this webview has never read from: whatever we could replay
+        // above is its own pending traffic, and current state still has to
+        // follow it — pending approvals live only in this snapshot. These go
+        // through the normal numbering so a drop mid-snapshot can be resumed.
         for (const message of this.getEventReplayMessages?.() ?? []) {
-          controller.enqueue(encodeSseMessage(message));
+          this.send(client, message);
         }
       },
       cancel: () => {
-        if (clientId) {
-          const client = this.clients.get(clientId);
-          if (client) {
-            clearInterval(client.heartbeat);
-          }
-          this.clients.delete(clientId);
-        }
+        // A dead socket can be reported long after the tab already reconnected;
+        // only the connection that is still attached may tear the client down.
+        this.detachIfCurrent(client, streamController);
       },
     });
 
@@ -757,16 +979,101 @@ select,
     });
   }
 
+  private makeActive(client: StreamClient): void {
+    if (this.activeClientId === client.id) {
+      return;
+    }
+
+    const superseded = this.activeClientId === null ? undefined : this.clients.get(this.activeClientId);
+    this.activeClientId = client.id;
+    if (superseded) {
+      // Its RPC session goes with the seat: a displaced tab is refused at
+      // /host-message, so anything we asked it would wait for an answer that
+      // can no longer come back.
+      this.rpcSessions.get(superseded.id)?.dispose();
+      this.rpcSessions.delete(superseded.id);
+      // Told on its own stream, before it stops receiving broadcasts, so the
+      // tab can say why it went quiet instead of just freezing.
+      this.send(superseded, { type: "dispatcher-webview-superseded" });
+    }
+  }
+
+  private clientFor(clientId: string): StreamClient {
+    const existing = this.clients.get(clientId);
+    if (existing) {
+      return existing;
+    }
+
+    const client: StreamClient = {
+      id: clientId,
+      epoch: crypto.randomUUID(),
+      controller: null,
+      heartbeat: null,
+      seq: 0,
+      buffer: [],
+      detachedAt: Date.now(),
+    };
+    this.clients.set(clientId, client);
+    return client;
+  }
+
+  private detachIfCurrent(client: StreamClient, controller: ReadableStreamDefaultController<Uint8Array> | null): void {
+    if (controller !== null && client.controller === controller) {
+      this.detachClient(client);
+    }
+  }
+
+  private detachClient(client: StreamClient): void {
+    if (client.heartbeat) {
+      clearInterval(client.heartbeat);
+      client.heartbeat = null;
+    }
+    client.controller = null;
+    client.detachedAt = Date.now();
+  }
+
+  private pruneDetachedClients(): void {
+    const cutoff = Date.now() - detachedClientRetentionMs;
+    for (const client of this.clients.values()) {
+      if (client.detachedAt !== null && client.detachedAt < cutoff) {
+        this.clients.delete(client.id);
+        if (this.activeClientId === client.id) {
+          // Leaving the id behind would keep a gone webview holding the seat:
+          // every other tab would be told it was superseded by nobody.
+          this.activeClientId = null;
+        }
+      }
+    }
+  }
+
+  // Queue for a single webview. Buffered while its stream is down so a reconnect
+  // can resume rather than lose the message.
+  private send(client: StreamClient, message: JsonObject): void {
+    client.seq += 1;
+    client.buffer.push({ id: client.seq, payload: message });
+    if (client.buffer.length > maxReplayEvents) {
+      client.buffer.splice(0, client.buffer.length - maxReplayEvents);
+    }
+
+    if (!client.controller) {
+      return;
+    }
+
+    try {
+      client.controller.enqueue(encodeSseMessage(client, message, client.seq));
+    } catch {
+      this.detachClient(client);
+    }
+  }
+
   private broadcast(message: JsonObject): void {
     this.recordMessage("outbound", message);
-    const payload = encodeSseMessage(message);
-    for (const client of this.clients.values()) {
-      try {
-        client.controller.enqueue(payload);
-      } catch {
-        clearInterval(client.heartbeat);
-        this.clients.delete(client.id);
-      }
+    // Tabs that never come back are only reachable from here: a closed webview
+    // stops opening streams, so this is the one place left to collect it.
+    this.pruneDetachedClients();
+    const active = this.activeClientId === null ? undefined : this.clients.get(this.activeClientId);
+    if (active) {
+      this.send(active, message);
     }
   }
 
@@ -963,7 +1270,9 @@ select,
   else document.addEventListener("DOMContentLoaded", applyBodyThemeClass, { once: true });
 
   const hostMessageUrl = ${JSON.stringify(`${routePrefix}/host-message`)};
-  const eventsUrl = ${JSON.stringify(`${routePrefix}/events`)};
+  // Identifies this webview across event stream reconnects so buffered replies survive.
+  const clientId = (crypto.randomUUID?.() ?? String(Date.now()) + Math.random().toString(16).slice(2));
+  const eventsUrl = ${JSON.stringify(`${routePrefix}/events?client=`)} + encodeURIComponent(clientId);
   const vscodeStateKey = "codex-extension-webview:vscode-state";
   const maxMessages = 500;
   const remember = (target, message) => {
@@ -977,31 +1286,89 @@ select,
     });
   };
   const postToWindow = (message) => window.postMessage(message, window.location.origin);
+  let superseded = false;
+  const showSuperseded = () => {
+    if (superseded) return;
+    superseded = true;
+    events.close();
+    const overlay = document.createElement("div");
+    overlay.setAttribute("data-codex-dispatcher-superseded", "");
+    overlay.style.cssText = "position:fixed;inset:0;z-index:2147483647;display:flex;flex-direction:column;align-items:center;justify-content:center;gap:16px;padding:24px;text-align:center;background:rgba(0,0,0,.86);color:#fff;font:15px/1.45 system-ui,-apple-system,sans-serif";
+    const text = document.createElement("div");
+    text.textContent = "Codex moved to another tab. Only one can drive the session.";
+    const button = document.createElement("button");
+    button.textContent = "Use this tab instead";
+    button.style.cssText = "padding:10px 18px;border:0;border-radius:8px;font:inherit;cursor:pointer;background:#fff;color:#000";
+    button.addEventListener("click", () => window.location.reload());
+    overlay.append(text, button);
+    (document.body || document.documentElement).appendChild(overlay);
+  };
   const deliver = (messages) => {
     for (const message of messages || []) {
+      // Ours, not the extension's: the host contract has no notion of a webview
+      // being replaced, so this one stops here.
+      if (message && message.type === "dispatcher-webview-superseded") {
+        showSuperseded();
+        continue;
+      }
       remember(window.__codexHostAdapterInboundMessages, message);
       postToWindow(message);
     }
   };
-  const sendHostMessage = async (message) => {
-    remember(window.__codexHostAdapterMessages, message);
-    try {
-      const response = await fetch(hostMessageUrl, {
-        method: "POST",
-        headers: { "content-type": "application/json" },
-        body: JSON.stringify(message),
-      });
-      const body = await response.json();
-      deliver(body.messages);
-    } catch (error) {
-      const adapterError = {
-        type: "host-adapter-error",
-        error: error instanceof Error ? error.message : String(error),
-        sourceType: typeof message?.type === "string" ? message.type : "unknown",
-      };
-      remember(window.__codexHostAdapterInboundMessages, adapterError);
-      console.error("[codex-extension-webview] host-message failed", error);
+  const outbox = [];
+  let flushing = false;
+  const flushOutbox = async () => {
+    if (flushing) {
+      return;
     }
+    flushing = true;
+    try {
+      while (outbox.length > 0) {
+        // One request in flight at a time: parallel posts arrive in whatever
+        // order the network feels like, and VS Code hands the extension its
+        // postMessage traffic strictly in send order.
+        const batch = outbox.splice(0, outbox.length);
+        try {
+          // Replies come back over the event stream, not in this response body, so the
+          // webview observes host traffic in one order instead of racing two channels.
+          const response = await fetch(hostMessageUrl, {
+            method: "POST",
+            headers: { "content-type": "application/json", "x-dispatcher-client": clientId },
+            body: '{"messages":[' + batch.map((entry) => entry.json).join(",") + ']}',
+          });
+          if (response.status === 409) {
+            showSuperseded();
+          }
+          if (!response.ok) {
+            throw new Error("host rejected the message batch with " + response.status);
+          }
+        } catch (error) {
+          // A dropped batch is a dead end for every promise waiting on it, so
+          // make it loud instead of leaving the webview waiting forever.
+          for (const entry of batch) {
+            remember(window.__codexHostAdapterInboundMessages, {
+              type: "host-adapter-error",
+              error: error instanceof Error ? error.message : String(error),
+              sourceType: entry.sourceType,
+            });
+          }
+          console.error("[codex-extension-webview] host-message failed", error);
+        }
+      }
+    } finally {
+      flushing = false;
+    }
+  };
+  const sendHostMessage = (message) => {
+    remember(window.__codexHostAdapterMessages, message);
+    // Serialise per message: VS Code's postMessage throws at the caller for a
+    // value it cannot clone, instead of taking its neighbours down with it.
+    const json = JSON.stringify(message);
+    if (json === undefined) {
+      throw new TypeError("postMessage payload is not serialisable for the host channel");
+    }
+    outbox.push({ json, sourceType: typeof message?.type === "string" ? message.type : "unknown" });
+    void flushOutbox();
   };
 
   window.__codexHostAdapterMessages = [];
@@ -1010,7 +1377,7 @@ select,
   window.addEventListener("error", (event) => rememberClientError(event.error ?? event.message));
   window.addEventListener("unhandledrejection", (event) => rememberClientError(event.reason));
   window.acquireVsCodeApi = () => ({
-    postMessage: (message) => { void sendHostMessage(message); },
+    postMessage: (message) => { sendHostMessage(message); },
     getState: () => {
       try { return JSON.parse(localStorage.getItem(vscodeStateKey) || "null"); } catch { return null; }
     },
@@ -1024,6 +1391,17 @@ select,
   events.onmessage = (event) => {
     try { deliver([JSON.parse(event.data)]); } catch (error) { console.error(error); }
   };
+  // EventSource reconnects on its own and replays through Last-Event-ID, but a
+  // silent drop used to look identical to an idle session, so make it visible.
+  events.onerror = () => {
+    remember(window.__codexHostAdapterClientErrors, {
+      message: "event stream disconnected",
+      readyState: events.readyState,
+    });
+    if (events.readyState === EventSource.CLOSED) {
+      console.error("[codex-extension-webview] event stream closed");
+    }
+  };
 })();
 </script>`;
   }
@@ -1034,6 +1412,7 @@ select,
       startedAt: this.startedAt,
       webviewRoot: this.webviewRoot,
       clients: this.clients.size,
+      bridge: this.getBridgeState?.() ?? null,
       messageCounts: Object.fromEntries(this.messageCounts.entries()) as JsonObject,
       recentMessages: this.recentMessages,
       hostErrors: this.hostErrors,
@@ -1064,13 +1443,44 @@ select,
   }
 }
 
+// This bridge hand-implements the host side of one extension's contract: the
+// vscode://codex endpoint set, the follower methods, the IPC method versions.
+// A version it was never checked against is a silent breakage, not an upgrade,
+// so auto-update has to hit an error instead of a half-working webview.
+// min: earliest version the UI parity work was done against; max: newest
+// version verified end to end.
+const supportedExtensionVersions = { min: [26, 422], max: [26, 803] };
+
+// The build `serve --install-extension` puts on a fresh machine: installing
+// marketplace latest would hand us a version the range above rejects.
+export const verifiedExtensionVersion = "26.803.61601";
+
+export function parseExtensionVersion(directoryName: string): number[] | null {
+  const match = /^openai\.chatgpt-(\d+)\.(\d+)\.(\d+)/.exec(directoryName);
+  return match ? [Number(match[1]), Number(match[2]), Number(match[3])] : null;
+}
+
+export function isSupportedExtensionVersion(version: number[]): boolean {
+  const release = version.slice(0, 2);
+  return compareVersions(release, supportedExtensionVersions.min) >= 0
+    && compareVersions(release, supportedExtensionVersions.max) <= 0;
+}
+
 export function resolveExtensionWebviewRoot(): string | null {
   const configured = process.env.CODEX_EXTENSION_WEBVIEW_ROOT;
-  if (configured && existsSync(join(configured, "index.html"))) {
+  if (configured) {
+    // An explicit root is the operator saying which contract to speak to, so a
+    // path that holds no webview is their mistake to see, not ours to skip.
+    if (!existsSync(join(configured, "index.html"))) {
+      throw new Error(`CODEX_EXTENSION_WEBVIEW_ROOT=${configured} has no index.html`);
+    }
     return resolve(configured);
   }
 
-  const extensionsDir = join(homedir(), ".vscode", "extensions");
+  return selectExtensionWebviewRoot(join(homedir(), ".vscode", "extensions"));
+}
+
+export function selectExtensionWebviewRoot(extensionsDir: string): string | null {
   let entries: string[];
   try {
     entries = readdirSync(extensionsDir);
@@ -1078,12 +1488,40 @@ export function resolveExtensionWebviewRoot(): string | null {
     return null;
   }
 
-  const roots = entries
-    .filter((entry) => entry.startsWith("openai.chatgpt-"))
-    .map((entry) => join(extensionsDir, entry, "webview"))
-    .filter((root) => existsSync(join(root, "index.html")));
+  const installed = entries
+    .map((entry) => ({ entry, version: parseExtensionVersion(entry) }))
+    .filter((candidate): candidate is { entry: string; version: number[] } => candidate.version !== null)
+    .filter((candidate) => existsSync(join(extensionsDir, candidate.entry, "webview", "index.html")));
 
-  return roots.sort(compareExtensionRoots).at(-1) ?? null;
+  if (installed.length === 0) {
+    return null;
+  }
+
+  const supported = installed
+    .filter((candidate) => isSupportedExtensionVersion(candidate.version))
+    .sort((left, right) => compareVersions(left.version, right.version));
+
+  const newest = supported.at(-1);
+  if (!newest) {
+    const found = installed.map((candidate) => candidate.version.join(".")).join(", ");
+    throw new Error(
+      `Codex extension ${found} is outside the range this dispatcher emulates `
+      + `(${supportedExtensionVersions.min.join(".")}.x - ${supportedExtensionVersions.max.join(".")}.x). `
+      + "Update the dispatcher, or point CODEX_EXTENSION_WEBVIEW_ROOT at a webview directory you want it to serve.",
+    );
+  }
+
+  return join(extensionsDir, newest.entry, "webview");
+}
+
+function compareVersions(left: number[], right: number[]): number {
+  for (let index = 0; index < Math.max(left.length, right.length); index += 1) {
+    const difference = (left[index] ?? 0) - (right[index] ?? 0);
+    if (difference !== 0) {
+      return difference;
+    }
+  }
+  return 0;
 }
 
 export function resolveWebviewAssetPath(webviewRoot: string, pathname: string): string | null {
@@ -1096,7 +1534,12 @@ export function resolveWebviewAssetPath(webviewRoot: string, pathname: string): 
   return filePath;
 }
 
-export async function handleVSCodeRequest(endpoint: string, body: JsonValue, defaultCwd: string): Promise<JsonValue> {
+export async function handleVSCodeRequest(
+  endpoint: string,
+  body: JsonValue,
+  defaultCwd: string,
+  webviewRoot: string | null,
+): Promise<JsonValue> {
   const params = asObject(body) ?? {};
 
   switch (endpoint) {
@@ -1113,14 +1556,6 @@ export async function handleVSCodeRequest(endpoint: string, body: JsonValue, def
     case "projectless-thread-cwd":
     case "projectless-workspace-root":
       return { path: defaultCwd };
-    case "get-global-state":
-      return { value: typeof params.key === "string" ? globalState.get(params.key) ?? null : null };
-    case "set-global-state":
-      if (typeof params.key === "string") {
-        globalState.set(params.key, params.value ?? null);
-        writePersistentExtensionState();
-      }
-      return { success: true };
     case "get-configuration":
       return { value: null };
     case "set-configuration":
@@ -1133,7 +1568,7 @@ export async function handleVSCodeRequest(endpoint: string, body: JsonValue, def
     case "set-pinned-threads-order":
       return { success: false };
     case "extension-info":
-      return { version: extensionVersion(), buildNumber: null, buildFlavor: "prod", appName: "Codex", appIconMedium: null };
+      return { version: extensionVersionOf(webviewRoot), buildNumber: null, buildFlavor: "prod", appName: "Codex", appIconMedium: null };
     case "locale-info":
       return { ideLocale: "en", systemLocale: Intl.DateTimeFormat().resolvedOptions().locale };
     case "os-info":
@@ -1202,6 +1637,23 @@ export async function handleVSCodeRequest(endpoint: string, body: JsonValue, def
   }
 }
 
+// `$W` in out/extension.js: the project id is a hash of the roots, so every
+// client that opens the same folders agrees on it without storing anything.
+function workspaceProject(roots: string[]): JsonObject | null {
+  const first = roots[0];
+  if (!first) {
+    return null;
+  }
+
+  return {
+    id: `vscode-${createHash("sha256").update(roots.join("\0")).digest("hex").slice(0, 32)}`,
+    name: basename(first) || first,
+    rootPaths: roots,
+    createdAt: 1,
+    updatedAt: 1,
+  };
+}
+
 export function makeFetchResponse(options: FetchResponseOptions): JsonObject {
   if (options.error) {
     return {
@@ -1223,138 +1675,407 @@ export function makeFetchResponse(options: FetchResponseOptions): JsonObject {
   };
 }
 
-async function handleExternalFetch(message: HostMessage, requestId: string | undefined): Promise<JsonObject> {
+// `cP.fetch` in out/extension.js. The webview asks its host for every backend
+// call precisely because the host is the one holding the account: an anonymous
+// proxy gets 401s the webview has no answer for, and the app never finishes
+// starting.
+async function handleExternalFetch(
+  message: HostMessage,
+  requestId: string | undefined,
+  getAuthToken: AuthTokenReader,
+  options: { userAgent: string; cancelSignal: AbortSignal },
+): Promise<JsonObject> {
   const url = normalizeExternalFetchUrl(message.url);
-  const whamResponse = makeWhamFetchResponse(url, requestId);
-  if (whamResponse) {
-    return whamResponse;
-  }
+  const method = typeof message.method === "string" ? message.method : "GET";
+  const attachAuth = shouldAttachAuth(url);
+  // The extension lets a backend call run for as long as it likes and relies on
+  // `cancel-fetch` alone. We cannot: a response that arrives after the relay's
+  // 30s give-up never reaches the webview at all. So the whole exchange —
+  // retries included — shares one deadline, and blowing it is terminal.
+  const deadline = AbortSignal.timeout(externalFetchTimeoutMs);
+  const signal = AbortSignal.any([options.cancelSignal, deadline]);
 
-  const statsigResponse = makeStatsigFetchResponse(url, requestId);
-  if (statsigResponse) {
-    return statsigResponse;
-  }
-
-  const headers = headersFromMessage(message);
-  let body: BodyInit | undefined;
-
-  if (typeof message.body === "string" && message.method !== "GET") {
-    const base64Header = Array.from(headers.entries()).find(([key, value]) => key.toLowerCase() === "x-codex-base64" && value === "1");
-    if (base64Header) {
-      headers.delete(base64Header[0]);
-      body = Buffer.from(message.body, "base64");
-    } else {
-      body = message.body;
-    }
-  }
-
-  const init: RequestInit = {
-    method: typeof message.method === "string" ? message.method : "GET",
-    headers,
-    signal: AbortSignal.timeout(10_000),
-  };
-  if (body !== undefined) {
-    init.body = body;
-  }
-
-  const response = await fetch(url, init);
-
-  if (!response.ok) {
-    return makeFetchResponse({
-      requestId,
-      status: response.status,
-      error: response.statusText || `HTTP ${response.status}`,
+  const attempt = async (attemptIndex: number, token: string | null): Promise<JsonObject> => {
+    const headers = buildExternalFetchHeaders(message, isJwt(token) ? token : null, {
+      method,
+      attachAuth,
+      userAgent: options.userAgent,
     });
-  }
+    const authorized = headers.has("authorization");
+    const binaryResponse = headers.get("x-codex-binary-response") === "1";
+    const base64Body = headers.get("x-codex-base64") === "1";
+    headers.delete("x-codex-binary-response");
+    headers.delete("x-codex-base64");
 
-  const responseHeaders: JsonObject = {};
-  response.headers.forEach((value, key) => {
-    if (key.toLowerCase() !== "authorization") {
-      responseHeaders[key] = value;
+    let body: BodyInit | undefined;
+    if (typeof message.body === "string" && method !== "GET") {
+      body = base64Body ? Buffer.from(message.body, "base64") : message.body;
     }
-  });
 
-  const contentTypeHeader = response.headers.get("content-type") ?? "";
-  let bodyJsonString: string;
-  if (contentTypeHeader.includes("application/json")) {
-    bodyJsonString = JSON.stringify(await response.json());
-  } else {
-    const bytes = Buffer.from(await response.arrayBuffer());
-    bodyJsonString = JSON.stringify({ base64: bytes.toString("base64"), contentType: contentTypeHeader });
-  }
+    const init: RequestInit = { method, headers, signal };
+    if (body !== undefined) {
+      init.body = body;
+    }
 
-  return {
-    type: "fetch-response",
-    responseType: "success",
-    requestId,
-    status: response.status,
-    headers: responseHeaders,
-    bodyJsonString,
+    try {
+      const response = await fetch(url, init);
+      if (response.status >= 200 && response.status < 300) {
+        const responseHeaders: JsonObject = {};
+        response.headers.forEach((value, key) => {
+          if (key.toLowerCase() !== "authorization") {
+            responseHeaders[key] = value;
+          }
+        });
+
+        return {
+          type: "fetch-response",
+          responseType: "success",
+          requestId,
+          status: response.status,
+          headers: responseHeaders,
+          bodyJsonString: await readExternalFetchBody(response, binaryResponse),
+        };
+      }
+
+      if (response.status === 401 && authorized && attemptIndex < externalFetchAttempts) {
+        const refreshed = await getAuthToken(true);
+        if (refreshed && refreshed !== token) {
+          return attempt(attemptIndex + 1, refreshed);
+        }
+      }
+
+      if (isRetryableFetchStatus(response.status) && attemptIndex < externalFetchAttempts) {
+        await waitForRetry(externalFetchBackoffMs(attemptIndex), deadline);
+        // The deadline is terminal, and that has to include the wait between
+        // attempts: a retry started after it has passed can only produce an
+        // answer the relay has already stopped waiting for, so the status we
+        // are holding is the last true thing we know.
+        if (!deadline.aborted) {
+          return attempt(attemptIndex + 1, token);
+        }
+      }
+
+      return { type: "fetch-response", responseType: "error", requestId, status: response.status, error: response.statusText };
+    } catch (error) {
+      if (options.cancelSignal.aborted) {
+        return { type: "fetch-response", responseType: "error", requestId, status: 499, error: "Request cancelled" };
+      }
+      // A dropped connection is what the retry budget is for; the extension
+      // retries the throw exactly like a 5xx.
+      if (!deadline.aborted && attemptIndex < externalFetchAttempts) {
+        await waitForRetry(externalFetchBackoffMs(attemptIndex), deadline);
+        if (!deadline.aborted) {
+          return attempt(attemptIndex + 1, token);
+        }
+      }
+
+      return {
+        type: "fetch-response",
+        responseType: "error",
+        requestId,
+        status: 432,
+        error: error instanceof Error ? error.message : "Unknown error",
+      };
+    }
   };
+
+  return attempt(0, attachAuth ? await getAuthToken(false) : null);
 }
 
-function makeWhamFetchResponse(url: string, requestId: string | undefined): JsonObject | null {
-  const parsedUrl = new URL(url);
-  if (parsedUrl.hostname !== "chatgpt.com") {
+// `cP.stream` in out/extension.js. The webview streams `/codex/responses` this
+// way, and nothing rides back on the request itself: every part of the answer,
+// including the fact that there is none, is a message the host has to send.
+// There is no deadline here on purpose — the unary proxy has one because the
+// relay gives up on a request after 30s, but these events travel down the
+// webview's own event stream, and a long answer is exactly what a stream is for.
+async function handleExternalFetchStream(
+  message: HostMessage,
+  requestId: string,
+  getAuthToken: AuthTokenReader,
+  options: { userAgent: string; cancelSignal: AbortSignal },
+  emit: (event: JsonObject) => void,
+): Promise<void> {
+  const url = normalizeExternalFetchUrl(message.url);
+  const method = typeof message.method === "string" ? message.method : "GET";
+  const attachAuth = shouldAttachAuth(url);
+  const signal = options.cancelSignal;
+
+  const attempt = async (attemptIndex: number, token: string | null): Promise<void> => {
+    const headers = buildExternalFetchHeaders(message, isJwt(token) ? token : null, {
+      method,
+      attachAuth,
+      userAgent: options.userAgent,
+    });
+    const authorized = headers.has("authorization");
+
+    const init: RequestInit = { method, headers, signal };
+    if (typeof message.body === "string" && method !== "GET") {
+      init.body = message.body;
+    }
+
+    try {
+      const response = await fetch(url, init);
+      if (response.status === 200 && response.body) {
+        emit({ type: "fetch-stream-response", requestId, status: response.status, headers: streamTimingHeaders(response.headers) });
+        const events = message.format === "ndjson"
+          ? readNdjsonStream(response.body, signal)
+          : readServerSentEvents(response.body, signal);
+        for await (const event of events) {
+          emit({ type: "fetch-stream-event", requestId, ...event });
+        }
+        emit({ type: "fetch-stream-complete", requestId });
+        return;
+      }
+
+      if (response.status === 401 && authorized && attemptIndex < externalFetchAttempts) {
+        const refreshed = await getAuthToken(true);
+        if (refreshed && refreshed !== token) {
+          return attempt(attemptIndex + 1, refreshed);
+        }
+      }
+
+      if (isRetryableFetchStatus(response.status) && attemptIndex < externalFetchAttempts) {
+        await Bun.sleep(externalFetchBackoffMs(attemptIndex));
+        return attempt(attemptIndex + 1, token);
+      }
+
+      emit({ type: "fetch-stream-error", requestId, error: `${response.status} ${response.statusText}` });
+    } catch (error) {
+      // A cancelled stream is finished, not broken: the webview asked for it to
+      // stop and has already dropped what it had.
+      if (signal.aborted || (error instanceof Error && error.name === "AbortError")) {
+        emit({ type: "fetch-stream-complete", requestId });
+        return;
+      }
+
+      if (attemptIndex < externalFetchAttempts) {
+        await Bun.sleep(externalFetchBackoffMs(attemptIndex));
+        return attempt(attemptIndex + 1, token);
+      }
+
+      emit({ type: "fetch-stream-error", requestId, error: error instanceof Error ? error.message : "Unknown error" });
+    }
+  };
+
+  await attempt(0, attachAuth ? await getAuthToken(false) : null);
+}
+
+// `F5`: a stream's headers are reported for timing only, so only those go back.
+function streamTimingHeaders(headers: Headers): JsonObject {
+  const reported: JsonObject = {};
+  for (const name of streamReportedHeaders) {
+    const value = headers.get(name);
+    if (value != null) {
+      reported[name] = value;
+    }
+  }
+  return reported;
+}
+
+// `B5`: one JSON document per line.
+async function* readNdjsonStream(body: ReadableStream<Uint8Array>, signal: AbortSignal): AsyncGenerator<JsonObject> {
+  for await (const chunk of readStreamChunks(body, signal, (pending) => [pending.indexOf("\n"), 1])) {
+    const line = chunk.replace(/\r$/, "");
+    if (line.trim().length > 0) {
+      yield { data: JSON.parse(line) as JsonValue };
+    }
+  }
+}
+
+// `mve` with `_N`: events separated by a blank line, `data:` lines joined and
+// parsed as one document. A heartbeat is the connection talking about itself.
+async function* readServerSentEvents(body: ReadableStream<Uint8Array>, signal: AbortSignal): AsyncGenerator<JsonObject> {
+  for await (const chunk of readStreamChunks(body, signal, findEventBoundary)) {
+    const event = parseServerSentEvent(chunk);
+    if (event && event.event !== "heartbeat") {
+      yield event;
+    }
+  }
+}
+
+function parseServerSentEvent(chunk: string): JsonObject | null {
+  let name: string | undefined;
+  const data: string[] = [];
+  for (const line of chunk.split(/\r?\n/)) {
+    if (line.startsWith("event:")) {
+      name = line.slice(6).trim();
+    } else if (line.startsWith("data:")) {
+      data.push(line.slice(5).trim());
+    }
+  }
+  if (data.length === 0) {
     return null;
   }
 
-  const path = parsedUrl.pathname.replace(/^\/backend-api/, "");
-  if (path === "/wham/accounts/check") {
-    return makeFetchResponse({ requestId, result: { account_ordering: [], accounts: {} } });
+  try {
+    const parsed = JSON.parse(data.join("\n")) as JsonValue;
+    return name === undefined ? { data: parsed } : { event: name, data: parsed };
+  } catch {
+    // `_N` returns null on a fragment it cannot parse and the stream carries on:
+    // the events are independent, and one unreadable event is not the end.
+    return null;
   }
-
-  if (path === "/wham/tasks/list") {
-    return makeFetchResponse({ requestId, result: { items: [] } });
-  }
-
-  if (path === "/wham/environments") {
-    return makeFetchResponse({ requestId, result: [] });
-  }
-
-  if (path === "/wham/usage") {
-    return makeFetchResponse({ requestId, result: null });
-  }
-
-  if (path.startsWith("/accounts/check/")) {
-    return makeFetchResponse({ requestId, result: { accounts: {} } });
-  }
-
-  return null;
 }
 
-function makeStatsigFetchResponse(url: string, requestId: string | undefined): JsonObject | null {
-  const parsedUrl = new URL(url);
-  if (parsedUrl.hostname === "ab.chatgpt.com" && parsedUrl.pathname === "/v1/initialize") {
-    return {
-      type: "fetch-response",
-      responseType: "success",
-      requestId,
-      status: 200,
-      headers: { "content-type": "application/json" },
-      bodyJsonString: JSON.stringify({
-        feature_gates: {},
-        dynamic_configs: {},
-        layer_configs: {},
-        sdkParams: {},
-        has_updates: true,
-        time: Date.now(),
-      }),
-    };
+// `nnt`: an event ends at a blank line, and a server is free to spell that line
+// either way — whichever comes first is the end of this event.
+function findEventBoundary(pending: string): [number, number] {
+  const crlf = pending.indexOf("\r\n\r\n");
+  const lf = pending.indexOf("\n\n");
+  if (crlf === -1) {
+    return [lf, 2];
+  }
+  if (lf === -1 || crlf < lf) {
+    return [crlf, 4];
+  }
+  return [lf, 2];
+}
+
+async function* readStreamChunks(
+  body: ReadableStream<Uint8Array>,
+  signal: AbortSignal,
+  findSeparator: (pending: string) => [number, number],
+): AsyncGenerator<string> {
+  const reader = body.getReader();
+  const decoder = new TextDecoder();
+  const cancelRead = (): void => {
+    reader.cancel().catch(() => {});
+  };
+  signal.addEventListener("abort", cancelRead, { once: true });
+  if (signal.aborted) {
+    cancelRead();
   }
 
-  if (parsedUrl.hostname === "chatgpt.com" && parsedUrl.pathname.startsWith("/ces/")) {
-    return {
-      type: "fetch-response",
-      responseType: "success",
-      requestId,
-      status: 202,
-      headers: { "content-type": "application/json" },
-      bodyJsonString: JSON.stringify({ success: true }),
-    };
+  let pending = "";
+  try {
+    while (!signal.aborted) {
+      const { value, done } = await reader.read();
+      if (done || value == null) {
+        break;
+      }
+      pending += decoder.decode(value, { stream: true });
+      let [index, length] = findSeparator(pending);
+      while (index >= 0) {
+        yield pending.slice(0, index);
+        pending = pending.slice(index + length);
+        [index, length] = findSeparator(pending);
+      }
+    }
+    // Whatever the last chunk left behind is an event too, unless the reader was
+    // cancelled — then there is nobody left to hand it to.
+    if (!signal.aborted) {
+      const tail = pending + decoder.decode();
+      if (tail.trim().length > 0) {
+        yield tail;
+      }
+    }
+  } finally {
+    signal.removeEventListener("abort", cancelRead);
+    reader.releaseLock();
+  }
+}
+
+// `shouldAttachAuth`: the account token goes to OpenAI's own hosts and nowhere
+// else — `ab.chatgpt.com` is the experiment CDN and is deliberately excluded.
+function shouldAttachAuth(url: string): boolean {
+  const host = new URL(url).host.toLowerCase();
+  return (
+    host === "localhost:8000" ||
+    host === "localhost" ||
+    host === "openai.com" ||
+    host.endsWith(".openai.com") ||
+    host === "chatgpt.com" ||
+    (host.endsWith(".chatgpt.com") && !host.startsWith("ab."))
+  );
+}
+
+// `ixe`: anything that is not a JWT is not a token the backend will take, and
+// sending it as one only costs a round trip.
+function isJwt(token: string | null): token is string {
+  return token != null && /^[A-Za-z0-9-_]+\.[A-Za-z0-9-_]+\.[A-Za-z0-9-_]+$/.test(token);
+}
+
+// `buildHeaders`: the account id rides beside the token, because the backend
+// resolves a multi-account session from the header, not from the JWT.
+function buildExternalFetchHeaders(
+  message: HostMessage,
+  token: string | null,
+  options: { method: string; attachAuth: boolean; userAgent: string },
+): Headers {
+  const headers = headersFromMessage(message);
+  if (options.attachAuth && token && !headers.has("authorization")) {
+    headers.set("Authorization", `Bearer ${token}`);
+    const accountId = chatgptAccountId(token);
+    if (accountId) {
+      headers.set("ChatGPT-Account-Id", accountId);
+    }
+  }
+  if (options.method !== "GET" && !headers.has("content-type")) {
+    headers.set("Content-Type", "application/json");
+  }
+  if (!headers.has("originator")) {
+    headers.set("originator", chatgptOriginator);
+  }
+  // `userAgentProvider.getUserAgent()`: the app server tells the client what to
+  // call itself, and the backend reads that name.
+  if (!headers.has("user-agent")) {
+    headers.set("User-Agent", options.userAgent);
   }
 
-  return null;
+  return headers;
+}
+
+function chatgptAccountId(token: string): string | null {
+  try {
+    const claims = JSON.parse(Buffer.from(token.split(".")[1] ?? "", "base64url").toString("utf8")) as JsonValue;
+    const auth = asObject(asObject(claims)?.["https://api.openai.com/auth"]);
+    const accountId = auth?.chatgpt_account_id;
+    return typeof accountId === "string" ? accountId : null;
+  } catch {
+    return null;
+  }
+}
+
+function isRetryableFetchStatus(status: number): boolean {
+  return status === 408 || status === 425 || status === 429 || (status >= 500 && status <= 599);
+}
+
+// The backoff ends early when the deadline does, so that the exchange keeps the
+// 25s it promised instead of spending another full backoff past it.
+function waitForRetry(delayMs: number, deadline: AbortSignal): Promise<void> {
+  if (deadline.aborted) {
+    return Promise.resolve();
+  }
+  return new Promise((resolve) => {
+    const finish = (): void => {
+      clearTimeout(timer);
+      deadline.removeEventListener("abort", finish);
+      resolve();
+    };
+    const timer = setTimeout(finish, delayMs);
+    deadline.addEventListener("abort", finish, { once: true });
+  });
+}
+
+function externalFetchBackoffMs(attemptIndex: number): number {
+  const delay = Math.min(externalFetchMaxBackoffMs, externalFetchBaseBackoffMs * 2 ** attemptIndex);
+  return Math.max(0, Math.floor(delay + delay * 0.2 * (Math.random() - 0.5) * 2));
+}
+
+// Only 2xx gets here: the webview resolves `success` with
+// JSON.parse(bodyJsonString), and the extension answers every other status with
+// an `error` response instead, so a body that is not valid JSON is a failed
+// exchange rather than something to hand over raw.
+async function readExternalFetchBody(response: Response, binaryResponse = false): Promise<string> {
+  const contentTypeHeader = response.headers.get("content-type") ?? "";
+  // `x-codex-binary-response`: the caller wants the bytes even when the server
+  // labels them JSON.
+  if (!binaryResponse && contentTypeHeader.includes("application/json")) {
+    return JSON.stringify(await response.json());
+  }
+
+  const bytes = Buffer.from(await response.arrayBuffer());
+  return JSON.stringify({ base64: bytes.toString("base64"), contentType: contentTypeHeader });
 }
 
 function normalizeExternalFetchUrl(url: JsonValue | undefined): string {
@@ -1514,112 +2235,20 @@ function stripHostId(params: JsonObject): JsonObject {
   return rest;
 }
 
-export function extensionStatePath(): string {
-  return join(process.env.CODEX_DISPATCHER_HOME ?? join(homedir(), ".codex-dispatcher"), "extension-state.json");
+export function extensionVersionOf(webviewRoot: string | null): string {
+  const version = webviewRoot ? parseExtensionVersion(basename(dirname(webviewRoot))) : null;
+  return version ? version.join(".") : "0.0.0";
 }
 
-function loadPersistentExtensionState(path: string): void {
-  activeExtensionStatePath = path;
-  globalState.clear();
-  persistedAtomState.clear();
-  if (!existsSync(path)) {
-    return;
-  }
-
-  const state = parsePersistentExtensionState(JSON.parse(readFileSync(path, "utf8")) as unknown);
-  for (const [key, value] of Object.entries(state.globalState)) {
-    globalState.set(key, value ?? null);
-  }
-  for (const [key, value] of Object.entries(state.persistedAtomState)) {
-    persistedAtomState.set(key, value ?? null);
-  }
+export function isRpcId(value: JsonValue | undefined): value is string | number {
+  return typeof value === "string" || typeof value === "number";
 }
 
-function writePersistentExtensionState(path = activeExtensionStatePath): void {
-  const state: PersistentExtensionState = {
-    globalState: Object.fromEntries(globalState.entries()) as JsonObject,
-    persistedAtomState: Object.fromEntries(persistedAtomState.entries()) as JsonObject,
-  };
-  mkdirSync(dirname(path), { recursive: true });
-  writeFileSync(path, `${JSON.stringify(state, null, 2)}\n`, { mode: 0o600 });
-}
-
-function parsePersistentExtensionState(value: unknown): PersistentExtensionState {
-  if (!isRecord(value)) {
-    throw new Error("Invalid codex-dispatcher extension state: expected object.");
+export function serverRequestResponse(response: JsonObject): ServerRequestResponse {
+  if (response.error !== undefined && response.error !== null) {
+    return { error: response.error };
   }
-  return {
-    globalState: optionalStateObject(value.globalState, "globalState"),
-    persistedAtomState: optionalStateObject(value.persistedAtomState, "persistedAtomState"),
-  };
-}
-
-function optionalStateObject(value: unknown, key: string): JsonObject {
-  if (value === undefined) {
-    return {};
-  }
-  if (!isRecord(value)) {
-    throw new Error(`Invalid codex-dispatcher extension state: ${key} must be an object.`);
-  }
-  return value as JsonObject;
-}
-
-function isRecord(value: unknown): value is Record<string, unknown> {
-  return typeof value === "object" && value !== null && !Array.isArray(value);
-}
-
-function updatePersistedAtomState(message: JsonObject): void {
-  if (typeof message.key !== "string") {
-    throw new Error("Invalid persisted atom update");
-  }
-  if (message.deleted === true) {
-    persistedAtomState.delete(message.key);
-    writePersistentExtensionState();
-    return;
-  }
-  persistedAtomState.set(message.key, message.value ?? null);
-  writePersistentExtensionState();
-}
-
-function persistedStateObject(): JsonObject {
-  return Object.fromEntries(persistedAtomState.entries()) as JsonObject;
-}
-
-function sharedObjectValue(key: string): JsonValue {
-  if (sharedObjectState.has(key)) {
-    return sharedObjectState.get(key) ?? null;
-  }
-
-  switch (key) {
-    case "host_config":
-      return { id: "local", display_name: "Local", kind: "local" };
-    case "remote_connections":
-    case "remote_control_connections":
-      return [];
-    case "statsig_default_enable_features":
-      return {};
-    case "pending_worktrees":
-    case "diff_comments":
-    case "diff_comments_from_model":
-    case "composer_prefill":
-      return null;
-    default:
-      return null;
-  }
-}
-
-function extensionVersion(): string {
-  const root = resolveExtensionWebviewRoot();
-  if (!root) {
-    return "0.0.0";
-  }
-
-  const extensionDir = basename(dirname(root));
-  return extensionDir.replace(/^openai\.chatgpt-/, "").replace(/-.+$/, "");
-}
-
-function compareExtensionRoots(left: string, right: string): number {
-  return basename(dirname(left)).localeCompare(basename(dirname(right)), undefined, { numeric: true });
+  return { result: response.result ?? null };
 }
 
 function asObject(value: JsonValue | undefined): JsonObject | null {
@@ -1644,37 +2273,106 @@ function requireString(value: JsonValue | undefined, name: string): string {
   return value;
 }
 
-function jsonResponse(value: JsonValue, status = 200): Response {
-  return new Response(JSON.stringify(value), {
-    status,
-    headers: { "content-type": "application/json; charset=utf-8" },
-  });
+function encodeSseMessage(client: StreamClient, message: JsonObject, eventId: number): Uint8Array {
+  return encoder.encode(`id: ${client.epoch}.${eventId}\ndata: ${JSON.stringify(message)}\n\n`);
 }
 
-function encodeSseMessage(message: JsonObject): Uint8Array {
-  return encoder.encode(`data: ${JSON.stringify(message)}\n\n`);
-}
-
-function authCookie(token: string): string {
-  return `${authCookieName}=${encodeURIComponent(token)}; HttpOnly; SameSite=Lax; Path=${routePrefix || "/"}`;
-}
-
-function cookieValue(header: string | null, name: string): string | null {
-  for (const part of header?.split(";") ?? []) {
-    const [rawKey, ...rawValue] = part.trim().split("=");
-    if (rawKey === name) {
-      try {
-        return decodeURIComponent(rawValue.join("="));
-      } catch {
-        return null;
-      }
-    }
+function bufferedAfter(client: StreamClient, lastEventId: number | null): { id: number; payload: JsonObject }[] | null {
+  if (lastEventId === null) {
+    // No Last-Event-ID means this webview has not seen a single event yet, so
+    // an intact buffer (still starting at the first event) is exactly what it
+    // missed — a POST whose reply landed before the stream came up.
+    const first = client.buffer[0];
+    return first && first.id === 1 ? [...client.buffer] : null;
   }
-  return null;
+  if (lastEventId === client.seq) {
+    return [];
+  }
+  const oldest = client.buffer[0];
+  if (!oldest || lastEventId < oldest.id - 1 || lastEventId > client.seq) {
+    return null;
+  }
+  return client.buffer.filter((event) => event.id > lastEventId);
+}
+
+// A thread the webview drives against our app server: either it named one or
+// the call created one.
+function appServerThreadId(params: JsonValue, result: JsonValue): string | null {
+  const fromResult = asObject(asObject(result)?.thread)?.id;
+  if (typeof fromResult === "string") {
+    return fromResult;
+  }
+  const fromParams = asObject(params)?.threadId;
+  return typeof fromParams === "string" ? fromParams : null;
+}
+
+function parseHostMessageBatch(body: unknown): HostMessage[] {
+  const messages = (body as { messages?: unknown } | null)?.messages;
+  if (!Array.isArray(messages)) {
+    throw new Error("host-message body must be { messages: [...] }");
+  }
+  return messages as HostMessage[];
+}
+
+function clientIdFromRequest(request: Request): string {
+  const url = new URL(request.url);
+  return url.searchParams.get("client") ?? request.headers.get("x-dispatcher-client") ?? "default";
+}
+
+// Sequence numbers restart whenever a client record is recreated (prune, host
+// restart), so a resume is only meaningful when the epoch still matches.
+function parseResumePoint(client: StreamClient, header: string | null): number | null {
+  const separator = header?.lastIndexOf(".") ?? -1;
+  if (!header || separator < 0 || header.slice(0, separator) !== client.epoch) {
+    return null;
+  }
+  const parsed = Number(header.slice(separator + 1));
+  return Number.isSafeInteger(parsed) && parsed >= 0 ? parsed : null;
+}
+
+// An installed app launches its start_url without the token in the query, so
+// the session has to outlive the browser process that first opened the link.
+const authCookieMaxAgeSeconds = 90 * 24 * 60 * 60;
+
+function authCookie(token: string, secure: boolean): string {
+  // Secure is conditional on purpose: `DISPATCHER_TLS=off` serves plain http,
+  // and an unconditional flag would make the cookie unusable exactly there.
+  return `${authCookieName}=${encodeURIComponent(token)}; HttpOnly; SameSite=Lax; Max-Age=${authCookieMaxAgeSeconds}; Path=${routePrefix || "/"}${secure ? "; Secure" : ""}`;
+}
+
+// The relay terminates TLS and forwards over plain http on loopback, so the
+// original scheme only survives in the header it sets.
+function isSecureRequest(request: Request, url: URL): boolean {
+  return url.protocol === "https:" || request.headers.get("x-forwarded-proto") === "https";
+}
+
+function secretEquals(candidate: string | null, secret: string): boolean {
+  if (candidate === null) {
+    return false;
+  }
+  // Lengths are compared in bytes, not code units: timingSafeEqual throws on a
+  // byte-length mismatch, so a multibyte candidate of the right character
+  // length would turn a plain 401 into an unhandled exception.
+  const candidateBytes = Buffer.from(candidate);
+  const secretBytes = Buffer.from(secret);
+  return candidateBytes.length === secretBytes.length && timingSafeEqual(candidateBytes, secretBytes);
 }
 
 function jsonValuesEqual(left: JsonValue, right: JsonValue): boolean {
   return JSON.stringify(left) === JSON.stringify(right);
+}
+
+async function serveFile(filePath: string): Promise<Response> {
+  const file = Bun.file(filePath);
+  if (!(await file.exists())) {
+    return new Response("Not found", { status: 404 });
+  }
+
+  return new Response(file, {
+    headers: {
+      "content-type": contentType(filePath),
+    },
+  });
 }
 
 function contentType(filePath: string): string {
