@@ -19,28 +19,9 @@ afterEach(() => {
 
 describe("relay server", () => {
   test("keeps running when a canceled browser stream receives late dispatcher chunks", async () => {
-    const dir = mkdtempSync(join(tmpdir(), "codex-dispatcher-relay-"));
-    tempDirs.push(dir);
-    const statePath = join(dir, "state.json");
-    writeFileSync(statePath, JSON.stringify(relayStateSnapshot(), null, 2));
-
-    const relay = Bun.spawn([process.execPath, "run", "src/relay-server.ts"], {
-      cwd: process.cwd(),
-      env: {
-        ...Bun.env,
-        GITHUB_CLIENT_ID: "test-client",
-        GITHUB_CLIENT_SECRET: "test-secret",
-        HOST: "127.0.0.1",
-        PORT: "0",
-        RELAY_DATA_PATH: statePath,
-        RELAY_PUBLIC_BASE_URL: `http://${baseHostname}`,
-      },
-      stderr: "pipe",
-      stdout: "pipe",
-    });
+    const { relay, relayUrl } = await startRelay();
 
     try {
-      const relayUrl = await waitForRelayUrl(relay);
       const ws = new WebSocket(new URL(`/api/dispatcher/connect?token=${dispatcherToken}`, relayUrl));
       const accepted = await waitForFrame(ws);
       expect(accepted.type).toBe("dispatcher-accepted");
@@ -100,31 +81,12 @@ describe("relay server", () => {
       relay.kill();
       await relay.exited.catch(() => undefined);
     }
-  });
+  }, 15_000);
 
   test("terminates the browser stream when the dispatcher fails mid-response", async () => {
-    const dir = mkdtempSync(join(tmpdir(), "codex-dispatcher-relay-"));
-    tempDirs.push(dir);
-    const statePath = join(dir, "state.json");
-    writeFileSync(statePath, JSON.stringify(relayStateSnapshot(), null, 2));
-
-    const relay = Bun.spawn([process.execPath, "run", "src/relay-server.ts"], {
-      cwd: process.cwd(),
-      env: {
-        ...Bun.env,
-        GITHUB_CLIENT_ID: "test-client",
-        GITHUB_CLIENT_SECRET: "test-secret",
-        HOST: "127.0.0.1",
-        PORT: "0",
-        RELAY_DATA_PATH: statePath,
-        RELAY_PUBLIC_BASE_URL: `http://${baseHostname}`,
-      },
-      stderr: "pipe",
-      stdout: "pipe",
-    });
+    const { relay, relayUrl } = await startRelay();
 
     try {
-      const relayUrl = await waitForRelayUrl(relay);
       const ws = new WebSocket(new URL(`/api/dispatcher/connect?token=${dispatcherToken}`, relayUrl));
       expect((await waitForFrame(ws)).type).toBe("dispatcher-accepted");
 
@@ -177,31 +139,12 @@ describe("relay server", () => {
       relay.kill();
       await relay.exited.catch(() => undefined);
     }
-  });
+  }, 15_000);
 
   test("ignores response frames for requests owned by another dispatcher session", async () => {
-    const dir = mkdtempSync(join(tmpdir(), "codex-dispatcher-relay-"));
-    tempDirs.push(dir);
-    const statePath = join(dir, "state.json");
-    writeFileSync(statePath, JSON.stringify(relayStateSnapshot(), null, 2));
-
-    const relay = Bun.spawn([process.execPath, "run", "src/relay-server.ts"], {
-      cwd: process.cwd(),
-      env: {
-        ...Bun.env,
-        GITHUB_CLIENT_ID: "test-client",
-        GITHUB_CLIENT_SECRET: "test-secret",
-        HOST: "127.0.0.1",
-        PORT: "0",
-        RELAY_DATA_PATH: statePath,
-        RELAY_PUBLIC_BASE_URL: `http://${baseHostname}`,
-      },
-      stderr: "pipe",
-      stdout: "pipe",
-    });
+    const { relay, relayUrl } = await startRelay();
 
     try {
-      const relayUrl = await waitForRelayUrl(relay);
       const owner = new WebSocket(new URL(`/api/dispatcher/connect?token=${dispatcherToken}`, relayUrl));
       expect((await waitForFrame(owner)).type).toBe("dispatcher-accepted");
 
@@ -267,31 +210,12 @@ describe("relay server", () => {
       relay.kill();
       await relay.exited.catch(() => undefined);
     }
-  });
+  }, 15_000);
 
   test("lets an anonymous browser read the PWA install metadata it never sends cookies for", async () => {
-    const dir = mkdtempSync(join(tmpdir(), "codex-dispatcher-relay-"));
-    tempDirs.push(dir);
-    const statePath = join(dir, "state.json");
-    writeFileSync(statePath, JSON.stringify(relayStateSnapshot(), null, 2));
-
-    const relay = Bun.spawn([process.execPath, "run", "src/relay-server.ts"], {
-      cwd: process.cwd(),
-      env: {
-        ...Bun.env,
-        GITHUB_CLIENT_ID: "test-client",
-        GITHUB_CLIENT_SECRET: "test-secret",
-        HOST: "127.0.0.1",
-        PORT: "0",
-        RELAY_DATA_PATH: statePath,
-        RELAY_PUBLIC_BASE_URL: `http://${baseHostname}`,
-      },
-      stderr: "pipe",
-      stdout: "pipe",
-    });
+    const { relay, relayUrl } = await startRelay();
 
     try {
-      const relayUrl = await waitForRelayUrl(relay);
       const dispatcher = new WebSocket(new URL(`/api/dispatcher/connect?token=${dispatcherToken}`, relayUrl));
       expect((await waitForFrame(dispatcher)).type).toBe("dispatcher-accepted");
 
@@ -352,8 +276,47 @@ describe("relay server", () => {
       relay.kill();
       await relay.exited.catch(() => undefined);
     }
-  });
+  }, 15_000);
 });
+
+// Very rarely (≈2 in 800 starts here) a spawned bun process hangs before
+// executing a single line of the script: both pipes stay empty and its main
+// thread sits in kevent64 — the picture in oven-sh/bun#27766. That is the
+// runtime failing to launch, not the relay failing to start, so launching
+// the relay includes one loud retry against it.
+async function startRelay(): Promise<{ relay: Bun.Subprocess<"ignore", "pipe", "pipe">; relayUrl: string }> {
+  const dir = mkdtempSync(join(tmpdir(), "codex-dispatcher-relay-"));
+  tempDirs.push(dir);
+  const statePath = join(dir, "state.json");
+  writeFileSync(statePath, JSON.stringify(relayStateSnapshot(), null, 2));
+
+  for (let attempt = 0; ; attempt++) {
+    const relay = Bun.spawn([process.execPath, "run", "src/relay-server.ts"], {
+      cwd: process.cwd(),
+      env: {
+        ...Bun.env,
+        GITHUB_CLIENT_ID: "test-client",
+        GITHUB_CLIENT_SECRET: "test-secret",
+        HOST: "127.0.0.1",
+        PORT: "0",
+        RELAY_DATA_PATH: statePath,
+        RELAY_PUBLIC_BASE_URL: `http://${baseHostname}`,
+      },
+      stderr: "pipe",
+      stdout: "pipe",
+    });
+    try {
+      return { relay, relayUrl: await waitForRelayUrl(relay) };
+    } catch (error) {
+      relay.kill();
+      await relay.exited.catch(() => undefined);
+      if (attempt > 0) {
+        throw error;
+      }
+      console.warn(`relay start produced no output, respawning once: ${error instanceof Error ? error.message : error}`);
+    }
+  }
+}
 
 function relayStateSnapshot(): unknown {
   return {
@@ -445,7 +408,9 @@ async function waitForRelayUrl(relay: Bun.Subprocess<"pipe", "pipe", "inherit">)
   const reader = relay.stdout.getReader();
   const decoder = new TextDecoder();
   let output = "";
-  const deadline = Date.now() + 5_000;
+  // A healthy start prints in well under 100ms; a start that is silent for
+  // two full seconds is the hung-runtime case and gets respawned.
+  const deadline = Date.now() + 2_000;
 
   while (Date.now() < deadline) {
     const result = await Promise.race([
