@@ -374,6 +374,18 @@ describe("codex ipc", () => {
       await withCodexHome(async (home) => {
         const socketPath = join(home, "ipc", "ipc.sock");
         const received: Collected = [];
+        const started = Date.now();
+        // The CI-only failures of this test come with an inconsistent peer map,
+        // so a failure has to explain itself with the event order, not just the
+        // final state.
+        const timeline: string[] = [];
+        const trace = (name: string, bridge: CodexIpcBridge) => {
+          bridge.onEvent((event) => {
+            const detail = event.type === "broadcast" ? event.broadcast.method : event.snapshot.status;
+            const peers = event.snapshot.peers.map((peer) => peer.clientType).join(",");
+            timeline.push(`+${Date.now() - started}ms ${name} ${event.type}:${detail} peers=[${peers}]`);
+          });
+        };
         const orphaned = new CodexIpcBridge();
         orphaned.onEvent((event) => {
           if (event.type === "broadcast" && event.broadcast.method !== "client-status-changed") {
@@ -382,6 +394,9 @@ describe("codex ipc", () => {
         });
         const stranded = new CodexIpcBridge();
         const usurper = new CodexIpcBridge();
+        trace("orphaned", orphaned);
+        trace("stranded", stranded);
+        trace("usurper", usurper);
         let extensionLike: RawIpcClient | null = null;
         try {
           await orphaned.start("orphaned-client");
@@ -409,7 +424,8 @@ describe("codex ipc", () => {
             };
             throw new Error(
               "rejoin never completed — "
-              + [describe("usurper", usurper), describe("orphaned", orphaned), describe("stranded", stranded)].join("; "),
+              + [describe("usurper", usurper), describe("orphaned", orphaned), describe("stranded", stranded)].join("; ")
+              + "\n" + timeline.join("\n"),
             );
           }
           expect(peers).toEqual(["orphaned-client", "stranded-client"]);
@@ -523,6 +539,12 @@ describe("codex ipc", () => {
   // request whose version is not the one it expects, so these numbers are only
   // ever right relative to the extension we are hosting.
   test("carries the method versions of the extension it hosts", () => {
+    // No VS Code at all (CI, standalone installs) means no host bundle to
+    // check drift against; VS Code without the extension is still a dev
+    // machine that has to install it.
+    if (!existsSync(join(homedir(), ".vscode", "extensions"))) {
+      return;
+    }
     const webviewRoot = selectExtensionWebviewRoot(join(homedir(), ".vscode", "extensions"));
     if (!webviewRoot) {
       throw new Error("Install the Codex VS Code extension: this bridge is defined against its wire contract");
