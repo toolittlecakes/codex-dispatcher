@@ -1,6 +1,6 @@
 {
   "name": "codex-dispatcher-desktop",
-  "version": "0.1.0",
+  "version": "0.1.1",
   "private": true,
   "scripts": {
     "sidecar": "cd .. && bun build --compile --target=bun --outfile=desktop/src-tauri/binaries/codex-dispatcher-aarch64-apple-darwin src/cli.ts",
