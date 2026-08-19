@@ -46,8 +46,13 @@ WantedBy=multi-user.target
 UNIT
 
 sudo systemctl daemon-reload
-pkill -f "bun run src/relay-server.ts" || true
-sudo systemctl enable --now codex-dispatcher-relay
+# A hand-started relay from before systemd would hold the port; a systemd one
+# must be restarted through systemd or it races its own auto-restart.
+if ! systemctl is-active --quiet codex-dispatcher-relay; then
+  pkill -f "bun run src/relay-server.ts" || true
+fi
+sudo systemctl enable codex-dispatcher-relay
+sudo systemctl restart codex-dispatcher-relay
 sleep 1
 sudo systemctl --no-pager --lines 5 status codex-dispatcher-relay
 REMOTE
