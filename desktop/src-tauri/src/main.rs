@@ -15,6 +15,7 @@ use tauri_plugin_notification::NotificationExt;
 use tauri_plugin_opener::OpenerExt;
 use tauri_plugin_shell::process::CommandEvent;
 use tauri_plugin_shell::ShellExt;
+use tauri_plugin_updater::UpdaterExt;
 
 struct TrayMenu {
     status: MenuItem<tauri::Wry>,
@@ -22,7 +23,11 @@ struct TrayMenu {
     copy_link: MenuItem<tauri::Wry>,
     restart: MenuItem<tauri::Wry>,
     login: MenuItem<tauri::Wry>,
+    update: MenuItem<tauri::Wry>,
 }
+
+#[derive(Default)]
+struct PendingUpdate(Mutex<Option<tauri_plugin_updater::Update>>);
 
 #[derive(Default)]
 struct AppState {
@@ -292,6 +297,97 @@ fn run_relay_login(app: &AppHandle) {
     });
 }
 
+fn check_for_updates(app: &AppHandle, interactive: bool) {
+    let app = app.clone();
+    tauri::async_runtime::spawn(async move {
+        let updater = match app.updater() {
+            Ok(updater) => updater,
+            Err(error) => {
+                log_line(&format!("updater init failed: {error}"));
+                return;
+            }
+        };
+        match updater.check().await {
+            Ok(Some(update)) => {
+                let version = update.version.clone();
+                let menu = app.state::<TrayMenu>();
+                let _ = menu.update.set_text(format!("Install Update {version}…"));
+                let _ = app
+                    .notification()
+                    .builder()
+                    .title(format!("Codex Dispatcher {version} is available"))
+                    .body("Install it from the tray menu")
+                    .show();
+                *app.state::<PendingUpdate>().0.lock().unwrap() = Some(update);
+            }
+            Ok(None) => {
+                if interactive {
+                    let _ = app
+                        .notification()
+                        .builder()
+                        .title("Codex Dispatcher is up to date")
+                        .body(format!("Version {}", app.package_info().version))
+                        .show();
+                }
+            }
+            Err(error) => {
+                log_line(&format!("update check failed: {error}"));
+                if interactive {
+                    let _ = app
+                        .notification()
+                        .builder()
+                        .title("Update check failed")
+                        .body(error.to_string())
+                        .show();
+                }
+            }
+        }
+    });
+}
+
+fn install_or_check_update(app: &AppHandle) {
+    let pending = app.state::<PendingUpdate>().0.lock().unwrap().take();
+    let Some(update) = pending else {
+        check_for_updates(app, true);
+        return;
+    };
+
+    let app = app.clone();
+    tauri::async_runtime::spawn(async move {
+        let _ = app
+            .notification()
+            .builder()
+            .title(format!("Downloading Codex Dispatcher {}", update.version))
+            .show();
+        match update.download_and_install(|_, _| {}, || {}).await {
+            Ok(()) => {
+                // The old serve must release the port and the relay slot before
+                // the relaunched app claims them.
+                let state = app.state::<AppState>();
+                state.quitting.store(true, Ordering::SeqCst);
+                stop_serve(&app);
+                for _ in 0..50 {
+                    if app.state::<AppState>().serve_pid.lock().unwrap().is_none() {
+                        break;
+                    }
+                    tokio_sleep(100).await;
+                }
+                app.restart();
+            }
+            Err(error) => {
+                log_line(&format!("update install failed: {error}"));
+                let _ = app
+                    .notification()
+                    .builder()
+                    .title("Update failed")
+                    .body(error.to_string())
+                    .show();
+                *app.state::<PendingUpdate>().0.lock().unwrap() = Some(update);
+            }
+        }
+    });
+}
+
 async fn tokio_sleep(millis: u64) {
     tauri::async_runtime::spawn_blocking(move || {
         std::thread::sleep(std::time::Duration::from_millis(millis));
@@ -303,6 +399,7 @@ async fn tokio_sleep(millis: u64) {
 fn main() {
     let app = tauri::Builder::default()
         .plugin(tauri_plugin_shell::init())
+        .plugin(tauri_plugin_updater::Builder::new().build())
         .plugin(tauri_plugin_opener::init())
         .plugin(tauri_plugin_clipboard_manager::init())
         .plugin(tauri_plugin_notification::init())
@@ -315,6 +412,7 @@ fn main() {
             app.set_activation_policy(tauri::ActivationPolicy::Accessory);
 
             app.manage(AppState::default());
+            app.manage(PendingUpdate::default());
 
             let status = MenuItem::with_id(app, "status", "Starting…", false, None::<&str>)?;
             let open = MenuItem::with_id(app, "open", "Open in Browser", false, None::<&str>)?;
@@ -327,6 +425,7 @@ fn main() {
                 !relay_configured(),
                 None::<&str>,
             )?;
+            let update = MenuItem::with_id(app, "update", "Check for Updates…", true, None::<&str>)?;
             let autostart_item = CheckMenuItem::with_id(
                 app,
                 "autostart",
@@ -346,6 +445,7 @@ fn main() {
                     &restart,
                     &login,
                     &PredefinedMenuItem::separator(app)?,
+                    &update,
                     &autostart_item,
                     &quit,
                 ],
@@ -357,6 +457,7 @@ fn main() {
                 copy_link,
                 restart,
                 login,
+                update,
             });
 
             TrayIconBuilder::with_id("main")
@@ -389,6 +490,7 @@ fn main() {
                         });
                     }
                     "login" => run_relay_login(app),
+                    "update" => install_or_check_update(app),
                     "autostart" => {
                         let autolaunch = app.autolaunch();
                         let enabled = autolaunch.is_enabled().unwrap_or(false);
@@ -412,6 +514,7 @@ fn main() {
                 .build(app)?;
 
             spawn_serve(app.handle());
+            check_for_updates(app.handle(), false);
             Ok(())
         })
         .build(tauri::generate_context!())

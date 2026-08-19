@@ -16,7 +16,15 @@ A Tauri v2 menu-bar app that supervises `codex-dispatcher serve` as a bundled si
 ```sh
 cd desktop
 bun install
+TAURI_SIGNING_PRIVATE_KEY="$HOME/.tauri/codex-dispatcher-updater.key" \
+TAURI_SIGNING_PRIVATE_KEY_PASSWORD="" \
 bun run build   # compiles the sidecar from ../src/cli.ts, then bundles the .app
 ```
 
-The bundle lands in `src-tauri/target/release/bundle/macos/Codex Dispatcher.app`. macOS-only for now: the sidecar script targets `aarch64-apple-darwin` and the bundle is unsigned (ad-hoc), so distribution needs signing + notarization.
+The bundle lands in `src-tauri/target/release/bundle/macos/Codex Dispatcher.app` (plus a .dmg and the updater's .app.tar.gz + .sig). The signing key pair is the tauri updater's (minisign): the private key lives outside the repo and in the `TAURI_SIGNING_PRIVATE_KEY` Actions secret, the public key sits in `tauri.conf.json`. Losing the private key means shipped apps can never update again.
+
+## Releases and updates
+
+Bumping the version (package.json + desktop/package.json + Cargo.toml + tauri.conf.json, kept equal) and pushing to main runs `.github/workflows/release.yml`: when no release for that version exists yet, it runs the tests, builds the bundle, tags `vX.Y.Z`, and publishes a GitHub release with the .dmg (first install), the updater archive + `latest.json` (the tray checks `releases/latest/download/latest.json` on launch and via "Check for Updates…"), and `codex-dispatcher-darwin-arm64` (the standalone cli, which `codex-dispatcher update` installs).
+
+macOS-only for now: the sidecar script targets `aarch64-apple-darwin` and the bundle is unsigned by Apple (ad-hoc), so first installs hit a Gatekeeper warning until we notarize.

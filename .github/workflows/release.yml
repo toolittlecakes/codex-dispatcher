@@ -10,13 +10,11 @@ permissions:
 
 jobs:
   darwin-arm64:
-    name: macOS arm64 binary
-    runs-on: macos-latest
+    name: macOS arm64 release
+    runs-on: macos-14
     steps:
       - name: Check out repository
         uses: actions/checkout@v5
-        with:
-          fetch-depth: 0
 
       - name: Set up Bun
         uses: oven-sh/setup-bun@v2
@@ -31,6 +29,11 @@ jobs:
             echo "package.json version must use X.Y.Z semver format." >&2
             exit 1
           fi
+          TAURI_VERSION="$(bun -e 'console.log(require("./desktop/src-tauri/tauri.conf.json").version)')"
+          if [ "$TAURI_VERSION" != "$VERSION" ]; then
+            echo "tauri.conf.json version $TAURI_VERSION disagrees with package.json $VERSION." >&2
+            exit 1
+          fi
           RELEASE_TAG="v$VERSION"
           echo "release_tag=$RELEASE_TAG" >> "$GITHUB_OUTPUT"
 
@@ -41,9 +44,19 @@ jobs:
             echo "should_release=true" >> "$GITHUB_OUTPUT"
           fi
 
+      - name: Set up Rust
+        if: steps.version.outputs.should_release == 'true'
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache Rust build
+        if: steps.version.outputs.should_release == 'true'
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: desktop/src-tauri
+
       - name: Install dependencies
         if: steps.version.outputs.should_release == 'true'
-        run: bun install --frozen-lockfile
+        run: bun install --frozen-lockfile && cd desktop && bun install --frozen-lockfile
 
       - name: Test
         if: steps.version.outputs.should_release == 'true'
@@ -53,17 +66,49 @@ jobs:
         if: steps.version.outputs.should_release == 'true'
         run: bun run typecheck
 
-      - name: Build binary
+      - name: Build tray app and sidecar
         if: steps.version.outputs.should_release == 'true'
-        run: bun build --compile --target=bun --outfile=dist/codex-dispatcher-darwin-arm64 src/cli.ts
+        env:
+          TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
+          TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ""
+        run: cd desktop && bun run build
+
+      - name: Assemble release assets
+        if: steps.version.outputs.should_release == 'true'
+        env:
+          RELEASE_TAG: ${{ steps.version.outputs.release_tag }}
+        run: |
+          BUNDLE="desktop/src-tauri/target/release/bundle"
+          mkdir -p release
+          cp desktop/src-tauri/binaries/codex-dispatcher-aarch64-apple-darwin release/codex-dispatcher-darwin-arm64
+          cp "$BUNDLE"/dmg/*.dmg "release/CodexDispatcher-${RELEASE_TAG#v}-darwin-arm64.dmg"
+          cp "$BUNDLE/macos/Codex Dispatcher.app.tar.gz" release/codex-dispatcher-tray-darwin-arm64.app.tar.gz
+          SIGNATURE="$(cat "$BUNDLE/macos/Codex Dispatcher.app.tar.gz.sig")" python3 - <<'PY'
+          import json, os
+          from datetime import datetime, timezone
+
+          tag = os.environ["RELEASE_TAG"]
+          manifest = {
+              "version": tag.removeprefix("v"),
+              "pub_date": datetime.now(timezone.utc).isoformat(timespec="seconds"),
+              "platforms": {
+                  "darwin-aarch64": {
+                      "signature": os.environ["SIGNATURE"],
+                      "url": "https://github.com/toolittlecakes/codex-dispatcher/releases/download/"
+                          + f"{tag}/codex-dispatcher-tray-darwin-arm64.app.tar.gz",
+                  }
+              },
+          }
+          with open("release/latest.json", "w") as file:
+              json.dump(manifest, file, indent=2)
+          PY
 
       - name: Publish release
         if: steps.version.outputs.should_release == 'true'
         env:
           GH_TOKEN: ${{ github.token }}
           RELEASE_TAG: ${{ steps.version.outputs.release_tag }}
-          ASSET_PATH: dist/codex-dispatcher-darwin-arm64
         run: |
           git tag "$RELEASE_TAG" "$GITHUB_SHA"
           git push origin "refs/tags/$RELEASE_TAG"
-          gh release create "$RELEASE_TAG" "$ASSET_PATH" --title "codex-dispatcher $RELEASE_TAG" --notes "Release $RELEASE_TAG" --latest
+          gh release create "$RELEASE_TAG" release/* --title "codex-dispatcher $RELEASE_TAG" --notes "Release $RELEASE_TAG" --latest
