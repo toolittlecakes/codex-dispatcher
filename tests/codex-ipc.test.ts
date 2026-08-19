@@ -393,7 +393,9 @@ describe("codex ipc", () => {
           unlinkSync(socketPath);
           await usurper.start("usurper-client");
 
-          const deadline = Date.now() + 6_000;
+          // Rejoin needs a reconnect poll cycle on both stranded sides; CI
+          // runners have shown 6s to be too tight for it.
+          const deadline = Date.now() + 12_000;
           while (usurper.getSnapshot().peers.length < 2 && Date.now() < deadline) {
             await Bun.sleep(50);
           }

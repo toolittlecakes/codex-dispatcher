@@ -58,6 +58,27 @@ jobs:
         if: steps.version.outputs.should_release == 'true'
         run: bun install --frozen-lockfile && cd desktop && bun install --frozen-lockfile
 
+      - name: Cache the Codex extension webview
+        if: steps.version.outputs.should_release == 'true'
+        uses: actions/cache@v4
+        with:
+          path: ~/.codex-dispatcher/extensions
+          key: codex-extension-${{ hashFiles('src/extension-webview.ts') }}
+
+      # The webview tests serve the real extension assets; installing them
+      # through our own installer also exercises the standalone install path
+      # on every release.
+      - name: Install the Codex extension webview
+        if: steps.version.outputs.should_release == 'true'
+        run: |
+          bun -e '
+            const { installExtensionWebview, dispatcherExtensionsDir } = await import("./src/extension-install.ts");
+            const { verifiedExtensionVersion, selectExtensionWebviewRoot } = await import("./src/extension-webview.ts");
+            if (!selectExtensionWebviewRoot(dispatcherExtensionsDir())) {
+              await installExtensionWebview(verifiedExtensionVersion);
+            }
+          '
+
       - name: Test
         if: steps.version.outputs.should_release == 'true'
         run: bun test
