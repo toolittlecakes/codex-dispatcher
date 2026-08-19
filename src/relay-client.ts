@@ -203,10 +203,14 @@ async function forwardHttpRequest(
   try {
     const headers = new Headers(frame.headers);
     headers.set("x-dispatcher-token", options.localDispatcherToken);
-    const requestInit: RequestInit = {
+    // decompress:false — the response headers travel to the browser as-is, so
+    // a gzip body has to stay gzip; Bun's fetch would otherwise inflate the
+    // bytes while the forwarded content-encoding still promises gzip.
+    const requestInit: BunFetchRequestInit = {
       method: frame.method,
       headers,
       signal: controller.signal,
+      decompress: false,
     };
     if (frame.bodyBase64) {
       requestInit.body = Buffer.from(frame.bodyBase64, "base64");
@@ -231,6 +235,11 @@ async function forwardHttpRequest(
           requestId: frame.requestId,
           bodyBase64: Buffer.from(result.value).toString("base64"),
         });
+        // Local reads finish in milliseconds while the socket drains at the
+        // uplink's pace; without this wait a single large asset parks
+        // megabytes in the send buffer ahead of every other request's
+        // response-start frame, and the relay times those out.
+        await drainBelowBackpressureLimit(ws);
       }
     }
 
@@ -274,5 +283,16 @@ function localRequestUrl(localBaseUrl: string, path: string): string {
 function sendFrame(ws: WebSocket, frame: RelayFrame): void {
   if (ws.readyState === WebSocket.OPEN) {
     ws.send(encodeRelayFrame(frame));
+  }
+}
+
+const backpressureLimitBytes = 256 * 1024;
+const backpressurePollMs = 20;
+
+// The client WebSocket has no drain event, so polling bufferedAmount is the
+// only way to yield until the socket catches up.
+async function drainBelowBackpressureLimit(ws: WebSocket): Promise<void> {
+  while (ws.readyState === WebSocket.OPEN && ws.bufferedAmount > backpressureLimitBytes) {
+    await Bun.sleep(backpressurePollMs);
   }
 }

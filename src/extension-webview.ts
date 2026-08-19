@@ -221,7 +221,7 @@ export class ExtensionWebview {
       return this.serveIndex(request, url);
     }
 
-    return this.serveAsset(url.pathname);
+    return this.serveAsset(request, url.pathname);
   }
 
   handleIpcBroadcast(broadcastMessage: IpcBroadcastMessage): void {
@@ -293,7 +293,9 @@ export class ExtensionWebview {
       `<head>\n${pwaHeadTags()}\n${this.buildViewportStyle()}\n${this.buildShim(url.searchParams.get("token") ?? "")}`,
     );
 
-    const headers = new Headers({ "content-type": "text/html; charset=utf-8" });
+    // The page embeds this host's instance id and the token shim; a cached
+    // copy would greet a restarted dispatcher as the wrong incarnation.
+    const headers = new Headers({ "content-type": "text/html; charset=utf-8", "cache-control": "no-cache" });
     if (secretEquals(url.searchParams.get("token"), this.getToken())) {
       headers.append("set-cookie", authCookie(this.getToken(), isSecureRequest(request, url)));
     }
@@ -305,13 +307,18 @@ export class ExtensionWebview {
     return `<meta name="viewport" content="width=device-width, initial-scale=1, minimum-scale=1, maximum-scale=1, user-scalable=no, viewport-fit=cover, interactive-widget=resizes-visual">`;
   }
 
-  private async serveAsset(pathname: string): Promise<Response> {
+  private async serveAsset(request: Request, pathname: string): Promise<Response> {
     const assetPath = resolveWebviewAssetPath(this.webviewRoot!, pathname);
     if (!assetPath) {
       return new Response("Not found", { status: 404 });
     }
 
-    return serveFile(assetPath);
+    return serveFile(assetPath, {
+      acceptEncoding: request.headers.get("accept-encoding"),
+      // Bundle assets carry a content hash in their filename, so a new build
+      // can never be hidden behind a cached old one.
+      immutable: pathname.startsWith(`${routePrefix}/assets/`),
+    });
   }
 
   private buildViewportStyle(): string {
@@ -2393,17 +2400,47 @@ function jsonValuesEqual(left: JsonValue, right: JsonValue): boolean {
   return JSON.stringify(left) === JSON.stringify(right);
 }
 
-async function serveFile(filePath: string): Promise<Response> {
+type ServeFileOptions = {
+  acceptEncoding?: string | null;
+  immutable?: boolean;
+};
+
+async function serveFile(filePath: string, options: ServeFileOptions = {}): Promise<Response> {
   const file = Bun.file(filePath);
   if (!(await file.exists())) {
     return new Response("Not found", { status: 404 });
   }
 
-  return new Response(file, {
-    headers: {
-      "content-type": contentType(filePath),
-    },
-  });
+  const headers = new Headers({ "content-type": contentType(filePath) });
+  if (options.immutable) {
+    headers.set("cache-control", "public, max-age=31536000, immutable");
+  }
+
+  // The multi-megabyte JS bundles shrink ~4x under gzip; over the relay's
+  // WebSocket that is the difference between seconds and minutes.
+  if (isCompressible(filePath) && acceptsGzip(options.acceptEncoding ?? null)) {
+    headers.set("content-encoding", "gzip");
+    headers.set("vary", "accept-encoding");
+    return new Response(Bun.gzipSync(await file.bytes()), { headers });
+  }
+
+  return new Response(file, { headers });
+}
+
+const compressibleExtensions = [".js", ".css", ".html", ".json", ".svg", ".wasm"];
+
+function isCompressible(filePath: string): boolean {
+  return compressibleExtensions.some((extension) => filePath.endsWith(extension));
+}
+
+function acceptsGzip(acceptEncoding: string | null): boolean {
+  if (!acceptEncoding) {
+    return false;
+  }
+  return acceptEncoding
+    .toLowerCase()
+    .split(",")
+    .some((entry) => entry.trim().split(";")[0]?.trim() === "gzip");
 }
 
 function contentType(filePath: string): string {

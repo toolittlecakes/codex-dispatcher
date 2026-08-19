@@ -330,6 +330,56 @@ describe("extension webview", () => {
     }
   });
 
+  test("serves hashed assets gzipped and immutable for the relay's sake", async () => {
+    const previousRoot = process.env.CODEX_EXTENSION_WEBVIEW_ROOT;
+    const root = mkdtempSync(join(tmpdir(), "codex-webview-"));
+    process.env.CODEX_EXTENSION_WEBVIEW_ROOT = root;
+    writeFileSync(join(root, "index.html"), "<html></html>");
+    mkdirSync(join(root, "assets"));
+    const source = "export const answer = 42;\n".repeat(200);
+    writeFileSync(join(root, "assets", "app-initial-HASH1234.js"), source);
+    writeFileSync(join(root, "assets", "photo-HASH1234.png"), "not really a png");
+
+    try {
+      const webview = new ExtensionWebview({
+        appServer: {} as never,
+        defaultCwd: "/repo",
+        getToken: () => "secret",
+      });
+      const assetRequest = (path: string, headers: Record<string, string>) =>
+        webview.fetch(
+          new Request(`http://localhost${path}`, { headers: { "x-dispatcher-token": "secret", ...headers } }),
+          new URL(`http://localhost${path}`),
+        );
+
+      const gzipped = await assetRequest("/assets/app-initial-HASH1234.js", { "accept-encoding": "gzip, deflate, br" });
+      expect(gzipped.status).toBe(200);
+      expect(gzipped.headers.get("content-encoding")).toBe("gzip");
+      expect(gzipped.headers.get("cache-control")).toBe("public, max-age=31536000, immutable");
+      expect(gzipped.headers.get("vary")).toBe("accept-encoding");
+      const body = Buffer.from(await gzipped.arrayBuffer());
+      expect(body.byteLength).toBeLessThan(source.length);
+      expect(Buffer.from(Bun.gunzipSync(body)).toString()).toBe(source);
+
+      // A client that never offered gzip must get the plain bytes.
+      const identity = await assetRequest("/assets/app-initial-HASH1234.js", {});
+      expect(identity.headers.get("content-encoding")).toBeNull();
+      expect(await identity.text()).toBe(source);
+
+      // Already-compressed formats gain nothing and would only burn CPU.
+      const image = await assetRequest("/assets/photo-HASH1234.png", { "accept-encoding": "gzip" });
+      expect(image.headers.get("content-encoding")).toBeNull();
+      expect(image.headers.get("cache-control")).toBe("public, max-age=31536000, immutable");
+    } finally {
+      if (previousRoot === undefined) {
+        delete process.env.CODEX_EXTENSION_WEBVIEW_ROOT;
+      } else {
+        process.env.CODEX_EXTENSION_WEBVIEW_ROOT = previousRoot;
+      }
+      rmSync(root, { recursive: true, force: true });
+    }
+  });
+
   test("promotes URL token to an HttpOnly cookie for extension traffic", async () => {
     const previousRoot = process.env.CODEX_EXTENSION_WEBVIEW_ROOT;
     const root = mkdtempSync(join(tmpdir(), "codex-webview-"));
