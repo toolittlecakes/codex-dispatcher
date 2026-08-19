@@ -8,6 +8,7 @@ import {
   codexIpcEndpoint,
   ipcMethodVersion,
   legacyCodexIpcSocketPath,
+  type CodexIpcEvent,
   type IpcBroadcastMessage,
 } from "../src/codex-ipc";
 import { selectExtensionWebviewRoot } from "../src/extension-webview";
@@ -386,13 +387,16 @@ describe("codex ipc", () => {
             timeline.push(`+${Date.now() - started}ms ${name} ${event.type}:${detail} peers=[${peers}]`);
           });
         };
-        const orphaned = new CodexIpcBridge();
-        orphaned.onEvent((event) => {
+        const strandedReceived: Collected = [];
+        const collect = (into: Collected) => (event: CodexIpcEvent) => {
           if (event.type === "broadcast" && event.broadcast.method !== "client-status-changed") {
-            received.push({ method: event.broadcast.method, params: event.broadcast.params });
+            into.push({ method: event.broadcast.method, params: event.broadcast.params });
           }
-        });
+        };
+        const orphaned = new CodexIpcBridge();
+        orphaned.onEvent(collect(received));
         const stranded = new CodexIpcBridge();
+        stranded.onEvent(collect(strandedReceived));
         const usurper = new CodexIpcBridge();
         trace("orphaned", orphaned);
         trace("stranded", stranded);
@@ -408,32 +412,30 @@ describe("codex ipc", () => {
           unlinkSync(socketPath);
           await usurper.start("usurper-client");
 
-          // Rejoin needs a reconnect poll cycle on both stranded sides, and CI
-          // runners have shown 12s of 1s-timer cycles can still be in flight.
+          // What rejoin promises is convergence: everyone ends up on one bus
+          // and traffic flows again. Which bridge hosts it after the shuffle is
+          // an election detail — a loaded machine (CI) can go through a second
+          // election before settling, and the timeline showed exactly that. So
+          // the check is a broadcast from the usurper reaching both stranded
+          // clients, resent until the bus has knit itself back together.
+          const delivered = () =>
+            received.some((message) => message.method === "thread-read-state-changed") &&
+            strandedReceived.some((message) => message.method === "thread-read-state-changed");
           const deadline = Date.now() + 25_000;
-          while (usurper.getSnapshot().peers.length < 2 && Date.now() < deadline) {
-            await Bun.sleep(50);
+          while (!delivered() && Date.now() < deadline) {
+            usurper.broadcast("thread-read-state-changed", { threadId: "t-1" });
+            await Bun.sleep(250);
           }
-          // Both sides of the abandoned bus have to notice: the router that lost
-          // the endpoint, and the client that was talking to it.
-          const peers = usurper.getSnapshot().peers.map((peer) => peer.clientType).sort();
-          if (peers.length < 2) {
-            const describe = (name: string, bridge: CodexIpcBridge) => {
-              const snapshot = bridge.getSnapshot();
-              return `${name}: status=${snapshot.status} peers=[${snapshot.peers.map((peer) => peer.clientType).join(", ")}]`;
-            };
+          if (!delivered()) {
+            const describe = (name: string, bridge: CodexIpcBridge) => `${name}: status=${bridge.getSnapshot().status}`;
             throw new Error(
               "rejoin never completed — "
               + [describe("usurper", usurper), describe("orphaned", orphaned), describe("stranded", stranded)].join("; ")
               + "\n" + timeline.join("\n"),
             );
           }
-          expect(peers).toEqual(["orphaned-client", "stranded-client"]);
 
           expect(await extensionLike.waitForClose()).toBe(true);
-
-          usurper.broadcast("thread-read-state-changed", { threadId: "t-1" });
-          await waitFor(() => received.some((message) => message.method === "thread-read-state-changed"));
         } finally {
           extensionLike?.close();
           usurper.stop();
