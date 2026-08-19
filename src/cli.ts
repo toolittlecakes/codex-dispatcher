@@ -717,11 +717,14 @@ function startDispatcher(options: {
 }): Promise<ChildProcess> {
   return new Promise((resolve, reject) => {
     const launch = serverLaunchCommand();
+    // stdin is a pipe we never write to: the server watches it for EOF as
+    // parent-death detection, so even a SIGKILLed cli takes the server down.
     const child = spawn(launch.command, launch.args, {
-      stdio: ["inherit", "pipe", "pipe"],
+      stdio: ["pipe", "pipe", "pipe"],
       env: {
         ...process.env,
         CODEX_DISPATCHER_CWD: options.cwd,
+        DISPATCHER_EXIT_WITH_STDIN: "1",
         DISPATCHER_TOKEN: options.token,
         DISPATCHER_TLS: options.tls ? "on" : "off",
         HOST: options.host,

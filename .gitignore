@@ -1,8 +1,11 @@
 node_modules/
 .DS_Store
 *.log
-dist/
+/dist/
 coverage/
 .env
 .env.*
 !.env.example
+desktop/src-tauri/target/
+desktop/src-tauri/binaries/
+desktop/src-tauri/gen/

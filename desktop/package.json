@@ -1,0 +1,13 @@
+{
+  "name": "codex-dispatcher-desktop",
+  "version": "0.0.2",
+  "private": true,
+  "scripts": {
+    "sidecar": "cd .. && bun build --compile --target=bun --outfile=desktop/src-tauri/binaries/codex-dispatcher-aarch64-apple-darwin src/cli.ts",
+    "dev": "bun run sidecar && tauri dev",
+    "build": "bun run sidecar && tauri build"
+  },
+  "devDependencies": {
+    "@tauri-apps/cli": "^2"
+  }
+}

@@ -258,6 +258,19 @@ process.once("SIGTERM", () => {
   process.exit(0);
 });
 
+// The cli sets this and holds our stdin pipe open without ever writing to it,
+// so the pipe closing means the parent died — including a SIGKILL it could not
+// trap. Without this a killed cli leaves the server squatting on the port.
+if (process.env.DISPATCHER_EXIT_WITH_STDIN === "1") {
+  process.stdin.resume();
+  process.stdin.once("end", () => {
+    console.error("parent process is gone; shutting down");
+    ipcBridge.stop();
+    appServer.stop();
+    process.exit(1);
+  });
+}
+
 function applyIpcBroadcastEffects(broadcastMessage: IpcBroadcastMessage): void {
   if (broadcastMessage.method === "thread-stream-state-changed") {
     const params = asJsonObject(broadcastMessage.params);
