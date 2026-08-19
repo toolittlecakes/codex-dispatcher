@@ -170,7 +170,15 @@ describe("extension webview", () => {
     const previousRoot = process.env.CODEX_EXTENSION_WEBVIEW_ROOT;
     delete process.env.CODEX_EXTENSION_WEBVIEW_ROOT;
     try {
-      const installed = readdirSync(join(homedir(), ".vscode", "extensions"))
+      // A machine without VS Code (CI, standalone installs) has nothing for
+      // this check to check.
+      let entries: string[];
+      try {
+        entries = readdirSync(join(homedir(), ".vscode", "extensions"));
+      } catch {
+        return;
+      }
+      const installed = entries
         .map((entry) => parseExtensionVersion(entry))
         .filter((version): version is number[] => version !== null);
       if (installed.length === 0) {

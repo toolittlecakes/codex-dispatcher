@@ -56,7 +56,7 @@ export async function installExtensionWebview(
     mkdirSync(staging, { recursive: true });
     const vsixPath = join(staging, "extension.vsix");
     writeFileSync(vsixPath, bytes);
-    await unzipWebview(vsixPath, staging);
+    await unzipExtensionAssets(vsixPath, staging);
 
     const webview = join(staging, "extension", "webview");
     if (!existsSync(join(webview, "index.html"))) {
@@ -65,15 +65,17 @@ export async function installExtensionWebview(
     rmSync(destination, { recursive: true, force: true });
     mkdirSync(destination, { recursive: true });
     renameSync(webview, join(destination, "webview"));
+    // The PWA icon is served from resources/, a sibling of webview/.
+    renameSync(join(staging, "extension", "resources"), join(destination, "resources"));
   } finally {
     rmSync(staging, { recursive: true, force: true });
   }
   return join(destination, "webview");
 }
 
-function unzipWebview(vsixPath: string, into: string): Promise<void> {
+function unzipExtensionAssets(vsixPath: string, into: string): Promise<void> {
   return new Promise<void>((resolve, reject) => {
-    const child = spawn("unzip", ["-q", vsixPath, "extension/webview/*", "-d", into], {
+    const child = spawn("unzip", ["-q", vsixPath, "extension/webview/*", "extension/resources/*", "-d", into], {
       stdio: ["ignore", "ignore", "pipe"],
     });
     let stderr = "";
