@@ -393,18 +393,26 @@ describe("codex ipc", () => {
           unlinkSync(socketPath);
           await usurper.start("usurper-client");
 
-          // Rejoin needs a reconnect poll cycle on both stranded sides; CI
-          // runners have shown 6s to be too tight for it.
-          const deadline = Date.now() + 12_000;
+          // Rejoin needs a reconnect poll cycle on both stranded sides, and CI
+          // runners have shown 12s of 1s-timer cycles can still be in flight.
+          const deadline = Date.now() + 25_000;
           while (usurper.getSnapshot().peers.length < 2 && Date.now() < deadline) {
             await Bun.sleep(50);
           }
           // Both sides of the abandoned bus have to notice: the router that lost
           // the endpoint, and the client that was talking to it.
-          expect(usurper.getSnapshot().peers.map((peer) => peer.clientType).sort()).toEqual([
-            "orphaned-client",
-            "stranded-client",
-          ]);
+          const peers = usurper.getSnapshot().peers.map((peer) => peer.clientType).sort();
+          if (peers.length < 2) {
+            const describe = (name: string, bridge: CodexIpcBridge) => {
+              const snapshot = bridge.getSnapshot();
+              return `${name}: status=${snapshot.status} peers=[${snapshot.peers.map((peer) => peer.clientType).join(", ")}]`;
+            };
+            throw new Error(
+              "rejoin never completed — "
+              + [describe("usurper", usurper), describe("orphaned", orphaned), describe("stranded", stranded)].join("; "),
+            );
+          }
+          expect(peers).toEqual(["orphaned-client", "stranded-client"]);
 
           expect(await extensionLike.waitForClose()).toBe(true);
 
@@ -417,7 +425,7 @@ describe("codex ipc", () => {
           orphaned.stop();
         }
       });
-    }, 15_000);
+    }, 40_000);
   });
 
   // Loading a long thread's history is a five-minute call. The router runs its
