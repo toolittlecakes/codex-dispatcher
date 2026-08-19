@@ -21,6 +21,11 @@ type PendingRequest = {
   timeout: ReturnType<typeof setTimeout>;
   resolve: (response: Response) => void;
   reject: (error: Error) => void;
+  requestLine: string;
+  startedAt: number;
+  firstByteAt: number | null;
+  status: number | null;
+  bytes: number;
 };
 
 type PendingOAuth = {
@@ -284,6 +289,7 @@ async function proxyThroughDispatcher(
         pending.cancelDispatcherRequest();
       }
       pendingRequestsById.delete(requestId);
+      logProxyOutcome(pending, "timeout-504");
       resolve(new Response("Dispatcher response timed out.", { status: 504 }));
     }, 30_000);
     pendingRequestsById.set(requestId, {
@@ -292,6 +298,11 @@ async function proxyThroughDispatcher(
       dispatcherSessionId: ws.data.session?.id ?? "",
       cancelDispatcherRequest: () => sendFrame(ws, { type: "http-request-cancel", requestId }),
       timeout: startTimeout,
+      requestLine: `${request.method} ${url.pathname}`,
+      startedAt: Date.now(),
+      firstByteAt: null,
+      status: null,
+      bytes: 0,
       resolve: (response) => {
         clearTimeout(startTimeout);
         resolve(response);
@@ -330,6 +341,20 @@ function cancelPendingRequest(requestId: string): void {
   clearTimeout(pending.timeout);
   pending.cancelDispatcherRequest();
   pendingRequestsById.delete(requestId);
+  logProxyOutcome(pending, "browser-abort");
+}
+
+// One line per finished proxy request in journald is the only visibility we
+// have into what the tunnel actually did for a browser.
+function logProxyOutcome(pending: PendingRequest | undefined, outcome: string): void {
+  if (!pending) {
+    return;
+  }
+  const now = Date.now();
+  const ttfb = pending.firstByteAt === null ? "-" : `${pending.firstByteAt - pending.startedAt}ms`;
+  console.log(
+    `[proxy] ${pending.requestLine} status=${pending.status ?? "-"} outcome=${outcome} ttfb=${ttfb} total=${now - pending.startedAt}ms bytes=${pending.bytes}`,
+  );
 }
 
 function handleDispatcherFrame(ws: Bun.ServerWebSocket<DispatcherWsData>, raw: string): void {
@@ -347,6 +372,8 @@ function handleDispatcherFrame(ws: Bun.ServerWebSocket<DispatcherWsData>, raw: s
       if (!pending) {
         return;
       }
+      pending.firstByteAt = Date.now();
+      pending.status = frame.status;
       pending.resolve(new Response(new ReadableStream<Uint8Array>({
         start(controller) {
           pending.controller = controller;
@@ -358,6 +385,7 @@ function handleDispatcherFrame(ws: Bun.ServerWebSocket<DispatcherWsData>, raw: s
           pending.closed = true;
           pending.cancelDispatcherRequest();
           pendingRequestsById.delete(frame.requestId);
+          logProxyOutcome(pending, "browser-cancel");
         },
       }), {
         status: frame.status,
@@ -371,11 +399,14 @@ function handleDispatcherFrame(ws: Bun.ServerWebSocket<DispatcherWsData>, raw: s
         return;
       }
       try {
-        pending.controller.enqueue(Buffer.from(frame.bodyBase64, "base64"));
+        const chunk = Buffer.from(frame.bodyBase64, "base64");
+        pending.bytes += chunk.byteLength;
+        pending.controller.enqueue(chunk);
       } catch {
         pending.closed = true;
         pending.cancelDispatcherRequest();
         pendingRequestsById.delete(frame.requestId);
+        logProxyOutcome(pending, "enqueue-failed");
       }
       return;
     }
@@ -386,6 +417,7 @@ function handleDispatcherFrame(ws: Bun.ServerWebSocket<DispatcherWsData>, raw: s
       }
       pendingRequestsById.delete(frame.requestId);
       pending.closed = true;
+      logProxyOutcome(pending, "end");
       try {
         pending.controller.close();
       } catch {
@@ -400,6 +432,7 @@ function handleDispatcherFrame(ws: Bun.ServerWebSocket<DispatcherWsData>, raw: s
       }
       pendingRequestsById.delete(frame.requestId);
       pending.closed = true;
+      logProxyOutcome(pending, "dispatcher-error");
       if (pending.controller) {
         try {
           pending.controller.error(new Error(frame.error));
@@ -438,6 +471,7 @@ function closePendingRequestsForDispatcher(sessionId: string): void {
     pending.closed = true;
     clearTimeout(pending.timeout);
     pendingRequestsById.delete(requestId);
+    logProxyOutcome(pending, "dispatcher-gone");
     if (pending.controller) {
       try {
         pending.controller.error(new Error("Dispatcher connection closed."));
