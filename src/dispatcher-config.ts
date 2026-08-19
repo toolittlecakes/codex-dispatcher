@@ -16,8 +16,30 @@ export type DispatcherConfig = {
   };
 };
 
+export function dispatcherHome(): string {
+  return process.env.CODEX_DISPATCHER_HOME ?? join(homedir(), ".codex-dispatcher");
+}
+
 export function dispatcherConfigPath(): string {
-  return join(process.env.CODEX_DISPATCHER_HOME ?? join(homedir(), ".codex-dispatcher"), "config.json");
+  return join(dispatcherHome(), "config.json");
+}
+
+export type DispatcherRuntime = {
+  pid: number;
+  localUrl: string;
+  phoneUrl: string | null;
+};
+
+// The tray app (and anything else that wants to link to a running dispatcher)
+// reads this instead of parsing serve's stdout. The URLs embed the webview
+// token, hence 0600.
+export function dispatcherRuntimePath(): string {
+  return join(dispatcherHome(), "runtime.json");
+}
+
+export function writeDispatcherRuntime(runtime: DispatcherRuntime, path = dispatcherRuntimePath()): void {
+  mkdirSync(dirname(path), { recursive: true });
+  writeFileSync(path, `${JSON.stringify(runtime, null, 2)}\n`, { mode: 0o600 });
 }
 
 export function readDispatcherConfig(path = dispatcherConfigPath()): DispatcherConfig {

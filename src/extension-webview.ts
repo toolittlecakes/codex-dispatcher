@@ -11,6 +11,7 @@ import type {
   ServerRequestResponse,
 } from "./codex-app-server";
 import type { IpcBroadcastMessage } from "./codex-ipc";
+import { dispatcherExtensionsDir } from "./extension-install";
 import {
   pwaHeadTags,
   pwaIconFilePath,
@@ -1503,7 +1504,11 @@ export function resolveExtensionWebviewRoot(): string | null {
     return resolve(configured);
   }
 
-  return selectExtensionWebviewRoot(join(homedir(), ".vscode", "extensions"));
+  // Two install locations, one contract: the dispatcher's own download dir
+  // (standalone machines) and VS Code's extensions dir (developer machines
+  // where the extension is already on disk). Newest supported copy wins.
+  return selectExtensionWebviewRoot(dispatcherExtensionsDir())
+    ?? selectExtensionWebviewRoot(join(homedir(), ".vscode", "extensions"));
 }
 
 export function selectExtensionWebviewRoot(extensionsDir: string): string | null {

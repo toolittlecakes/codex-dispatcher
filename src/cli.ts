@@ -6,7 +6,15 @@ import { createServer } from "node:net";
 import { dirname, join, resolve } from "node:path";
 import packageJson from "../package.json" with { type: "json" };
 import { resolveCodexCliPath } from "./codex-app-server";
-import { ensureWebviewToken, readDispatcherConfig, writeDispatcherConfig, type DispatcherConfig } from "./dispatcher-config";
+import {
+  dispatcherRuntimePath,
+  ensureWebviewToken,
+  readDispatcherConfig,
+  writeDispatcherConfig,
+  writeDispatcherRuntime,
+  type DispatcherConfig,
+} from "./dispatcher-config";
+import { installExtensionWebview } from "./extension-install";
 import { resolveExtensionWebviewRoot, verifiedExtensionVersion } from "./extension-webview";
 import { buildGitHubDeviceCodeBody, buildGitHubDeviceTokenBody } from "./github-oauth";
 import { startRelayClient, type RelayClient } from "./relay-client";
@@ -134,6 +142,12 @@ try {
     console.log("        (self-signed certificate: accept it once, against the fingerprint above)");
   }
   console.log("");
+
+  writeDispatcherRuntime({
+    pid: process.pid,
+    localUrl: extensionUrl(localTarget, token),
+    phoneUrl: relayClient?.stableUrl ?? (tunnelStart ? extensionUrl(tunnelStart.url, token) : null),
+  });
 } catch (error) {
   console.error(error instanceof Error ? error.message : String(error));
   shutdown(1);
@@ -591,17 +605,15 @@ async function runDoctor(options: CliOptions): Promise<boolean> {
   } catch (error) {
     unsupportedExtension = error instanceof Error ? error.message : String(error);
   }
-  const codeCli = await checkExecutable("VS Code CLI", "code", ["--version"]);
   checks.push({
     label: "Codex VS Code extension webview",
-    ok: unsupportedExtension === null && (webviewRoot !== null || (options.installExtension && codeCli.ok)),
+    ok: unsupportedExtension === null && (webviewRoot !== null || options.installExtension),
     detail: unsupportedExtension ?? webviewRoot ?? (
-      options.installExtension && codeCli.ok
-        ? `not installed yet; serve will install ${extensionId}@${verifiedExtensionVersion}`
-        : "not found; install the extension or set CODEX_EXTENSION_WEBVIEW_ROOT"
+      options.installExtension
+        ? `not installed yet; serve will download ${extensionId}@${verifiedExtensionVersion} from the marketplace`
+        : "not found; run serve without --no-install-extension or set CODEX_EXTENSION_WEBVIEW_ROOT"
     ),
   });
-  checks.push(codeCli);
 
   if (options.tunnel === "cloudflare") {
     checks.push(await checkExecutable("cloudflared", process.env.CLOUDFLARED_PATH ?? "cloudflared", ["--version"]));
@@ -662,37 +674,15 @@ async function ensureCodexExtensionWebviewRoot(installMissing: boolean): Promise
     );
   }
 
-  console.log(`Codex VS Code extension was not found. Installing ${extensionId}@${verifiedExtensionVersion} with the VS Code CLI...`);
-  await runCommand("code", ["--install-extension", `${extensionId}@${verifiedExtensionVersion}`]);
+  await installExtensionWebview(verifiedExtensionVersion);
 
   const installed = resolveExtensionWebviewRoot();
   if (!installed) {
     throw new Error(
-      "VS Code reported extension installation finished, but Codex webview assets were not found. Set CODEX_EXTENSION_WEBVIEW_ROOT to the extension webview directory.",
+      "Extension download finished, but Codex webview assets were not found. Set CODEX_EXTENSION_WEBVIEW_ROOT to the extension webview directory.",
     );
   }
   return installed;
-}
-
-function runCommand(command: string, args: string[]): Promise<void> {
-  return new Promise<void>((resolve, reject) => {
-    const child = spawn(command, args, { stdio: "inherit" });
-    child.on("error", (error) => reject(error));
-    child.on("exit", (code, signal) => {
-      if (code === 0) {
-        resolve();
-        return;
-      }
-      reject(new Error(`${command} ${args.join(" ")} failed: code=${String(code)} signal=${String(signal)}`));
-    });
-  }).catch((error) => {
-    if (error instanceof Error && "code" in error && error.code === "ENOENT") {
-      throw new Error(
-        "VS Code CLI `code` was not found. Install the VS Code shell command or set CODEX_EXTENSION_WEBVIEW_ROOT.",
-      );
-    }
-    throw error;
-  });
 }
 
 function canRun(command: string, args: string[]): Promise<CommandCheck> {
@@ -913,6 +903,11 @@ function sleep(ms: number): Promise<void> {
 
 function shutdown(code: number): never {
   shuttingDown = true;
+  try {
+    unlinkSync(dispatcherRuntimePath());
+  } catch {
+    // serve may exit before the runtime file was ever written
+  }
   relayClient?.close();
   tunnel?.kill("SIGTERM");
   dispatcher?.kill("SIGTERM");
