@@ -11,6 +11,9 @@ type DispatcherWsData = {
   kind: "dispatcher";
   session: RelayDispatcherSession | null;
   acceptedFrame: RelayFrame;
+  // Dispatchers that opted in with ?flow=1 wait for byte confirmations; a
+  // dispatcher that never asked must not receive frames it cannot decode.
+  flowControl: boolean;
 };
 
 type PendingRequest = {
@@ -180,6 +183,7 @@ function handleDispatcherConnect(
       kind: "dispatcher",
       session: result.ok ? result.session : null,
       acceptedFrame,
+      flowControl: url.searchParams.get("flow") === "1",
     },
   })) {
     return undefined;
@@ -394,12 +398,18 @@ function handleDispatcherFrame(ws: Bun.ServerWebSocket<DispatcherWsData>, raw: s
       return;
     }
     case "http-response-chunk": {
+      const chunk = Buffer.from(frame.bodyBase64, "base64");
+      // Confirm consumption even for chunks of a cancelled request: flow
+      // control measures the pipe, and unconfirmed bytes would jam the
+      // dispatcher's window for every other request.
+      if (ws.data.flowControl && chunk.byteLength > 0) {
+        sendFrame(ws, { type: "flow-ack", bytes: chunk.byteLength });
+      }
       const pending = pendingRequestForDispatcher(ws, frame.requestId);
       if (!pending?.controller || pending.closed) {
         return;
       }
       try {
-        const chunk = Buffer.from(frame.bodyBase64, "base64");
         pending.bytes += chunk.byteLength;
         pending.controller.enqueue(chunk);
       } catch {

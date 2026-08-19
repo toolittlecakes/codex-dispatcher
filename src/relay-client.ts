@@ -76,10 +76,11 @@ export function startRelayClient(options: RelayClientOptions): Promise<RelayClie
     const connect = (killExisting: boolean) => {
       stopHeartbeat();
       const socket = new WebSocket(dispatcherWebSocketUrl({ ...options, killExisting }));
+      const flowGate: FlowGate = { unackedBytes: 0, waiters: [] };
       ws = socket;
 
       socket.addEventListener("message", (event) => {
-        void handleRelayMessage(options, socket, event.data, activeRequests).then((controlFrame) => {
+        void handleRelayMessage(options, socket, event.data, activeRequests, flowGate).then((controlFrame) => {
           if (!controlFrame) {
             return;
           }
@@ -136,6 +137,7 @@ export function startRelayClient(options: RelayClientOptions): Promise<RelayClie
       });
 
       socket.addEventListener("close", () => {
+        releaseFlowWaiters(flowGate);
         const wasCurrentSocket = ws === socket;
         if (wasCurrentSocket) {
           ws = null;
@@ -161,17 +163,55 @@ export function dispatcherWebSocketUrl(options: Pick<RelayClientOptions, "relayU
   const url = new URL("/api/dispatcher/connect", options.relayUrl);
   url.protocol = url.protocol === "https:" ? "wss:" : "ws:";
   url.searchParams.set("token", options.relayToken);
+  url.searchParams.set("flow", "1");
   if (options.killExisting) {
     url.searchParams.set("killExisting", "1");
   }
   return url.toString();
 }
 
+// Bun's client WebSocket reports bufferedAmount as 0 no matter what it holds,
+// so the only working backpressure is end-to-end: cap the bytes the relay has
+// not yet confirmed pulling off the socket. The cap is shared by every
+// response on the connection — that is what keeps a 17-byte host-message
+// answer from queueing behind minutes of asset chunks.
+const flowWindowBytes = 512 * 1024;
+
+type FlowGate = {
+  unackedBytes: number;
+  waiters: (() => void)[];
+};
+
+function acknowledgeFlow(gate: FlowGate, bytes: number): void {
+  gate.unackedBytes = Math.max(0, gate.unackedBytes - bytes);
+  if (gate.unackedBytes <= flowWindowBytes) {
+    for (const wake of gate.waiters.splice(0)) {
+      wake();
+    }
+  }
+}
+
+function releaseFlowWaiters(gate: FlowGate): void {
+  for (const wake of gate.waiters.splice(0)) {
+    wake();
+  }
+}
+
+async function waitForFlowWindow(gate: FlowGate, ws: WebSocket, signal: AbortSignal): Promise<void> {
+  while (gate.unackedBytes > flowWindowBytes && ws.readyState === WebSocket.OPEN && !signal.aborted) {
+    await new Promise<void>((resolve) => {
+      gate.waiters.push(resolve);
+      signal.addEventListener("abort", () => resolve(), { once: true });
+    });
+  }
+}
+
 async function handleRelayMessage(
   options: RelayClientOptions,
   ws: WebSocket,
   raw: string | Buffer,
-  activeRequests?: Map<string, AbortController>,
+  activeRequests: Map<string, AbortController>,
+  flowGate: FlowGate,
 ): Promise<RelayControlFrame | null> {
   const frame = decodeRelayFrame(raw);
   switch (frame.type) {
@@ -179,13 +219,13 @@ async function handleRelayMessage(
     case "dispatcher-rejected":
       return frame;
     case "http-request":
-      if (!activeRequests) {
-        throw new Error("Relay request map is unavailable.");
-      }
-      void forwardHttpRequest(options, ws, frame, activeRequests);
+      void forwardHttpRequest(options, ws, frame, activeRequests, flowGate);
       return null;
     case "http-request-cancel":
       handleHttpRequestCancel(frame, activeRequests);
+      return null;
+    case "flow-ack":
+      acknowledgeFlow(flowGate, frame.bytes);
       return null;
     default:
       return null;
@@ -197,6 +237,7 @@ async function forwardHttpRequest(
   ws: WebSocket,
   frame: RelayHttpRequestFrame,
   activeRequests: Map<string, AbortController>,
+  flowGate: FlowGate,
 ): Promise<void> {
   const controller = new AbortController();
   activeRequests.set(frame.requestId, controller);
@@ -230,16 +271,16 @@ async function forwardHttpRequest(
         if (result.done) {
           break;
         }
+        flowGate.unackedBytes += result.value.byteLength;
         sendFrame(ws, {
           type: "http-response-chunk",
           requestId: frame.requestId,
           bodyBase64: Buffer.from(result.value).toString("base64"),
         });
         // Local reads finish in milliseconds while the socket drains at the
-        // uplink's pace; without this wait a single large asset parks
-        // megabytes in the send buffer ahead of every other request's
-        // response-start frame, and the relay times those out.
-        await drainBelowBackpressureLimit(ws);
+        // uplink's pace; unchecked, one response parks megabytes in the send
+        // buffer ahead of every other frame on this connection.
+        await waitForFlowWindow(flowGate, ws, controller.signal);
       }
     }
 
@@ -286,13 +327,3 @@ function sendFrame(ws: WebSocket, frame: RelayFrame): void {
   }
 }
 
-const backpressureLimitBytes = 256 * 1024;
-const backpressurePollMs = 20;
-
-// The client WebSocket has no drain event, so polling bufferedAmount is the
-// only way to yield until the socket catches up.
-async function drainBelowBackpressureLimit(ws: WebSocket): Promise<void> {
-  while (ws.readyState === WebSocket.OPEN && ws.bufferedAmount > backpressureLimitBytes) {
-    await Bun.sleep(backpressurePollMs);
-  }
-}

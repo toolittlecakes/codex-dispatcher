@@ -10,7 +10,7 @@ describe("relay client", () => {
         relayToken: "token",
         killExisting: false,
       }),
-    ).toBe("wss://codex-dispatcher.app/api/dispatcher/connect?token=token");
+    ).toBe("wss://codex-dispatcher.app/api/dispatcher/connect?token=token&flow=1");
   });
 
   test("adds explicit takeover flag when requested", () => {
@@ -20,7 +20,7 @@ describe("relay client", () => {
         relayToken: "token",
         killExisting: true,
       }),
-    ).toBe("ws://localhost:8788/api/dispatcher/connect?token=token&killExisting=1");
+    ).toBe("ws://localhost:8788/api/dispatcher/connect?token=token&flow=1&killExisting=1");
   });
 
   test("aborts local streaming requests when the relay cancels them", async () => {
@@ -201,6 +201,105 @@ describe("relay client", () => {
       localDispatcher.stop(true);
     }
   });
+
+  // The whole point of the flow window: a relay that stops confirming bytes
+  // stops the dispatcher from pouring the rest of a large response into the
+  // socket, and confirmations release exactly the remainder.
+  test("sends no more than the flow window until the relay confirms bytes", async () => {
+    const payloadBytes = 4 * 1024 * 1024;
+    let relaySocket: Bun.ServerWebSocket<unknown> | null = null;
+    const responseDone = deferred<void>();
+    let receivedBytes = 0;
+    let acksEnabled = false;
+
+    const localDispatcher = Bun.serve({
+      port: 0,
+      hostname: "127.0.0.1",
+      fetch() {
+        return new Response(Buffer.alloc(payloadBytes, 7), {
+          headers: { "content-type": "application/octet-stream" },
+        });
+      },
+    });
+
+    const relay = Bun.serve({
+      port: 0,
+      hostname: "127.0.0.1",
+      fetch(request, server) {
+        if (server.upgrade(request)) {
+          return undefined;
+        }
+        return new Response("upgrade required", { status: 400 });
+      },
+      websocket: {
+        open(ws) {
+          relaySocket = ws;
+          ws.send(encodeRelayFrame({
+            type: "dispatcher-accepted",
+            stableUrl: "https://toolittlecakes.codex-dispatcher.app/",
+            killedSessionId: null,
+          }));
+        },
+        message(ws, raw) {
+          const frame = decodeRelayFrame(raw.toString());
+          if (frame.type === "http-response-chunk") {
+            const bytes = Buffer.from(frame.bodyBase64, "base64").byteLength;
+            receivedBytes += bytes;
+            if (acksEnabled) {
+              ws.send(encodeRelayFrame({ type: "flow-ack", bytes }));
+            }
+          }
+          if (frame.type === "http-response-end") {
+            responseDone.resolve();
+          }
+        },
+      },
+    });
+
+    try {
+      const client = await startRelayClient({
+        relayUrl: relay.url.toString(),
+        relayToken: "relay-token",
+        localBaseUrl: localDispatcher.url.toString(),
+        localDispatcherToken: "local-token",
+        killExisting: false,
+      });
+
+      relaySocket?.send(encodeRelayFrame({
+        type: "http-request",
+        requestId: "req-large",
+        method: "GET",
+        path: "/large.bin",
+        headers: [],
+        bodyBase64: null,
+      }));
+
+      // Give the dispatcher ample time to overshoot if it were going to.
+      await sleep(500);
+      const stalledAt = receivedBytes;
+      expect(stalledAt).toBeGreaterThan(0);
+      // One chunk may be in flight past the 512KB window, never megabytes.
+      expect(stalledAt).toBeLessThan(1024 * 1024);
+      await sleep(300);
+      expect(receivedBytes).toBe(stalledAt);
+
+      acksEnabled = true;
+      // Confirm the backlog; every later chunk is confirmed as it arrives.
+      relaySocket?.send(encodeRelayFrame({ type: "flow-ack", bytes: stalledAt }));
+
+      await Promise.race([
+        responseDone.promise,
+        sleep(10_000).then(() => {
+          throw new Error(`response stalled after acks: ${receivedBytes} of ${payloadBytes} bytes`);
+        }),
+      ]);
+      expect(receivedBytes).toBe(payloadBytes);
+      client.close();
+    } finally {
+      relay.stop(true);
+      localDispatcher.stop(true);
+    }
+  }, 20_000);
 });
 
 function deferred<T>(): { promise: Promise<T>; resolve: (value: T | PromiseLike<T>) => void } {

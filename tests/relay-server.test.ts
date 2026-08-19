@@ -212,6 +212,53 @@ describe("relay server", () => {
     }
   }, 15_000);
 
+  test("confirms received chunks to a dispatcher that asked for flow control", async () => {
+    const { relay, relayUrl } = await startRelay();
+
+    try {
+      const ws = new WebSocket(new URL(`/api/dispatcher/connect?token=${dispatcherToken}&flow=1`, relayUrl));
+      expect((await waitForFrame(ws)).type).toBe("dispatcher-accepted");
+
+      const chunkBytes = 128 * 1024;
+      const ackPromise = new Promise<number>((resolve, reject) => {
+        const timeout = setTimeout(() => reject(new Error("relay never confirmed the chunk")), 5_000);
+        ws.addEventListener("message", (event) => {
+          const frame = decodeRelayFrame(String(event.data));
+          if (frame.type === "http-request") {
+            ws.send(encodeRelayFrame({
+              type: "http-response-start",
+              requestId: frame.requestId,
+              status: 200,
+              headers: [["content-type", "application/octet-stream"]],
+            }));
+            ws.send(encodeRelayFrame({
+              type: "http-response-chunk",
+              requestId: frame.requestId,
+              bodyBase64: Buffer.alloc(chunkBytes, 1).toString("base64"),
+            }));
+            ws.send(encodeRelayFrame({ type: "http-response-end", requestId: frame.requestId }));
+          }
+          if (frame.type === "flow-ack") {
+            clearTimeout(timeout);
+            resolve(frame.bytes);
+          }
+        });
+      });
+
+      const response = await fetch(new URL("/icon.png", relayUrl), {
+        headers: { host: `toolittlecakes.${baseHostname}` },
+        redirect: "manual",
+      });
+      expect(response.status).toBe(200);
+      expect((await response.arrayBuffer()).byteLength).toBe(chunkBytes);
+      expect(await ackPromise).toBe(chunkBytes);
+      ws.close();
+    } finally {
+      relay.kill();
+      await relay.exited.catch(() => undefined);
+    }
+  }, 15_000);
+
   test("lets an anonymous browser read the PWA install metadata it never sends cookies for", async () => {
     const { relay, relayUrl } = await startRelay();
 

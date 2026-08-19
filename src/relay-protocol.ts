@@ -43,6 +43,13 @@ export type RelayHeartbeatFrame = {
   sentAt: number;
 };
 
+// Pipe-level flow control: the relay confirms bytes it pulled off the socket
+// (delivered or not), the dispatcher caps how many bytes ride unconfirmed.
+export type RelayFlowAckFrame = {
+  type: "flow-ack";
+  bytes: number;
+};
+
 export type RelayControlFrame =
   | {
       type: "dispatcher-accepted";
@@ -63,6 +70,7 @@ export type RelayFrame =
   | RelayHttpResponseErrorFrame
   | RelayHttpRequestCancelFrame
   | RelayHeartbeatFrame
+  | RelayFlowAckFrame
   | RelayControlFrame;
 
 export function encodeRelayFrame(frame: RelayFrame): string {
@@ -118,6 +126,11 @@ export function decodeRelayFrame(raw: string | Buffer): RelayFrame {
         type: "dispatcher-heartbeat",
         sentAt: requiredTimestamp(value.sentAt, "sentAt"),
       };
+    case "flow-ack":
+      return {
+        type: "flow-ack",
+        bytes: requiredByteCount(value.bytes),
+      };
     case "dispatcher-accepted":
       return {
         type: "dispatcher-accepted",
@@ -150,6 +163,13 @@ function requiredString(value: unknown, key: string): string {
 function requiredStatus(value: unknown): number {
   if (typeof value !== "number" || !Number.isInteger(value) || value < 100 || value > 599) {
     throw new Error("Invalid relay frame: status must be an HTTP status code.");
+  }
+  return value;
+}
+
+function requiredByteCount(value: unknown): number {
+  if (typeof value !== "number" || !Number.isInteger(value) || value <= 0) {
+    throw new Error("Invalid relay frame: bytes must be a positive integer.");
   }
   return value;
 }
