@@ -90,11 +90,13 @@ describe("relay server", () => {
       const ws = new WebSocket(new URL(`/api/dispatcher/connect?token=${dispatcherToken}`, relayUrl));
       expect((await waitForFrame(ws)).type).toBe("dispatcher-accepted");
 
+      let requestId = "";
       ws.addEventListener("message", (event) => {
         const frame = decodeRelayFrame(String(event.data));
         if (frame.type !== "http-request") {
           return;
         }
+        requestId = frame.requestId;
         ws.send(encodeRelayFrame({
           type: "http-response-start",
           requestId: frame.requestId,
@@ -106,11 +108,6 @@ describe("relay server", () => {
           requestId: frame.requestId,
           bodyBase64: Buffer.from("partial").toString("base64"),
         }));
-        ws.send(encodeRelayFrame({
-          type: "http-response-error",
-          requestId: frame.requestId,
-          error: "local dispatcher body read failed",
-        }));
       });
 
       const response = await fetch(new URL("/stream", relayUrl), {
@@ -121,11 +118,24 @@ describe("relay server", () => {
       });
       expect(response.status).toBe(200);
 
+      // Read the first chunk before failing the dispatcher side: an error that
+      // lands while the response headers are still in flight tears the socket
+      // down before fetch resolves, which is a different scenario.
+      const reader = response.body!.getReader();
+      const first = await reader.read();
+      expect(new TextDecoder().decode(first.value)).toBe("partial");
+
+      ws.send(encodeRelayFrame({
+        type: "http-response-error",
+        requestId,
+        error: "local dispatcher body read failed",
+      }));
+
       // Before the fix the error frame was dropped once streaming had started, so
       // the browser response stayed open until the client gave up.
       const outcome = await Promise.race([
-        response
-          .text()
+        reader
+          .read()
           .then(() => "settled" as const)
           .catch(() => "settled" as const),
         sleep(3_000).then(() => "hung" as const),
