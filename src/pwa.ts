@@ -41,12 +41,21 @@ export function pwaManifest(): string {
   );
 }
 
-// An installable app needs a service worker with a fetch listener, but this one
-// deliberately caches nothing: the webview is worthless without the laptop it
-// streams from, and a cache would happily serve assets of an extension version
-// the dispatcher no longer hosts. Not calling respondWith leaves every request
-// on the plain network path, streams included.
-export const pwaServiceWorkerSource = `self.addEventListener("install", () => {
+// The manifest is the list of hashed assets this dispatcher has actually
+// served — the app's real boot set, not the 200MB+ of lazy chunks the bundle
+// ships. The worker below syncs its cache to that list, so a phone on a bad
+// channel warms up from what some browser already needed.
+export const pwaPrecacheManifestPath = "/precache.json";
+
+// Cache-first is safe precisely because only /assets/* is cached: those
+// filenames carry a content hash, so a new extension version references new
+// names and can never be hidden behind an old cached file. Everything else —
+// index with its embedded host id, /events, /host-message — stays on the plain
+// network path, streams included.
+export const pwaServiceWorkerSource = `const assetCache = "codex-assets";
+const precacheManifestPath = ${JSON.stringify(pwaPrecacheManifestPath)};
+
+self.addEventListener("install", () => {
   self.skipWaiting();
 });
 
@@ -54,7 +63,91 @@ self.addEventListener("activate", (event) => {
   event.waitUntil(self.clients.claim());
 });
 
-self.addEventListener("fetch", () => {});
+self.addEventListener("fetch", (event) => {
+  const request = event.request;
+  const url = new URL(request.url);
+  if (request.method !== "GET" || url.origin !== self.location.origin) {
+    return;
+  }
+  if (request.mode === "navigate") {
+    // Every page open re-syncs the cache in the background; the navigation
+    // itself stays on the network.
+    event.waitUntil(scheduleCacheSync());
+    return;
+  }
+  if (!url.pathname.startsWith("/assets/") || request.headers.has("range")) {
+    return;
+  }
+  event.respondWith(serveAsset(request, url.pathname));
+});
+
+async function serveAsset(request, pathname) {
+  const cache = await caches.open(assetCache);
+  const hit = await cache.match(pathname);
+  if (hit) {
+    return hit;
+  }
+  const response = await fetch(request);
+  if (response.ok) {
+    await cache.put(pathname, response.clone());
+  }
+  return response;
+}
+
+let syncInFlight = null;
+
+function scheduleCacheSync() {
+  if (!syncInFlight) {
+    // The delay keeps the sweep off the tunnel while the page pulls its own
+    // boot assets — which land in the cache anyway via serveAsset.
+    syncInFlight = new Promise((resolve) => setTimeout(resolve, 15000))
+      .then(syncAssetCache)
+      .finally(() => {
+        syncInFlight = null;
+      });
+  }
+  return syncInFlight;
+}
+
+async function syncAssetCache() {
+  const manifestResponse = await fetch(precacheManifestPath);
+  if (!manifestResponse.ok) {
+    throw new Error("precache manifest fetch failed: " + manifestResponse.status);
+  }
+  const manifest = await manifestResponse.json();
+  const cache = await caches.open(assetCache);
+  const cachedPaths = new Set((await cache.keys()).map((cached) => new URL(cached.url).pathname));
+  const wanted = new Set(manifest.assets);
+  // Hashed names outside the manifest belong to an extension version the
+  // dispatcher no longer serves.
+  for (const pathname of cachedPaths) {
+    if (!wanted.has(pathname)) {
+      await cache.delete(pathname);
+    }
+  }
+  const queue = manifest.assets.filter((pathname) => !cachedPaths.has(pathname));
+  const workers = [];
+  for (let index = 0; index < 4; index += 1) {
+    workers.push(downloadQueued(cache, queue));
+  }
+  await Promise.all(workers);
+}
+
+async function downloadQueued(cache, queue) {
+  while (queue.length > 0) {
+    const pathname = queue.pop();
+    // The page may have pulled this one through serveAsset since the sweep
+    // started; downloading it twice would double the load on a bad channel.
+    if (await cache.match(pathname)) {
+      continue;
+    }
+    const response = await fetch(pathname);
+    if (!response.ok) {
+      throw new Error("precache of " + pathname + " failed: " + response.status);
+    }
+    await cache.put(pathname, response);
+  }
+}
 `;
 
 export function pwaHeadTags(): string {

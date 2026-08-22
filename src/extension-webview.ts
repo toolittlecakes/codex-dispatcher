@@ -1,5 +1,5 @@
 import { createHash, timingSafeEqual } from "node:crypto";
-import { existsSync, readFileSync, readdirSync } from "node:fs";
+import { existsSync, mkdirSync, readFileSync, readdirSync, writeFileSync } from "node:fs";
 import { homedir, platform, release } from "node:os";
 import { basename, dirname, join, resolve, sep } from "node:path";
 import { AppServerError } from "./codex-app-server";
@@ -11,6 +11,7 @@ import type {
   ServerRequestResponse,
 } from "./codex-app-server";
 import type { IpcBroadcastMessage } from "./codex-ipc";
+import { dispatcherHome } from "./dispatcher-config";
 import { dispatcherExtensionsDir } from "./extension-install";
 import {
   pwaHeadTags,
@@ -18,6 +19,7 @@ import {
   pwaIconPath,
   pwaManifest,
   pwaManifestPath,
+  pwaPrecacheManifestPath,
   pwaServiceWorkerPath,
   pwaServiceWorkerSource,
 } from "./pwa";
@@ -47,6 +49,7 @@ type ExtensionWebviewOptions = {
   getToken: () => string;
   getEventReplayMessages?: () => JsonObject[];
   statePath?: string;
+  precacheManifestPath?: string;
   assertThreadFollowerOwner?: (conversationId: string) => Promise<void> | void;
   getThreadRole?: (conversationId: string) => string | Promise<string>;
   handleFollowerRequest?: (method: string, params: JsonValue, signal: AbortSignal) => Promise<JsonValue>;
@@ -162,6 +165,11 @@ export class ExtensionWebview {
   private readonly webviewRoot: string | null;
   private readonly state: ExtensionState;
   private settingDefinitionsCache: SettingDefinitions | null = null;
+  // The hashed assets browsers actually pulled — the app's boot set, which
+  // /precache.json hands to the service worker so a phone on a slow relay can
+  // warm its cache from what some other browser already needed.
+  private readonly precacheManifestPath: string;
+  private readonly servedAssetPaths = new Set<string>();
 
   constructor(options: ExtensionWebviewOptions) {
     this.appServer = options.appServer;
@@ -176,6 +184,10 @@ export class ExtensionWebview {
     this.onThreadActivity = options.onThreadActivity;
     this.state = new ExtensionState(options.statePath ?? extensionStatePath());
     this.webviewRoot = resolveExtensionWebviewRoot();
+    this.precacheManifestPath = options.precacheManifestPath ?? join(dispatcherHome(), "precache-manifest.json");
+    for (const pathname of loadPrecacheManifest(this.precacheManifestPath, extensionVersionOf(this.webviewRoot))) {
+      this.servedAssetPaths.add(pathname);
+    }
   }
 
   async fetch(request: Request, url: URL): Promise<Response> {
@@ -192,8 +204,14 @@ export class ExtensionWebview {
     }
 
     if (url.pathname === pwaServiceWorkerPath) {
+      // no-cache: a worker held back by HTTP caching would keep running old
+      // caching logic long after an update shipped new logic.
       return new Response(pwaServiceWorkerSource, {
-        headers: { "content-type": "text/javascript; charset=utf-8", "service-worker-allowed": "/" },
+        headers: {
+          "content-type": "text/javascript; charset=utf-8",
+          "service-worker-allowed": "/",
+          "cache-control": "no-cache",
+        },
       });
     }
 
@@ -215,6 +233,13 @@ export class ExtensionWebview {
 
     if (url.pathname === `${routePrefix}/debug`) {
       return jsonResponse(this.debugSnapshot());
+    }
+
+    if (url.pathname === pwaPrecacheManifestPath) {
+      return jsonResponse({
+        version: extensionVersionOf(this.webviewRoot),
+        assets: [...this.servedAssetPaths].sort(),
+      });
     }
 
     if (url.pathname === routePrefix || url.pathname === `${routePrefix}/` || url.pathname === `${routePrefix}/index.html`) {
@@ -313,12 +338,24 @@ export class ExtensionWebview {
       return new Response("Not found", { status: 404 });
     }
 
-    return serveFile(assetPath, {
+    const response = await serveFile(assetPath, {
       acceptEncoding: request.headers.get("accept-encoding"),
       // Bundle assets carry a content hash in their filename, so a new build
       // can never be hidden behind a cached old one.
       immutable: pathname.startsWith(`${routePrefix}/assets/`),
     });
+    if (response.status === 200 && pathname.startsWith(`${routePrefix}/assets/`)) {
+      this.recordServedAsset(pathname);
+    }
+    return response;
+  }
+
+  private recordServedAsset(pathname: string): void {
+    if (this.servedAssetPaths.has(pathname)) {
+      return;
+    }
+    this.servedAssetPaths.add(pathname);
+    writePrecacheManifest(this.precacheManifestPath, extensionVersionOf(this.webviewRoot), [...this.servedAssetPaths].sort());
   }
 
   private buildViewportStyle(): string {
@@ -2271,6 +2308,27 @@ function parseOptionalBody(body: JsonValue | undefined): JsonValue {
 function stripHostId(params: JsonObject): JsonObject {
   const { hostId: _hostId, ...rest } = params;
   return rest;
+}
+
+// The manifest is a relearnable hint, not state the dispatcher depends on:
+// unreadable or written by another extension version, the boot set starts
+// over empty and refills from the next page load.
+export function loadPrecacheManifest(path: string, version: string): string[] {
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(readFileSync(path, "utf8")) as unknown;
+  } catch {
+    return [];
+  }
+  if (!isRecord(parsed) || parsed.version !== version || !Array.isArray(parsed.assets)) {
+    return [];
+  }
+  return parsed.assets.filter((entry): entry is string => typeof entry === "string");
+}
+
+function writePrecacheManifest(path: string, version: string, assets: string[]): void {
+  mkdirSync(dirname(path), { recursive: true });
+  writeFileSync(path, `${JSON.stringify({ version, assets }, null, 2)}\n`);
 }
 
 export function extensionVersionOf(webviewRoot: string | null): string {

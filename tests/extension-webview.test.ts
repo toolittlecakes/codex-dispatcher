@@ -232,9 +232,16 @@ describe("extension webview", () => {
       const workerResponse = await webview.fetch(new Request("http://localhost/sw.js"), new URL("http://localhost/sw.js"));
       expect(workerResponse.status).toBe(200);
       expect(workerResponse.headers.get("content-type")).toContain("text/javascript");
+      // An HTTP-cached worker would keep running old caching logic after an
+      // update shipped new logic.
+      expect(workerResponse.headers.get("cache-control")).toBe("no-cache");
       const worker = await workerResponse.text();
       expect(worker).toContain('addEventListener("fetch"');
-      expect(worker).not.toContain("caches");
+      // The worker caches only hashed assets and syncs against the manifest
+      // the dispatcher learns; index and the streams must stay on the network.
+      expect(worker).toContain('"/precache.json"');
+      expect(worker).toContain('startsWith("/assets/")');
+      expect(worker).not.toContain('"/events"');
 
       const html = await (
         await webview.fetch(new Request("http://localhost/?token=secret"), new URL("http://localhost/?token=secret"))
@@ -345,6 +352,7 @@ describe("extension webview", () => {
         appServer: {} as never,
         defaultCwd: "/repo",
         getToken: () => "secret",
+        precacheManifestPath: join(root, "precache-manifest.json"),
       });
       const assetRequest = (path: string, headers: Record<string, string>) =>
         webview.fetch(
@@ -370,6 +378,63 @@ describe("extension webview", () => {
       const image = await assetRequest("/assets/photo-HASH1234.png", { "accept-encoding": "gzip" });
       expect(image.headers.get("content-encoding")).toBeNull();
       expect(image.headers.get("cache-control")).toBe("public, max-age=31536000, immutable");
+    } finally {
+      if (previousRoot === undefined) {
+        delete process.env.CODEX_EXTENSION_WEBVIEW_ROOT;
+      } else {
+        process.env.CODEX_EXTENSION_WEBVIEW_ROOT = previousRoot;
+      }
+      rmSync(root, { recursive: true, force: true });
+    }
+  });
+
+  // The bundle ships 200MB+ of lazy chunks; the only precache list worth
+  // sending to a phone is the boot set browsers actually pulled. The
+  // dispatcher learns it by serving, remembers it across restarts, and forgets
+  // it when the extension version changes (old hashed names would be junk).
+  test("learns the served boot set and exposes it as the precache manifest", async () => {
+    const previousRoot = process.env.CODEX_EXTENSION_WEBVIEW_ROOT;
+    const root = mkdtempSync(join(tmpdir(), "codex-webview-precache-"));
+    process.env.CODEX_EXTENSION_WEBVIEW_ROOT = root;
+    writeFileSync(join(root, "index.html"), "<html></html>");
+    mkdirSync(join(root, "assets"));
+    writeFileSync(join(root, "assets", "app-initial-HASH1234.js"), "export const answer = 42;\n");
+    const manifestPath = join(root, "precache-manifest.json");
+
+    const newWebview = () =>
+      new ExtensionWebview({
+        appServer: {} as never,
+        defaultCwd: "/repo",
+        getToken: () => "secret",
+        precacheManifestPath: manifestPath,
+      });
+    const request = (webview: ExtensionWebview, path: string) =>
+      webview.fetch(
+        new Request(`http://localhost${path}`, { headers: { "x-dispatcher-token": "secret" } }),
+        new URL(`http://localhost${path}`),
+      );
+    const manifestOf = async (webview: ExtensionWebview) =>
+      (await (await request(webview, "/precache.json")).json()) as { version: string; assets: string[] };
+
+    try {
+      const webview = newWebview();
+      expect((await manifestOf(webview)).assets).toEqual([]);
+
+      expect((await request(webview, "/assets/app-initial-HASH1234.js")).status).toBe(200);
+      // Misses and non-asset pages must never enter the manifest: the worker
+      // would keep re-downloading them on every sync.
+      expect((await request(webview, "/assets/gone-HASH1234.js")).status).toBe(404);
+      await request(webview, "/index.html");
+      expect(await manifestOf(webview)).toEqual({ version: "0.0.0", assets: ["/assets/app-initial-HASH1234.js"] });
+
+      // A restarted dispatcher still knows the boot set without waiting for a
+      // browser to pull it again.
+      expect((await manifestOf(newWebview())).assets).toEqual(["/assets/app-initial-HASH1234.js"]);
+
+      // A manifest from another extension version lists hashed names that no
+      // longer exist; carrying them over would make the worker precache 404s.
+      writeFileSync(manifestPath, JSON.stringify({ version: "1.2.3", assets: ["/assets/old-OLDHASH0.js"] }));
+      expect((await manifestOf(newWebview())).assets).toEqual([]);
     } finally {
       if (previousRoot === undefined) {
         delete process.env.CODEX_EXTENSION_WEBVIEW_ROOT;
