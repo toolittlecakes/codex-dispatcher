@@ -236,6 +236,24 @@ export class ExtensionWebview {
     }
 
     if (url.pathname === pwaPrecacheManifestPath) {
+      if (request.method === "POST") {
+        let body: unknown;
+        try {
+          body = await request.json();
+        } catch {
+          return jsonResponse({ error: "expected { assets: string[] }" }, 400);
+        }
+        if (!isRecord(body) || !Array.isArray(body.assets)) {
+          return jsonResponse({ error: "expected { assets: string[] }" }, 400);
+        }
+        // The service worker reports what its cache holds — the only witness
+        // of assets a warm browser pulled from its own HTTP cache, which never
+        // reach serveAsset. Only names that exist on disk enter the manifest,
+        // or one confused client would send every other device chasing 404s.
+        this.recordServedAssets(body.assets.filter(
+          (entry): entry is string => typeof entry === "string" && this.isServableAsset(entry),
+        ));
+      }
       return jsonResponse({
         version: extensionVersionOf(this.webviewRoot),
         assets: [...this.servedAssetPaths].sort(),
@@ -351,11 +369,26 @@ export class ExtensionWebview {
   }
 
   private recordServedAsset(pathname: string): void {
-    if (this.servedAssetPaths.has(pathname)) {
+    this.recordServedAssets([pathname]);
+  }
+
+  private recordServedAssets(pathnames: string[]): void {
+    const unseen = pathnames.filter((pathname) => !this.servedAssetPaths.has(pathname));
+    if (unseen.length === 0) {
       return;
     }
-    this.servedAssetPaths.add(pathname);
+    for (const pathname of unseen) {
+      this.servedAssetPaths.add(pathname);
+    }
     writePrecacheManifest(this.precacheManifestPath, extensionVersionOf(this.webviewRoot), [...this.servedAssetPaths].sort());
+  }
+
+  private isServableAsset(pathname: string): boolean {
+    if (!pathname.startsWith(`${routePrefix}/assets/`)) {
+      return false;
+    }
+    const assetPath = resolveWebviewAssetPath(this.webviewRoot!, pathname);
+    return assetPath !== null && existsSync(assetPath);
   }
 
   private buildViewportStyle(): string {

@@ -242,6 +242,9 @@ describe("extension webview", () => {
       expect(worker).toContain('"/precache.json"');
       expect(worker).toContain('startsWith("/assets/")');
       expect(worker).not.toContain('"/events"');
+      // The sync must teach as well as learn: a warm browser is the only
+      // witness of assets its HTTP cache absorbed before the worker existed.
+      expect(worker).toContain('method: "POST"');
 
       const html = await (
         await webview.fetch(new Request("http://localhost/?token=secret"), new URL("http://localhost/?token=secret"))
@@ -430,6 +433,23 @@ describe("extension webview", () => {
       // A restarted dispatcher still knows the boot set without waiting for a
       // browser to pull it again.
       expect((await manifestOf(newWebview())).assets).toEqual(["/assets/app-initial-HASH1234.js"]);
+
+      // A service worker reports what its cache holds — the dispatcher never
+      // saw those requests if the browser's HTTP cache answered them. Names
+      // that are not real files on disk must not spread to other devices.
+      writeFileSync(join(root, "assets", "chunk-lazy-HASH5678.js"), "export {};\n");
+      const taught = await webview.fetch(
+        new Request("http://localhost/precache.json", {
+          method: "POST",
+          headers: { "x-dispatcher-token": "secret", "content-type": "application/json" },
+          body: JSON.stringify({ assets: ["/assets/chunk-lazy-HASH5678.js", "/assets/fabricated-HASH.js", "/etc/passwd", 7] }),
+        }),
+        new URL("http://localhost/precache.json"),
+      );
+      expect(((await taught.json()) as { assets: string[] }).assets).toEqual([
+        "/assets/app-initial-HASH1234.js",
+        "/assets/chunk-lazy-HASH5678.js",
+      ]);
 
       // A manifest from another extension version lists hashed names that no
       // longer exist; carrying them over would make the worker precache 404s.

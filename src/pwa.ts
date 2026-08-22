@@ -110,13 +110,20 @@ function scheduleCacheSync() {
 }
 
 async function syncAssetCache() {
-  const manifestResponse = await fetch(precacheManifestPath);
-  if (!manifestResponse.ok) {
-    throw new Error("precache manifest fetch failed: " + manifestResponse.status);
-  }
-  const manifest = await manifestResponse.json();
   const cache = await caches.open(assetCache);
   const cachedPaths = new Set((await cache.keys()).map((cached) => new URL(cached.url).pathname));
+  // Teach and learn in one round trip: the dispatcher cannot see what a warm
+  // browser pulls out of its own HTTP cache, so each worker reports what it
+  // holds and gets back the union every device taught.
+  const manifestResponse = await fetch(precacheManifestPath, {
+    method: "POST",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify({ assets: Array.from(cachedPaths) }),
+  });
+  if (!manifestResponse.ok) {
+    throw new Error("precache manifest sync failed: " + manifestResponse.status);
+  }
+  const manifest = await manifestResponse.json();
   const wanted = new Set(manifest.assets);
   // Hashed names outside the manifest belong to an extension version the
   // dispatcher no longer serves.
